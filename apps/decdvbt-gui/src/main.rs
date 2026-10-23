@@ -27,6 +27,7 @@ mod scopes;
 mod sdr;
 mod services;
 mod source;
+mod t2card;
 mod ts_viewer;
 mod waterfall;
 
@@ -41,8 +42,10 @@ use decdvbt_engine::{
     Command, CpuGauge, FrontEndSettings, Outputs, Row, Stats, TsView, signal_block, spectral_cn_db,
 };
 use decdvbt_io::name_hint;
+use decdvbt_rx::auto::Standard;
 use decdvbt_rx::receiver::ReceiverStatus;
 use decdvbt_rx::sounder::Geometry;
+use decdvbt_rx::t2::receiver::T2Status;
 use decdvbt_ts::{Epg, TsTap};
 use eframe::egui::{self, Color32, RichText};
 use source::{Gains, Session, Spec};
@@ -405,6 +408,10 @@ struct App {
     decode: bool,
     decoder_sent: Option<Option<f64>>,
     dec: ReceiverStatus,
+    /// Which standard the receiver has locked on, and with a T2 lock that
+    /// receiver's own status (`dec` then holds the common figures).
+    standard: Standard,
+    dec2: Option<Box<T2Status>>,
     dec_packets: u64,
     dec_rate: Option<(u64, Instant, f64)>,
     started: Instant,
@@ -575,6 +582,8 @@ impl App {
             decode: opts.decode,
             decoder_sent: None,
             dec: ReceiverStatus::default(),
+            standard: Standard::Searching,
+            dec2: None,
             dec_packets: 0,
             dec_rate: None,
             stats: Stats::default(),
@@ -713,6 +722,7 @@ impl App {
                 self.sounder_sent = None;
                 self.decoder_sent = None;
                 self.dec = ReceiverStatus::default();
+                (self.standard, self.dec2) = (Standard::Searching, None);
                 self.dec_packets = 0;
                 self.dec_rate = None;
                 self.reset_stream();
@@ -822,6 +832,7 @@ impl App {
             self.decoder_sent = Some(want);
             if want.is_none() {
                 self.dec = ReceiverStatus::default();
+                (self.standard, self.dec2) = (Standard::Searching, None);
                 self.dec_packets = 0;
                 self.dec_rate = None;
                 self.reset_stream();
@@ -1310,6 +1321,8 @@ impl App {
             // the receiver's status and the scopes' cells.
             let u = s.rx.take_decoder();
             self.dec = u.status;
+            self.standard = u.standard;
+            self.dec2 = u.t2;
             self.dec_packets = u.packets;
             if self.bottom == Bottom::Maps {
                 if let Some(c) = &u.scopes {
@@ -1427,6 +1440,9 @@ impl App {
             m.fft = g.fft;
             m.guard = g.guard;
         }
+        if let (Standard::Dvbt2, Some(t2), true) = (self.standard, &self.dec2, self.decode) {
+            return self.t2_card(t2);
+        }
         let mut details = match (mode, locked) {
             (Some(m), _) => mode_details(&m),
             (None, Some(g)) => lock_details(&g, self.chan_view.status.cfo_hz),
@@ -1464,6 +1480,28 @@ impl App {
             details,
             cn_db,
             cn_source,
+            channel: self.vfo_hz.and_then(uhf_channel_at),
+            freq_hz: self.vfo_hz,
+            active: self.session.is_some(),
+        }
+    }
+
+    /// The card for a DVB-T2 lock.
+    fn t2_card(&self, t2: &T2Status) -> card::Card {
+        let c = t2card::card(t2, self.ts_mbps());
+        let measured = t2.decoding && t2.snr_db.is_finite();
+        card::Card {
+            standard: Some(card::Standard::DvbT2),
+            assumed: false,
+            name: c.name,
+            qef_db: t2.plp.and_then(|p| p.qef_cn_db()),
+            details: c.details,
+            cn_db: if measured {
+                Some(t2.snr_db)
+            } else {
+                self.cn_db
+            },
+            cn_source: if measured { "MER" } else { "spectrum" },
             channel: self.vfo_hz.and_then(uhf_channel_at),
             freq_hz: self.vfo_hz,
             active: self.session.is_some(),

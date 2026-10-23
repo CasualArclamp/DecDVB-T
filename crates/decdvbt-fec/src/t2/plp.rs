@@ -67,6 +67,9 @@ pub struct PlpCoder {
     q: Vec<i8>,
     info: Vec<u8>,
     times: DecodeTimes,
+    /// The soft bits' scale, the LDPC iterations at most.
+    scale: f32,
+    iterations: usize,
 }
 
 impl PlpCoder {
@@ -103,6 +106,8 @@ impl PlpCoder {
             q: vec![0; n],
             info: vec![0; params.n_bch / 8],
             times: DecodeTimes::default(),
+            scale: SCALE,
+            iterations: ITERATIONS,
             params,
             qam,
             rotated,
@@ -114,6 +119,15 @@ impl PlpCoder {
     /// Cells in one FEC block.
     pub fn cells(&self) -> usize {
         self.map.cells
+    }
+
+    /// Change the decoder's tuning (for the tools that look for the best):
+    /// soft bits a unit of LLR, the min-sum's normalization 1 − 2^−shift and
+    /// the most LDPC iterations.
+    pub fn set_tuning(&mut self, scale: f32, norm_shift: u32, iterations: usize) {
+        self.scale = scale;
+        self.decoder.set_norm_shift(norm_shift);
+        self.iterations = iterations;
     }
 
     /// The time the stages took since the last call.
@@ -155,11 +169,13 @@ impl PlpCoder {
         let p = self.params;
         assert_eq!(y.len(), self.map.cells);
         let t0 = Instant::now();
-        self.cst.demap_block_q(y, var, SCALE, &mut self.cell_q);
+        self.cst.demap_block_q(y, var, self.scale, &mut self.cell_q);
         let t1 = Instant::now();
         self.map.gather_q(&self.cell_q, &mut self.q);
         let t2 = Instant::now();
-        let ldpc = self.decoder.decode(&self.q, &mut self.info, ITERATIONS);
+        let ldpc = self
+            .decoder
+            .decode(&self.q, &mut self.info, self.iterations);
         let t3 = Instant::now();
         let bch = self.bch.decode(&mut self.info);
         let t4 = Instant::now();

@@ -45,6 +45,8 @@ fn run(spec: &str, channel: Channel, frames: usize, rate: f64, vfo: f64) -> Outc
         pos += block.len() as u64;
         rx.take_ts(&mut ts);
     }
+    rx.flush();
+    rx.take_ts(&mut ts);
     let (mut good, mut bad) = (0, 0);
     for p in ts.as_chunks::<188>().0 {
         let pid = (u16::from(p[1] & 0x1F) << 8) | u16::from(p[2]);

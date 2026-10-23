@@ -1,0 +1,174 @@
+// made by CasualArclamp
+//! The FEC stage on a thread of its own. A frame's cells go to it as soon as
+//! they are equalised, and the receive thread goes on to the next frame while
+//! the blocks are deinterleaved, demapped and decoded (on as many threads as
+//! asked). The transport packets come back a frame behind. At most two frames
+//! wait: if the FEC stage cannot keep up, [`FecPipe::submit`] holds the
+//! receive thread until it has caught up, which is the right thing to feel.
+
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::JoinHandle;
+
+use decdvbt_core::Iq;
+
+use crate::t2::plp::{FrameStats, PlpDecoder, PlpParams};
+
+/// Frames in the FEC stage's hands (decoding or queued) at most.
+const MAX_IN_FLIGHT: usize = 2;
+
+/// One frame's PLP cells for the FEC stage.
+pub struct Job {
+    pub params: PlpParams,
+    pub cells: Vec<Iq>,
+    pub var: Vec<f32>,
+    /// Where the PLP's first block starts in `cells`, and how many blocks.
+    pub start: usize,
+    pub blocks: usize,
+}
+
+/// What a frame made.
+pub struct Done {
+    /// The transport packets, back to back.
+    pub ts: Vec<u8>,
+    pub stats: Option<FrameStats>,
+    pub resyncs: u64,
+}
+
+enum Msg {
+    Frame(Job),
+    /// The stream has jumped: forget a packet cut by the last frame.
+    Reset,
+}
+
+pub struct FecPipe {
+    tx: Option<Sender<Msg>>,
+    rx: Receiver<Done>,
+    join: Option<JoinHandle<()>>,
+    in_flight: usize,
+}
+
+impl FecPipe {
+    pub fn new(threads: usize) -> FecPipe {
+        let (tx, jobs) = channel();
+        let (done_tx, rx) = channel();
+        let join = std::thread::Builder::new()
+            .name("decdvbt-t2-fec".into())
+            .spawn(move || worker(threads, jobs, done_tx))
+            .expect("cannot start the FEC thread");
+        FecPipe {
+            tx: Some(tx),
+            rx,
+            join: Some(join),
+            in_flight: 0,
+        }
+    }
+
+    /// Hand a frame over, waiting first while two are already in hand.
+    /// Returns every frame finished meanwhile.
+    pub fn submit(&mut self, job: Job) -> Vec<Done> {
+        let mut done = self.poll();
+        while self.in_flight >= MAX_IN_FLIGHT {
+            match self.rx.recv() {
+                Ok(d) => {
+                    self.in_flight -= 1;
+                    done.push(d);
+                }
+                Err(_) => {
+                    self.in_flight = 0;
+                    break;
+                }
+            }
+        }
+        if let Some(tx) = &self.tx
+            && tx.send(Msg::Frame(job)).is_ok()
+        {
+            self.in_flight += 1;
+        }
+        done
+    }
+
+    /// The frames finished, without waiting.
+    pub fn poll(&mut self) -> Vec<Done> {
+        let mut done = Vec::new();
+        while let Ok(d) = self.rx.try_recv() {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            done.push(d);
+        }
+        done
+    }
+
+    /// Wait for every frame in hand.
+    pub fn flush(&mut self) -> Vec<Done> {
+        let mut done = Vec::new();
+        while self.in_flight > 0 {
+            match self.rx.recv() {
+                Ok(d) => {
+                    self.in_flight -= 1;
+                    done.push(d);
+                }
+                Err(_) => self.in_flight = 0,
+            }
+        }
+        done
+    }
+
+    /// The stream has jumped (after the frames in hand).
+    pub fn reset(&mut self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Msg::Reset);
+        }
+    }
+}
+
+impl Drop for FecPipe {
+    fn drop(&mut self) {
+        // Closing the channel ends the thread's loop.
+        self.tx = None;
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+fn worker(threads: usize, jobs: Receiver<Msg>, out: Sender<Done>) {
+    let mut decoder: Option<PlpDecoder> = None;
+    let mut packets = Vec::new();
+    for msg in jobs {
+        let job = match msg {
+            Msg::Reset => {
+                if let Some(d) = &mut decoder {
+                    d.reset();
+                }
+                continue;
+            }
+            Msg::Frame(job) => job,
+        };
+        if decoder.as_ref().map(|d| d.params) != Some(job.params) {
+            decoder = PlpDecoder::new(job.params, threads);
+        }
+        let done = match &mut decoder {
+            Some(d) => {
+                packets.clear();
+                let stats =
+                    d.decode_frame(&job.cells, &job.var, job.start, job.blocks, &mut packets);
+                let mut ts = Vec::with_capacity(packets.len() * 188);
+                for p in &packets {
+                    ts.extend_from_slice(p);
+                }
+                Done {
+                    ts,
+                    stats,
+                    resyncs: d.resyncs(),
+                }
+            }
+            None => Done {
+                ts: Vec::new(),
+                stats: None,
+                resyncs: 0,
+            },
+        };
+        if out.send(done).is_err() {
+            return;
+        }
+    }
+}

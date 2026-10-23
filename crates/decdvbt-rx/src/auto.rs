@@ -10,6 +10,7 @@
 
 use decdvbt_core::Iq;
 
+use crate::outer::OuterStats;
 use crate::receiver::{Receiver, ReceiverConfig, ReceiverStatus};
 use crate::scope::{Measurements, Scopes};
 use crate::t2::receiver::{T2Config, T2Receiver, T2Status};
@@ -53,14 +54,43 @@ impl AutoReceiver {
         self.standard
     }
 
-    /// The DVB-T receiver's status (its counters go on counting only while it
-    /// is the one looking or locked).
+    /// The DVB-T receiver's own status (its counters go on counting only
+    /// while it is the one looking or locked).
     pub fn dvbt(&self) -> &ReceiverStatus {
         self.t.status()
     }
 
     pub fn dvbt2(&self) -> &T2Status {
         self.t2.status()
+    }
+
+    /// The status in the DVB-T receiver's terms, whichever has the lock, for
+    /// whatever shows only the common things (the lock, the carrier offset,
+    /// the signal-to-noise ratio, the blocks the code lost): with a T2 lock
+    /// its TPS stands for L1 read, its Reed–Solomon blocks for LDPC blocks.
+    pub fn status(&self) -> ReceiverStatus {
+        let mut s = self.t.status().clone();
+        if self.standard == Standard::Dvbt2 {
+            let t2 = self.t2.status();
+            s.tracking = t2.tracking;
+            s.tps_synced = t2.l1_ok;
+            s.decoding = t2.decoding;
+            s.hierarchical = false;
+            (s.fft, s.guard, s.tps) = (None, None, None);
+            s.cfo_hz = t2.cfo_hz;
+            s.clock_ppm = t2.clock_ppm;
+            s.snr_db = t2.snr_db;
+            s.locks = t2.locks;
+            s.outer = OuterStats {
+                blocks: t2.blocks_ok + t2.blocks_bad,
+                clean: t2.blocks_ok,
+                uncorrectable: t2.blocks_bad,
+                losses: t2.resyncs,
+                packets: t2.packets,
+                ..Default::default()
+            };
+        }
+        s
     }
 
     /// Whether the locked receiver is decoding.
@@ -84,29 +114,41 @@ impl AutoReceiver {
         self.t2.take_ts(out);
     }
 
+    /// Wait for the T2 receiver's FEC stage to finish what it has (for the
+    /// end of a file); the packets are then there for `take_ts`.
+    pub fn flush(&mut self) {
+        self.t2.flush();
+    }
+
     pub fn request_scopes(&mut self) {
-        if self.standard != Standard::Dvbt2 {
-            self.t.request_scopes();
+        match self.standard {
+            Standard::Dvbt2 => self.t2.request_scopes(),
+            _ => self.t.request_scopes(),
         }
     }
 
     pub fn take_scopes(&mut self) -> Option<Scopes> {
-        self.t.take_scopes()
+        match self.standard {
+            Standard::Dvbt2 => self.t2.take_scopes(),
+            _ => self.t.take_scopes(),
+        }
     }
 
     pub fn set_heat(&mut self, rows_per_s: f64) {
         self.t.set_heat(rows_per_s);
+        self.t2.set_heat(rows_per_s);
     }
 
     pub fn take_heat(&mut self, out: &mut Vec<Measurements>) {
         self.t.take_heat(out);
+        self.t2.take_heat(out);
     }
 
     pub fn measure(&mut self) -> Option<Measurements> {
-        if self.standard == Standard::Dvbt2 {
-            return None;
+        match self.standard {
+            Standard::Dvbt2 => self.t2.measure(),
+            _ => self.t.measure(),
         }
-        self.t.measure()
     }
 
     /// Hand over a block of the radio's samples, whose first is the stream's

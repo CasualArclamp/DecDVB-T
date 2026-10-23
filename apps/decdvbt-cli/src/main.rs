@@ -60,7 +60,7 @@ enum Command {
     },
     /// Run the channel sounder: lock to a DVB-T signal and list its paths.
     Sound(Box<sound::SoundArgs>),
-    /// Decode a DVB-T signal to a transport stream and report on it.
+    /// Decode a DVB-T or DVB-T2 signal to a transport stream and report on it.
     Decode(Box<decode::DecodeArgs>),
     /// Make a DVB-T test signal as an IQ file, optionally through a channel.
     Modulate(Box<modulate::ModulateArgs>),

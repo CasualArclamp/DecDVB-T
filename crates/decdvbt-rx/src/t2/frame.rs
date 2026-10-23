@@ -374,6 +374,12 @@ pub struct Equalised {
     /// The timing the windows still drifted by, samples a symbol (the slopes
     /// of the alignment, which the symbols' line did not take out).
     pub drift_residual: f64,
+    /// The noise power on each carrier (the pilots' own).
+    pub noise: f32,
+    /// For the display, when asked for: the middle data symbol's carriers as
+    /// read, and its pilots equalised and normalised to ±1.
+    pub scope_raw: Vec<Iq>,
+    pub scope_pilots: Vec<Iq>,
 }
 
 impl Demod {
@@ -439,7 +445,7 @@ impl Demod {
     /// `carriers` is changed (the alignment). Returns the cells of the data
     /// symbols in logical order and their variances, the SNR, and the
     /// channel at the middle symbol.
-    pub fn data_cells(&mut self, carriers: &mut [Iq]) -> Option<Equalised> {
+    pub fn data_cells(&mut self, carriers: &mut [Iq], scope: bool) -> Option<Equalised> {
         let geo = self.geo;
         let (c_ps, mid) = (geo.c_ps, geo.mid);
         let first = geo.n_p2;
@@ -530,6 +536,7 @@ impl Demod {
         let mut chan_mid = vec![Iq::new(0.0, 0.0); c_ps];
         let mut sym_snr: Vec<f32> = Vec::new();
         let mut own: Vec<f32> = Vec::new();
+        let (mut scope_raw, mut scope_pilots) = (Vec::new(), Vec::new());
         for j in first..last {
             let rel = j - first;
             for m in 0..n_nodes {
@@ -551,6 +558,13 @@ impl Demod {
                 }
             }
             let row = &carriers[j * c_ps..(j + 1) * c_ps];
+            if scope && j == (first + last) / 2 {
+                scope_raw = row.to_vec();
+                for (&k, &pv) in self.cp_ks[j % dy].iter().zip(&self.cp_pv[j]) {
+                    let k = k as usize;
+                    scope_pilots.push(row[k] / (Iq::new(hr[k], hi[k]) * pv));
+                }
+            }
             own.clear();
             for (&k, &pv) in self.cp_ks[j % dy].iter().zip(&self.cp_pv[j]) {
                 let k = k as usize;
@@ -647,6 +661,9 @@ impl Demod {
             channel: chan_mid,
             symbol_snr_db: sym_snr,
             drift_residual,
+            noise: vy,
+            scope_raw,
+            scope_pilots,
         })
     }
 

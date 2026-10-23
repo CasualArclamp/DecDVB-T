@@ -20,6 +20,7 @@ pub mod bitmap;
 pub mod l1;
 pub mod plp;
 pub mod qam;
+pub mod threshold;
 pub mod timeint;
 
 pub use bitmap::BitMap;

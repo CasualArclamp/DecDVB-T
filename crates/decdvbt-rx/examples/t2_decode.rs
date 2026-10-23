@@ -86,6 +86,10 @@ fn main() {
             );
         }
     }
+    rx.flush();
+    ts.clear();
+    rx.take_ts(&mut ts);
+    o.write_all(&ts).unwrap();
     let s = rx.status();
     let secs = t0.elapsed().as_secs_f64();
     println!(

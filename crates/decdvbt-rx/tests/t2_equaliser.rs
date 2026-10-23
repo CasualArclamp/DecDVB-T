@@ -61,7 +61,7 @@ fn run_noisy(cfg: T2Config, channel: Channel, sigma2: f32, seed: u32) -> (f32, V
     // The second frame's P1 starts at its first sample.
     let timing = demod.timing(&y, 2048.0).expect("timing");
     let mut carriers = demod.all_carriers(&y, &timing);
-    let eq = demod.data_cells(&mut carriers).expect("equalised");
+    let eq = demod.data_cells(&mut carriers, false).expect("equalised");
     let n_p2_cells = demod.carriers.p2_cells() * geo.n_p2;
     let tx_data = &tx[n_p2_cells..n_p2_cells + eq.cells.len()];
     let total = mer(&eq.cells, tx_data);
@@ -145,7 +145,7 @@ fn decode_blocks(cfg: T2Config, channel: Channel, sigma2: f32, seed: u32) -> (us
     let (dealt, dvar) = demod.p2_cells(&carriers[..geo.n_p2 * geo.c_ps]);
     let (logical, lvar) = demod.p2_logical(&dealt, &dvar, 1840, pre.l1_post_size as usize);
     let _ = p2_deal;
-    let eq = demod.data_cells(&mut carriers).expect("equalised");
+    let eq = demod.data_cells(&mut carriers, false).expect("equalised");
     let mut cells = logical;
     let mut var = lvar;
     cells.extend_from_slice(&eq.cells);

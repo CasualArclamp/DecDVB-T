@@ -132,6 +132,10 @@ pub struct ScopeView {
     pending: Vec<Arc<Scopes>>,
     /// The last symbol's constellation, for the ideal points and the header.
     modulation: Option<Modulation>,
+    /// A DVB-T2 signal's constellation (bits a cell, rotated) and the level
+    /// its pilots sit at.
+    t2: Option<(u8, bool)>,
+    pilot_mark: f32,
     seen: bool,
     measurements: Option<Arc<Measurements>>,
 }
@@ -147,6 +151,8 @@ impl Default for ScopeView {
             ],
             pending: Vec::new(),
             modulation: None,
+            t2: None,
+            pilot_mark: 4.0 / 3.0,
             seen: false,
             measurements: None,
         }
@@ -177,9 +183,12 @@ impl ScopeView {
             self.scopes[2].add(&s.data, Some(1.0));
             self.scopes[3].add(&s.raw, None);
             self.modulation = s.modulation;
+            self.t2 = s.t2_qam;
+            self.pilot_mark = s.pilot_mark.unwrap_or(4.0 / 3.0);
             self.seen = true;
         }
         let modulation = self.modulation;
+        let (t2, pilot_mark) = (self.t2, self.pilot_mark);
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Scopes").strong());
             if !self.seen {
@@ -187,10 +196,19 @@ impl ScopeView {
             } else {
                 let mut bits = Vec::new();
                 bits.extend(modulation.map(|m| m.name().to_string()));
+                bits.extend(t2.map(|(b, rot)| {
+                    format!("{}-QAM{}", 1u32 << b, if rot { " rotated" } else { "" })
+                }));
                 if st.decoding && st.snr_db.is_finite() {
                     bits.push(format!("MER {:.1} dB", st.snr_db));
                 }
-                if st.decoding {
+                if st.decoding && t2.is_some() {
+                    let o = &st.outer;
+                    bits.push(format!(
+                        "{} of {} LDPC blocks lost",
+                        o.uncorrectable, o.blocks
+                    ));
+                } else if st.decoding {
                     bits.push(format!("before RS {:.1e}", st.outer.pre_rs_ber()));
                     let o = &st.outer;
                     let total = (o.clean + o.corrected + o.uncorrectable).max(1);
@@ -213,8 +231,8 @@ impl ScopeView {
             ui.spacing_mut().item_spacing.x = gap;
             let marks: [Vec<Iq>; 4] = [
                 vec![Iq::new(1.0, 0.0), Iq::new(-1.0, 0.0)],
-                vec![Iq::new(4.0 / 3.0, 0.0), Iq::new(-4.0 / 3.0, 0.0)],
-                ideal(modulation),
+                vec![Iq::new(pilot_mark, 0.0), Iq::new(-pilot_mark, 0.0)],
+                ideal(modulation, t2),
                 Vec::new(),
             ];
             for (ph, marks) in self.scopes.iter_mut().zip(&marks) {
@@ -229,7 +247,24 @@ impl ScopeView {
 }
 
 /// The ideal points of a constellation at unit mean power (α = 1).
-fn ideal(m: Option<Modulation>) -> Vec<Iq> {
+fn ideal(m: Option<Modulation>, t2: Option<(u8, bool)>) -> Vec<Iq> {
+    // A DVB-T2 constellation: a grid of 2^(bits/2) levels, unless rotated (its
+    // cells are then spread over stripes, and no points are marked).
+    if let Some((bits, rotated)) = t2 {
+        if rotated {
+            return Vec::new();
+        }
+        let per_axis = 1i32 << (bits / 2);
+        let norm = ((per_axis * per_axis - 1) as f32 * 2.0 / 3.0).sqrt();
+        return (0..per_axis)
+            .flat_map(|i| {
+                (0..per_axis).map(move |q| {
+                    let l = |v: i32| (2 * v - per_axis + 1) as f32 / norm;
+                    Iq::new(l(i), l(q))
+                })
+            })
+            .collect();
+    }
     let (levels, norm): (&[f32], f32) = match m {
         Some(Modulation::Qpsk) => (&[-1.0, 1.0], 2f32.sqrt()),
         Some(Modulation::Qam16) => (&[-3.0, -1.0, 1.0, 3.0], 10f32.sqrt()),
@@ -602,12 +637,15 @@ mod tests {
             (Modulation::Qam16, 16),
             (Modulation::Qam64, 64),
         ] {
-            let pts = ideal(Some(m));
+            let pts = ideal(Some(m), None);
             assert_eq!(pts.len(), n);
             let power = pts.iter().map(|c| c.norm_sqr()).sum::<f32>() / n as f32;
             assert!((power - 1.0).abs() < 1e-5, "{m:?}: {power}");
         }
-        assert!(ideal(None).is_empty());
+        assert!(ideal(None, None).is_empty());
+        // A DVB-T2 grid: 256 points, none for a rotated one.
+        assert_eq!(ideal(None, Some((8, false))).len(), 256);
+        assert!(ideal(None, Some((8, true))).is_empty());
     }
 
     #[test]

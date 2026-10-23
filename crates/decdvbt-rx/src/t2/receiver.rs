@@ -12,7 +12,6 @@
 use std::time::{Duration, Instant};
 
 use decdvbt_core::Iq;
-use decdvbt_fec::t2::bbframe::TS_LEN;
 use decdvbt_fec::t2::l1::{L1Coder, L1Mod, PRE_CELLS, PostLayout, post_llrs};
 use decdvbt_ofdm::t2::carriers::p2_roles;
 use decdvbt_ofdm::t2::l1::{L1Post, L1Pre};
@@ -20,10 +19,12 @@ use decdvbt_ofdm::t2::p1::SAMPLES as P1_SAMPLES;
 use decdvbt_ofdm::t2::{Fft, Guard, Mode, PilotPattern, Reference};
 
 use crate::interp::Interpolator;
+use crate::scope::{MeasureState, Measurements, Scopes, measure as measure_channel, thin};
 use crate::symbol::PAD;
 use crate::t2::frame::{Demod, Geometry, SymbolFft, cp_peak, p2_equalise};
 use crate::t2::p1det;
-use crate::t2::plp::{FrameStats, PlpDecoder, PlpParams};
+use crate::t2::pipe::{Done, FecPipe, Job};
+use crate::t2::plp::PlpParams;
 use crate::window::Window;
 
 /// The signal's sample rate for 8 MHz channels, Hz.
@@ -46,7 +47,8 @@ pub struct T2Config {
     pub fs_in: f64,
     /// How far above the radio's centre the signal's centre is.
     pub vfo_offset_hz: f64,
-    /// Threads the FEC blocks are spread over.
+    /// Threads the FEC blocks are spread over (on top of the FEC stage's own
+    /// thread, which hands them out).
     pub fec_threads: usize,
 }
 
@@ -55,7 +57,10 @@ impl T2Config {
         T2Config {
             fs_in,
             vfo_offset_hz,
-            fec_threads: 2,
+            // A quarter of the machine's threads, two to four: about what a
+            // 40 Mbit/s 256-QAM multiplex takes, with room to spare.
+            fec_threads: (std::thread::available_parallelism().map_or(2, |n| n.get()) / 4)
+                .clamp(2, 4),
         }
     }
 }
@@ -68,7 +73,9 @@ pub struct T2Profile {
     pub read: Duration,
     /// Channel estimates and equalised cells.
     pub equalise: Duration,
-    /// L1, the time interleaver, LDPC and BCH, the packets.
+    /// Handing the frame to the FEC stage, and waiting for it if it is two
+    /// frames behind (the FEC work itself runs on its own threads: see the
+    /// fields below).
     pub fec: Duration,
     /// Of `fec`: the interleavers undone (one thread), and, summed over the
     /// threads, the demapper, the bit deinterleaver, LDPC and BCH.
@@ -131,7 +138,6 @@ struct Track {
     geo: Geometry,
     demod: Demod,
     l1pre: L1Pre,
-    plp: Option<PlpDecoder>,
     /// The carrier offset from the radio's centre, Hz, and the radio's
     /// samples a sample of the signal's.
     cfo_hz: f64,
@@ -154,7 +160,24 @@ pub struct T2Receiver {
     coder: L1Coder,
     acq_fft: Option<SymbolFft>,
     y: Vec<Iq>,
-    packets: Vec<[u8; TS_LEN]>,
+    /// The FEC stage, started at the first lock.
+    fec: Option<FecPipe>,
+    /// For the display: cells asked for, the ones made; the last frame's
+    /// channel (at the middle symbol) and its noise; rows of the channel
+    /// wanted a second and those made.
+    scope_wanted: bool,
+    scopes: Option<Scopes>,
+    channel: Option<ChannelEstimate>,
+    measure_state: MeasureState,
+    heat_rate: f64,
+    heat: Vec<Measurements>,
+}
+
+/// A frame's channel estimate at its middle symbol, for the display.
+struct ChannelEstimate {
+    mode: Mode,
+    h: Vec<Iq>,
+    noise: f32,
 }
 
 fn rotate(y: &mut [Iq], f_hz: f64, fs: f64) {
@@ -188,7 +211,13 @@ impl T2Receiver {
             coder: L1Coder::new(),
             acq_fft: None,
             y: Vec::new(),
-            packets: Vec::new(),
+            fec: None,
+            scope_wanted: false,
+            scopes: None,
+            channel: None,
+            measure_state: MeasureState::default(),
+            heat_rate: 0.0,
+            heat: Vec::new(),
         }
     }
 
@@ -196,8 +225,60 @@ impl T2Receiver {
         &self.status
     }
 
+    /// Ask for the cells of a symbol of the next frame (for
+    /// [`take_scopes`](Self::take_scopes)); nothing is copied until asked.
+    pub fn request_scopes(&mut self) {
+        self.scope_wanted = true;
+    }
+
+    /// The cells asked for, once the next frame has come.
+    pub fn take_scopes(&mut self) -> Option<Scopes> {
+        self.scopes.take()
+    }
+
+    /// Make a row of the channel for each frame (about 4.6 a second) while
+    /// `rows_per_s` is more than zero, for a heat map of it over time.
+    pub fn set_heat(&mut self, rows_per_s: f64) {
+        self.heat_rate = rows_per_s.max(0.0);
+        if self.heat_rate == 0.0 {
+            self.heat.clear();
+        }
+    }
+
+    pub fn take_heat(&mut self, out: &mut Vec<Measurements>) {
+        out.append(&mut self.heat);
+    }
+
+    /// The channel as the last frame's estimate has it (gain and
+    /// signal-to-noise ratio across the band, the impulse response and its
+    /// echoes), or `None` with no lock.
+    pub fn measure(&mut self) -> Option<Measurements> {
+        let c = self.channel.as_ref()?;
+        Some(Self::measurements(&mut self.measure_state, c))
+    }
+
+    fn measurements(state: &mut MeasureState, c: &ChannelEstimate) -> Measurements {
+        let hr: Vec<f32> = c.h.iter().map(|v| v.re).collect();
+        let hi: Vec<f32> = c.h.iter().map(|v| v.im).collect();
+        let w: Vec<f32> = c.h.iter().map(|v| v.norm_sqr()).collect();
+        let noise = vec![c.noise; c.h.len()];
+        let guard_us = (c.mode.guard.samples(c.mode.fft) as f64 / FS_NATIVE * 1e6) as f32;
+        measure_channel(
+            state,
+            c.mode.fft.n(),
+            FS_NATIVE,
+            guard_us,
+            (&hr, &hi),
+            &w,
+            &noise,
+        )
+    }
+
     /// Forget the lock and the stretch wanted: the stream has jumped.
     pub fn reset(&mut self) {
+        if let Some(f) = &mut self.fec {
+            f.reset();
+        }
         self.win.cancel();
         self.track = None;
         self.next_attempt = 0;
@@ -208,12 +289,39 @@ impl T2Receiver {
 
     /// Transport packets (188 bytes each) decoded since the last call.
     pub fn take_ts(&mut self, out: &mut Vec<u8>) {
+        self.collect();
         out.append(&mut self.ts);
+    }
+
+    /// Wait for the frames the FEC stage has in hand: their packets are
+    /// then there for [`take_ts`](Self::take_ts) (for the end of a file).
+    pub fn flush(&mut self) {
+        if let Some(f) = &mut self.fec {
+            let done = f.flush();
+            for d in done {
+                self.absorb(d);
+            }
+        }
+    }
+
+    /// Take in the frames the FEC stage has finished.
+    fn collect(&mut self) {
+        if let Some(f) = &mut self.fec {
+            for d in f.poll() {
+                self.absorb(d);
+            }
+        }
+    }
+
+    fn absorb(&mut self, d: Done) {
+        self.ts.extend_from_slice(&d.ts);
+        self.account(d.stats, d.resyncs);
     }
 
     /// Hand over a block of the radio's samples, whose first is the stream's
     /// `abs_start`-th.
     pub fn push(&mut self, block: &[Iq], abs_start: u64) {
+        self.collect();
         if !self.win.is_wanting() {
             self.want_acquisition(abs_start.max(self.next_attempt));
         }
@@ -247,6 +355,9 @@ impl T2Receiver {
     }
 
     fn drop_lock(&mut self) {
+        if let Some(f) = &mut self.fec {
+            f.reset();
+        }
         self.win.cancel();
         self.track = None;
         self.status.tracking = false;
@@ -306,15 +417,11 @@ impl T2Receiver {
             while p1 - MARGIN as f64 * step < end as f64 {
                 p1 += frame;
             }
-            let plp = l1post
-                .plps
-                .first()
-                .and_then(PlpParams::from_l1)
-                .and_then(|p| PlpDecoder::new(p, self.cfg.fec_threads));
+            let plp = l1post.plps.first().and_then(PlpParams::from_l1);
             self.status.mode = Some(mode);
             self.status.l1pre = Some(l1pre.clone());
             self.status.l1post = Some(l1post);
-            self.status.plp = plp.as_ref().map(|p| p.params);
+            self.status.plp = plp;
             self.status.tracking = true;
             self.status.l1_ok = true;
             self.status.locks += 1;
@@ -323,7 +430,6 @@ impl T2Receiver {
                 demod: Demod::new(geo),
                 geo,
                 l1pre,
-                plp,
                 cfo_hz: cfo,
                 step,
                 next_p1: p1,
@@ -591,7 +697,8 @@ impl T2Receiver {
         self.status.l1_ok = true;
         self.status.l1post = Some(post.clone());
 
-        let data = t.demod.data_cells(&mut carriers);
+        let scope = std::mem::take(&mut self.scope_wanted);
+        let data = t.demod.data_cells(&mut carriers, scope);
         self.status.profile.equalise += t_eq.elapsed();
         {
             let d = &t.demod.prof;
@@ -606,6 +713,37 @@ impl T2Receiver {
             return;
         };
         self.status.snr_db = data.snr_db;
+        let c_data = t.demod.carriers.data_cells();
+        let mid_symbol = (data.cells.len() / c_data.max(1)) / 2;
+        if scope && let Some(plp) = self.status.plp {
+            let cells = data.cells
+                [mid_symbol * c_data..((mid_symbol + 1) * c_data).min(data.cells.len())]
+                .iter()
+                .copied();
+            self.scopes = Some(Scopes {
+                raw: thin(data.scope_raw.iter().copied(), 3000),
+                data: thin(cells.collect::<Vec<_>>().into_iter(), 3000),
+                pilots: data.scope_pilots.clone(),
+                t2_qam: Some((plp.qam.bits() as u8, plp.rotated)),
+                pilot_mark: Some(1.0),
+                symbol: self.status.frames_ok,
+                ..Scopes::default()
+            });
+        }
+        // The channel at the middle symbol, for the display.
+        let estimate = ChannelEstimate {
+            mode: t.geo.mode,
+            h: data.channel.clone(),
+            noise: data.noise,
+        };
+        if self.heat_rate > 0.0 {
+            if self.heat.len() >= 400 {
+                self.heat.remove(0);
+            }
+            let row = Self::measurements(&mut self.measure_state, &estimate);
+            self.heat.push(row);
+        }
+        self.channel = Some(estimate);
         self.status.debug.push_str(&format!(
             " | symbol SNR dB {}",
             data.symbol_snr_db
@@ -625,30 +763,29 @@ impl T2Receiver {
             .filter(|i| *i < post.plps.len());
         if let Some(i) = pick {
             let params = PlpParams::from_l1(&post.plps[i]);
-            if params != t.plp.as_ref().map(|p| p.params) {
-                t.plp = params.and_then(|p| PlpDecoder::new(p, self.cfg.fec_threads));
-                self.status.plp = params;
-            }
+            self.status.plp = params;
             let dynamic = post.dynamic.get(i);
-            if let (Some(plp), Some(dynamic)) = (t.plp.as_mut(), dynamic) {
+            if let (Some(params), Some(dynamic)) = (params, dynamic) {
                 // The cells of the frame: P2's (all of them logical), then
                 // the data symbols'.
                 let mut cells = logical;
                 let mut var = lvar;
                 cells.extend_from_slice(&data.cells);
                 var.extend_from_slice(&data.var);
-                let first = PRE_CELLS + t.l1pre.l1_post_size as usize + dynamic.plp_start as usize;
-                self.packets.clear();
-                let stats = plp.decode_frame(
-                    &cells,
-                    &var,
-                    first,
-                    dynamic.plp_num_blocks as usize,
-                    &mut self.packets,
-                );
-                self.account(stats, plp.resyncs());
-                for p in &self.packets {
-                    self.ts.extend_from_slice(p);
+                let job = Job {
+                    params,
+                    cells,
+                    var,
+                    start: PRE_CELLS + t.l1pre.l1_post_size as usize + dynamic.plp_start as usize,
+                    blocks: dynamic.plp_num_blocks as usize,
+                };
+                let threads = self.cfg.fec_threads;
+                let done = self
+                    .fec
+                    .get_or_insert_with(|| FecPipe::new(threads))
+                    .submit(job);
+                for d in done {
+                    self.absorb(d);
                 }
                 self.status.plp_id = post.plps[i].plp_id;
                 self.status.blocks_per_frame = dynamic.plp_num_blocks as usize;
@@ -663,7 +800,7 @@ impl T2Receiver {
         self.finish_frame(t);
     }
 
-    fn account(&mut self, stats: Option<FrameStats>, resyncs: u64) {
+    fn account(&mut self, stats: Option<crate::t2::plp::FrameStats>, resyncs: u64) {
         match stats {
             Some(s) => {
                 let p = &mut self.status.profile;

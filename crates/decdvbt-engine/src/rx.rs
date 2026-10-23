@@ -18,10 +18,12 @@ use std::time::{Duration, Instant};
 use decdvbt_core::{Iq, SampleFormat};
 use decdvbt_io::{IqFileWriter, IqSource};
 
+use decdvbt_rx::auto::{AutoReceiver, Standard};
 use decdvbt_rx::delay_doppler::{DelayDoppler, FreqDoppler};
-use decdvbt_rx::receiver::{Receiver as OfdmReceiver, ReceiverConfig, ReceiverStatus};
+use decdvbt_rx::receiver::ReceiverStatus;
 use decdvbt_rx::scope::{Measurements, Scopes};
 use decdvbt_rx::sounder::{Sounder, SounderConfig, Status as SounderStatus};
+use decdvbt_rx::t2::receiver::T2Status;
 use decdvbt_ts::Epg;
 
 use crate::frontend::{FrontEnd, FrontEndReading, FrontEndSettings};
@@ -147,6 +149,9 @@ pub struct SounderUpdate {
 #[derive(Default)]
 struct DecoderOut {
     status: ReceiverStatus,
+    /// Which standard has the lock, and the T2 receiver's status with it.
+    standard: Standard,
+    t2: Option<Box<T2Status>>,
     /// Packets made since the receiver was started.
     packets: u64,
     scopes: Option<Arc<Scopes>>,
@@ -197,7 +202,11 @@ impl Pace {
 /// What [`Rx::take_decoder`] hands over.
 #[derive(Default)]
 pub struct DecoderUpdate {
+    /// The status in the DVB-T receiver's terms (see [`AutoReceiver::status`]).
     pub status: ReceiverStatus,
+    /// The standard locked on, and, if it is T2, that receiver's own status.
+    pub standard: Standard,
+    pub t2: Option<Box<T2Status>>,
     /// Transport packets decoded since the receiver was started.
     pub packets: u64,
     /// The scopes' cells and the measurements, if new ones have been made
@@ -340,6 +349,8 @@ impl Rx {
         let mut o = self.shared.decoder.lock().unwrap();
         DecoderUpdate {
             status: o.status.clone(),
+            standard: o.standard,
+            t2: o.t2.clone(),
             packets: o.packets,
             scopes: o.scopes.take(),
             measurements: o.measurements.take(),
@@ -410,7 +421,7 @@ fn run(
     let mut sounder: Option<(Sounder, f64)> = None;
     let mut sounder_pub = Instant::now();
     // The receiver, with the RF frequency of the signal it was asked for.
-    let mut decoder: Option<(OfdmReceiver, f64)> = None;
+    let mut decoder: Option<(AutoReceiver, f64)> = None;
     let mut decoder_pub = Instant::now();
     let mut settle = Settle::default();
     let mut front = FrontEnd::new(FrontEndSettings::default());
@@ -431,7 +442,7 @@ fn run(
     };
     let new_decoder = |vfo_hz: f64, centre: f64, rate: f64, heat: Option<f64>| {
         let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
-        let mut d = OfdmReceiver::new(ReceiverConfig::new(rate, offset));
+        let mut d = AutoReceiver::new(rate, offset);
         d.set_heat(heat.unwrap_or(0.0));
         d
     };
@@ -599,7 +610,9 @@ fn run(
                     meter.time(Stage::Decoder, || d.measure())
                 });
                 let mut o = sh.decoder.lock().unwrap();
-                o.status = d.status().clone();
+                o.status = d.status();
+                o.standard = d.standard();
+                o.t2 = (d.standard() == Standard::Dvbt2).then(|| Box::new(d.dvbt2().clone()));
                 o.packets += packets;
                 if let Some(s) = d.take_scopes() {
                     o.scopes = Some(Arc::new(s));
@@ -873,6 +886,90 @@ mod tests {
             "{} {}",
             at(c0),
             at(c3)
+        );
+    }
+
+    /// A DVB-T2 signal through the thread: the receiver finds out for itself
+    /// that it is T2, reads L1, hands over the packets that went in, and the
+    /// scopes and the channel come out too.
+    #[test]
+    fn a_t2_signal_is_recognised_and_decoded_in_the_thread() {
+        use decdvbt_io::IqFileReader;
+        use decdvbt_mod::channel::{Channel, Path as ChPath};
+        use decdvbt_mod::sim::{T2SimOptions, generate_t2};
+        use decdvbt_mod::t2::T2Config;
+        use decdvbt_mod::ts::check_test_payload;
+
+        let opts = T2SimOptions {
+            cfg: T2Config::parse("8k-1/16-pp4-16qam-3/4-short-ext").unwrap(),
+            ts_file: None,
+            frames: 14,
+            out_rate_hz: Some(10e6),
+            level_dbfs: -20.0,
+            channel: Channel {
+                paths: vec![ChPath::echo(0.0, 0.0), ChPath::echo(2.0, -9.0)],
+                cfo_hz: 40_000.0,
+                cn_db: Some(30.0),
+                ..Default::default()
+            },
+        };
+        let path = std::env::temp_dir().join("decdvbt-engine-t2.cs8");
+        let mut w = decdvbt_io::IqFileWriter::create(&path, SampleFormat::Cs8).unwrap();
+        generate_t2(&opts, |b| w.write(b).map_err(|e| e.to_string())).unwrap();
+        w.finish().unwrap();
+
+        let src = IqFileReader::open(&path, SampleFormat::Cs8, 10e6, 1 << 17)
+            .unwrap()
+            .with_center_freq(546e6);
+        let rx = Rx::start(Box::new(src), RxOptions::default(), None);
+        let (tap, tap_rx) = decdvbt_ts::TsTap::new(4096);
+        rx.set_outputs(Outputs {
+            tap: Some(tap),
+            ..Default::default()
+        });
+        rx.send(Command::Decode(Some(546e6)));
+        rx.send(Command::Scopes(true));
+        rx.send(Command::Measure(true));
+        let t0 = Instant::now();
+        let (mut ts, mut last) = (Vec::new(), None);
+        let (mut scopes, mut measurements) = (None, None);
+        // Until a couple of thousand packets are in, before the file ends and
+        // the engine plays it again from the start.
+        while t0.elapsed() < Duration::from_secs(20) && ts.len() < 188 * 2000 {
+            std::thread::sleep(Duration::from_millis(50));
+            let u = rx.take_decoder();
+            for batch in tap_rx.try_iter() {
+                for p in &batch {
+                    ts.extend_from_slice(p);
+                }
+            }
+            scopes = u.scopes.or(scopes);
+            measurements = u.measurements.or(measurements);
+            last = Some((u.standard, u.t2, u.status));
+        }
+        drop(rx);
+        let _ = std::fs::remove_file(&path);
+        let (standard, t2, status) = last.expect("a status");
+        assert_eq!(standard, Standard::Dvbt2);
+        let t2 = t2.expect("T2's status");
+        assert!(t2.l1_ok && t2.decoding, "{t2:?}");
+        assert!(status.tracking && status.tps_synced && status.decoding);
+        let good = ts
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .filter(|p| check_test_payload(&p[..]).is_some())
+            .count();
+        assert!(good > 1000, "{good} good packets of {}", ts.len() / 188);
+        let scopes = scopes.expect("scopes");
+        assert_eq!(scopes.t2_qam, Some((4, false)));
+        assert!(!scopes.data.is_empty() && !scopes.pilots.is_empty());
+        let m = measurements.expect("measurements");
+        assert!(m.mean_snr_db > 15.0, "{}", m.mean_snr_db);
+        assert!(
+            m.echoes
+                .iter()
+                .any(|e| (e.delay_us.abs() - 2.0).abs() < 0.5)
         );
     }
 

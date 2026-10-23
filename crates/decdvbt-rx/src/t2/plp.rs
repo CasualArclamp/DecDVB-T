@@ -58,6 +58,12 @@ impl PlpParams {
         })
     }
 
+    /// The C/N this receiver needs for the PLP's coding in a Gaussian channel,
+    /// dB (see [`decdvbt_fec::t2::threshold`]).
+    pub fn qef_cn_db(&self) -> Option<f32> {
+        decdvbt_fec::t2::threshold::qef_cn_db(self.frame, self.rate, self.qam, self.rotated)
+    }
+
     /// Cells in one FEC block.
     pub fn cells_per_block(&self) -> usize {
         self.frame.n_ldpc() / self.qam.bits()

@@ -320,7 +320,7 @@ impl Receiver {
         let guard_us = (fft.n() as f64 / t.guard.divisor() as f64 / self.fs_native * 1e6) as f32;
         Some(scope::measure(
             &mut self.measure_state,
-            fft,
+            fft.n(),
             self.fs_native,
             guard_us,
             t.eq.channel(),
@@ -558,7 +558,7 @@ impl Receiver {
                 }
                 self.heat.push(scope::measure(
                     &mut self.measure_state,
-                    fft,
+                    fft.n(),
                     self.fs_native,
                     guard_us,
                     t.eq.channel(),

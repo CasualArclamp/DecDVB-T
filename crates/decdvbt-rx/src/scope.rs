@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use decdvbt_core::Iq;
-use decdvbt_core::dvbt::{FftSize, Modulation};
+use decdvbt_core::dvbt::Modulation;
 use decdvbt_ofdm::pilots::{Role, SymbolPlan};
 use rustfft::{Fft, FftPlanner};
 
@@ -37,12 +37,17 @@ pub struct Scopes {
     pub tps: Vec<Iq>,
     /// The constellation the data cells are on, once the TPS says.
     pub modulation: Option<Modulation>,
+    /// A DVB-T2 signal's: the constellation's bits a cell and whether it is
+    /// rotated (then `modulation` is `None`), and the level the pilots are
+    /// normalised to (4/3 for DVB-T).
+    pub t2_qam: Option<(u8, bool)>,
+    pub pilot_mark: Option<f32>,
     /// The symbol's number since the lock.
     pub symbol: u64,
 }
 
 /// Every `stride`-th of `x`, so that no more than `max` remain.
-fn thin(x: impl ExactSizeIterator<Item = Iq>, max: usize) -> Vec<Iq> {
+pub fn thin(x: impl ExactSizeIterator<Item = Iq>, max: usize) -> Vec<Iq> {
     let stride = x.len().div_ceil(max).max(1);
     x.step_by(stride).collect()
 }
@@ -67,6 +72,8 @@ pub fn snapshot(
             .map(|(_, &c)| c)
     };
     Scopes {
+        t2_qam: None,
+        pilot_mark: None,
         raw: thin(raw.iter().copied(), MAX_POINTS),
         data: thin(
             plan.data_carriers(phase).iter().map(|&k| z[k as usize]),
@@ -119,11 +126,11 @@ pub struct MeasureState {
 
 /// The curves and the impulse response from a channel estimate: `hr`, `hi` its
 /// real and imaginary parts per carrier, `w` its power |H|² and `noise` the
-/// noise power at each carrier. `fs_native` is the signal's own sample rate,
+/// noise power at each carrier. `n` is the transform's length, `fs_native` the signal's own sample rate,
 /// `guard_us` the guard interval.
 pub fn measure(
     st: &mut MeasureState,
-    fft: FftSize,
+    n: usize,
     fs_native: f64,
     guard_us: f32,
     (hr, hi): (&[f32], &[f32]),
@@ -132,7 +139,6 @@ pub fn measure(
 ) -> Measurements {
     let k_total = hr.len();
     let kmid = (k_total - 1) / 2;
-    let n = fft.n();
     let df_mhz = (fs_native / n as f64 / 1e6) as f32;
 
     // Across the band: groups of carriers.
@@ -224,6 +230,7 @@ pub fn measure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use decdvbt_core::dvbt::FftSize;
 
     /// A channel of two paths, 2 µs apart and 6 dB down: its estimate is
     /// 1 + a·e^(−j2πfτ); the impulse response has the second path at +2 µs,
@@ -247,7 +254,7 @@ mod tests {
         let noise = vec![0.001f32; k_total];
         let m = measure(
             &mut MeasureState::default(),
-            fft,
+            fft.n(),
             fs,
             28.0,
             (&hr, &hi),

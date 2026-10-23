@@ -11,9 +11,18 @@ use decdvbt_core::channel::parse_channel;
 use decdvbt_core::channel::uhf_centre_hz;
 use decdvbt_io::{IqFileReader, IqSource, format_from_path, name_hint};
 
-/// `source` is an IQ file, or a UHF channel ("C26") for the HackRF.
-/// `file_rate_msps` is the rate of a raw file whose name does not say.
-pub fn open(source: &str, file_rate_msps: f64) -> Result<Box<dyn IqSource>> {
+/// The HackRF's gains: the RF amplifier (+14 dB), LNA and VGA, dB.
+#[derive(Clone, Copy)]
+pub struct Gains {
+    pub amp: bool,
+    pub lna: u16,
+    pub vga: u16,
+}
+
+/// `source` is an IQ file, or a UHF channel ("C26") for the HackRF, which
+/// takes `gains` (the radio's defaults if `None`). `file_rate_msps` is the
+/// rate of a raw file whose name does not say.
+pub fn open(source: &str, file_rate_msps: f64, gains: Option<Gains>) -> Result<Box<dyn IqSource>> {
     match parse_channel(source) {
         #[cfg(feature = "hackrf")]
         Some(n) => {
@@ -21,7 +30,11 @@ pub fn open(source: &str, file_rate_msps: f64) -> Result<Box<dyn IqSource>> {
             Ok(Box::new(HackRfSource::open(HackRfSettings {
                 center_hz: uhf_centre_hz(n).unwrap().round() as u64,
                 sample_rate: 10_000_000,
-                gains: HackRfGains::default(),
+                gains: gains.map_or_else(HackRfGains::default, |g| HackRfGains {
+                    amp: g.amp,
+                    lna_db: g.lna,
+                    vga_db: g.vga,
+                }),
             })?))
         }
         #[cfg(not(feature = "hackrf"))]
