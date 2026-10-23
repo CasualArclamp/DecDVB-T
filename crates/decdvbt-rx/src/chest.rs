@@ -38,6 +38,12 @@ use decdvbt_core::Iq;
 use decdvbt_core::dvbt::FftSize;
 use decdvbt_ofdm::pilots::{continual_pilots, prbs};
 
+// The work is mostly loops over a few thousand carriers. They are written as
+// plain loops over separate real and imaginary arrays (which the compiler
+// turns into vector code) and compiled twice, once for the baseline CPU and
+// once with AVX2 and FMA switched on, the right one chosen at run time (as the
+// interpolator and the Viterbi do).
+
 /// How much of each new pilot estimate goes into the grid (the rest being
 /// the old): 1 for no smoothing. Half averages about three estimates, a few
 /// ms for the pilots of one carrier.
@@ -100,18 +106,32 @@ pub struct Equalizer {
     /// How well the last symbol's continual pilots lined up with the
     /// reference once fitted: |Σ z|/Σ|z|, 1 for perfectly.
     pub coherence: f32,
-    /// The pilots' positions across the band, (k − kmid)/kmid.
+    /// Fill `h` and `cp_resid` (for the diagnostics: the decoder does not
+    /// read them) on each symbol.
+    pub diagnostics: bool,
+    avx2: bool,
+    /// The pilots' positions across the band, (k − kmid)/kmid, padded to a
+    /// multiple of eight with zeros.
     cp_x: Vec<f32>,
-    /// e^(−j·b·x) for each slope tried and each pilot.
-    scan: Vec<Iq>,
+    /// e^(−j·b·x) for each slope tried and each pilot, as real and imaginary
+    /// arrays of `np` (the padded pilot count) per slope.
+    scan_r: Vec<f32>,
+    scan_i: Vec<f32>,
+    np: usize,
+    /// Scratch: the pilots against their reference, and the grid and the
+    /// interpolated points as real and imaginary arrays.
+    zr: Vec<f32>,
+    zi: Vec<f32>,
+    ext_r: Vec<f32>,
+    ext_i: Vec<f32>,
+    mid: [[Vec<f32>; 2]; 2],
+    hr: Vec<f32>,
+    hi: Vec<f32>,
     /// The noise power at each carrier (channel-estimate units²), from the
     /// pilots' innovations.
     pub noise: Vec<f32>,
     /// The same per grid point, before smoothing across them.
     nz: Vec<f32>,
-    /// The grid with `L` copies of its end values either side, for the
-    /// interpolator.
-    ext: Vec<Iq>,
     /// The interpolator's taps for the carriers a third and two thirds of
     /// the way between grid points, for the grid points m−L+1 .. m+L.
     taps: [[f32; 2 * L]; 2],
@@ -157,13 +177,18 @@ impl Equalizer {
             .map(|&k| (k as f32 - kmid as f32) / kmid as f32)
             .collect();
         let n_slopes = (2.0 * SLOPE_MAX / SLOPE_STEP) as usize + 1;
-        let scan = (0..n_slopes)
-            .flat_map(|i| {
-                let b = -SLOPE_MAX + i as f32 * SLOPE_STEP;
-                cp_x.iter()
-                    .map(move |&x| Iq::new((b * x).cos(), -(b * x).sin()))
-            })
-            .collect();
+        let np = cps.len().next_multiple_of(8);
+        let mut cp_x = cp_x;
+        cp_x.resize(np, 0.0);
+        let (mut scan_r, mut scan_i) = (Vec::new(), Vec::new());
+        for i in 0..n_slopes {
+            let b = -SLOPE_MAX + i as f32 * SLOPE_STEP;
+            for &x in &cp_x {
+                // The padding pilots have no weight: z is zero there.
+                scan_r.push((b * x).cos());
+                scan_i.push(-(b * x).sin());
+            }
+        }
         Equalizer {
             fft,
             k_total,
@@ -186,15 +211,42 @@ impl Equalizer {
             nz: vec![0.0; g],
             cp_resid: Vec::new(),
             coherence: 1.0,
+            diagnostics: false,
+            avx2: Self::detect(),
             cp_x,
-            scan,
-            ext: vec![Iq::new(0.0, 0.0); g + 2 * L],
+            scan_r,
+            scan_i,
+            np,
+            zr: vec![0.0; np],
+            zi: vec![0.0; np],
+            ext_r: vec![0.0; g + 2 * L],
+            ext_i: vec![0.0; g + 2 * L],
+            mid: std::array::from_fn(|_| std::array::from_fn(|_| vec![0.0; g])),
+            hr: vec![0.0; k_total],
+            hi: vec![0.0; k_total],
             taps: [interp_taps(1.0 / 3.0), interp_taps(2.0 / 3.0)],
         }
     }
 
     pub fn fft(&self) -> FftSize {
         self.fft
+    }
+
+    fn detect() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// Use the baseline code even where AVX2 is there (tests, comparison).
+    pub fn without_avx2(mut self) -> Equalizer {
+        self.avx2 = false;
+        self
     }
 
     /// How many samples later than the reference the last symbol's window
@@ -218,83 +270,141 @@ impl Equalizer {
 
     /// Take a symbol's carriers `c` (modified: its phase offset and slope
     /// taken out), the symbol being number `phase` (its index in the frame
-    /// mod 4); fills `h`, `z` and `w`.
+    /// mod 4); fills `z`, `w` and `noise` (and, with `diagnostics`, `h`).
     pub fn process(&mut self, c: &mut [Iq], phase: usize) {
+        #[cfg(target_arch = "x86_64")]
+        if self.avx2 {
+            // SAFETY: AVX2 and FMA were detected at construction.
+            unsafe { self.process_avx2(c, phase) };
+            return;
+        }
+        self.process_inner(c, phase);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn process_avx2(&mut self, c: &mut [Iq], phase: usize) {
+        self.process_inner(c, phase);
+    }
+
+    #[inline(always)]
+    fn process_inner(&mut self, c: &mut [Iq], phase: usize) {
         debug_assert_eq!(c.len(), self.k_total);
-        let kmid = self.kmid as f32;
+        let kmid = self.kmid;
+        let (np, n_cp) = (self.np, self.cps.len());
 
         // 1. The continual pilots against their reference.
-        let hcp: Vec<Iq> = self.cps.iter().map(|&k| c[k] * self.inv[k]).collect();
         let mut trusted = true;
+        let mut hcp = [Iq::new(0.0, 0.0); 192];
+        let hcp = &mut hcp[..n_cp];
+        for (h, &k) in hcp.iter_mut().zip(&self.cps) {
+            *h = c[k] * self.inv[k];
+        }
         if self.ref_ok && self.use_cpe {
-            let z: Vec<Iq> = hcp
-                .iter()
-                .zip(&self.cp_ref)
-                .map(|(h, r)| h * r.conj())
-                .collect();
-            // The coarse slope: the strongest coherent sum.
-            let n = z.len();
-            let (mut best, mut best_i, mut best_sum) = (-1.0f32, 0usize, Iq::new(0.0, 0.0));
-            for (i, row) in self.scan.chunks_exact(n).enumerate() {
-                let mut sum = Iq::new(0.0, 0.0);
-                for (zj, r) in z.iter().zip(row) {
-                    sum += zj * r;
-                }
-                let p = sum.norm_sqr();
+            for (j, (h, r)) in hcp.iter().zip(&self.cp_ref).enumerate() {
+                let z = h * r.conj();
+                self.zr[j] = z.re;
+                self.zi[j] = z.im;
+            }
+            // The coarse slope: the strongest coherent sum over the slopes
+            // tried.
+            let (mut best, mut best_i, mut best_sum) = (-1.0f32, 0usize, (0.0f32, 0.0f32));
+            for (i, (sr, si)) in self
+                .scan_r
+                .chunks_exact(np)
+                .zip(self.scan_i.chunks_exact(np))
+                .enumerate()
+            {
+                let sum = cdot(&self.zr, &self.zi, sr, si);
+                let p = sum.0 * sum.0 + sum.1 * sum.1;
                 if p > best {
                     (best, best_i, best_sum) = (p, i, sum);
                 }
             }
-            let mut b = -SLOPE_MAX + best_i as f32 * SLOPE_STEP;
-            let mut a = best_sum.arg();
-            // Refined by a weighted line fit through what the coarse one
-            // leaves (small, so nothing wraps).
-            for _ in 0..2 {
-                let (mut s0, mut sx, mut sxx, mut sp, mut sxp) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
-                for (zj, &xj) in z.iter().zip(&self.cp_x) {
-                    let th = a + b * xj;
-                    let r = zj * Iq::new(th.cos(), -th.sin());
-                    let (w, ph, xj) = (f64::from(r.norm()), f64::from(r.arg()), f64::from(xj));
-                    s0 += w;
-                    sx += w * xj;
-                    sxx += w * xj * xj;
-                    sp += w * ph;
-                    sxp += w * xj * ph;
-                }
-                let d = s0 * sxx - sx * sx;
-                if d > 0.0 {
-                    let db = (s0 * sxp - sx * sp) / d;
-                    let da = (sp - db * sx) / s0;
-                    b += db as f32;
-                    a += da as f32;
-                }
-            }
-            // How well the pilots line up now.
-            let (mut sum, mut mag) = (Iq::new(0.0, 0.0), 0.0f32);
-            for (zj, &xj) in z.iter().zip(&self.cp_x) {
-                let th = a + b * xj;
-                sum += zj * Iq::new(th.cos(), -th.sin());
-                mag += zj.norm();
-            }
-            self.coherence = if mag > 0.0 { sum.norm() / mag } else { 0.0 };
+            let b0 = -SLOPE_MAX + best_i as f32 * SLOPE_STEP;
+            let a0 = best_sum.1.atan2(best_sum.0);
+            // How well the pilots line up (at the coarse slope, which is
+            // within a quarter radian of the fine one).
+            let mag: f32 = (0..n_cp)
+                .map(|j| (self.zr[j] * self.zr[j] + self.zi[j] * self.zi[j]).sqrt())
+                .sum();
+            self.coherence = if mag > 0.0 { best.sqrt() / mag } else { 0.0 };
             trusted = self.coherence >= MIN_COHERENCE;
+            // Refined by a weighted line fit through the little the coarse
+            // one leaves (under a quarter radian, so its phase is
+            // arctan(t) = t − t³/3 + t⁵/5 of the ratio t of its parts).
+            let (sr, si) = (
+                &self.scan_r[best_i * np..(best_i + 1) * np],
+                &self.scan_i[best_i * np..(best_i + 1) * np],
+            );
+            let (ca, sa) = (a0.cos(), -a0.sin());
+            let (mut s0, mut sx, mut sxx, mut sp, mut sxp) = (0.0f32, 0.0, 0.0, 0.0, 0.0);
+            for j in 0..n_cp {
+                let (zr, zi) = (self.zr[j], self.zi[j]);
+                let (rr, ri) = (zr * sr[j] - zi * si[j], zr * si[j] + zi * sr[j]);
+                let (qr, qi) = (rr * ca - ri * sa, rr * sa + ri * ca);
+                let w = (qr * qr + qi * qi).sqrt();
+                // A pilot a quarter turn or more from the fit is noise.
+                let t = if qr > 1e-9 {
+                    (qi / qr).clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                let t2 = t * t;
+                let ph = t * (1.0 - t2 * (1.0 / 3.0 - t2 * 0.2));
+                let w = if qr > 1e-9 { w } else { 0.0 };
+                let x = self.cp_x[j];
+                s0 += w;
+                sx += w * x;
+                sxx += w * x * x;
+                sp += w * ph;
+                sxp += w * x * ph;
+            }
+            let d = s0 * sxx - sx * sx;
+            let (mut da, mut db) = (0.0, 0.0);
+            if d > 0.0 {
+                db = (s0 * sxp - sx * sp) / d;
+                da = (sp - db * sx) / s0;
+            }
+            let (a, b) = (a0 + da, b0 + db);
             self.cpe = (a, b);
-            for (k, v) in c.iter_mut().enumerate() {
-                let th = a + b * (k as f32 - kmid) / kmid;
-                *v *= Iq::new(th.cos(), -th.sin());
+            // Taken out of every carrier: e^(−j(a + b·x)) with x linear in k,
+            // so a phasor stepped out from the middle either way (renewed
+            // exactly now and then against the rounding).
+            let step = -b / kmid as f32;
+            let (cs, sn) = (step.cos(), step.sin());
+            let stepv = Iq::new(cs, sn);
+            let mid = Iq::new(a.cos(), -a.sin());
+            c[kmid] *= mid;
+            let (mut up, mut down) = (mid, mid);
+            let n_side = c.len() - 1 - kmid;
+            for i in 1..=n_side {
+                up *= stepv;
+                down *= stepv.conj();
+                if i % 256 == 0 {
+                    let th = step * i as f32;
+                    up = mid * Iq::new(th.cos(), th.sin());
+                    down = mid * Iq::new(th.cos(), -th.sin());
+                }
+                c[kmid + i] *= up;
+                c[kmid - i] *= down;
             }
         } else {
             self.cpe = (0.0, 0.0);
         }
         // The reference follows the corrected pilots.
         let (mut err, mut pow) = (0.0f32, 0.0f32);
-        self.cp_resid.clear();
-        for ((&k, r), _) in self.cps.iter().zip(&mut self.cp_ref).zip(&hcp) {
+        if self.diagnostics {
+            self.cp_resid.clear();
+        }
+        for (&k, r) in self.cps.iter().zip(&mut self.cp_ref) {
             let h = c[k] * self.inv[k];
             if self.ref_ok {
                 err += (h - *r).norm_sqr();
                 pow += r.norm_sqr();
-                self.cp_resid.push(h * r.conj() / r.norm_sqr().max(1e-12));
+                if self.diagnostics {
+                    self.cp_resid.push(h * r.conj() / r.norm_sqr().max(1e-12));
+                }
             }
             if !self.ref_ok {
                 *r = h;
@@ -345,25 +455,35 @@ impl Equalizer {
 
         // 3. Every carrier, from the grid, its ends held out `L` points. The
         // grid's own points are the carriers 3m; the two between each pair
-        // take 2·L taps.
-        self.ext[L..L + m_max].copy_from_slice(&self.grid);
+        // take 2·L taps: a short filter over the grid, as real and imaginary
+        // arrays.
+        for (m, g) in self.grid.iter().enumerate() {
+            self.ext_r[L + m] = g.re;
+            self.ext_i[L + m] = g.im;
+        }
         let (first, last) = (self.grid[0], self.grid[m_max - 1]);
-        self.ext[..L].fill(first);
-        self.ext[L + m_max..].fill(last);
+        self.ext_r[..L].fill(first.re);
+        self.ext_i[..L].fill(first.im);
+        self.ext_r[L + m_max..].fill(last.re);
+        self.ext_i[L + m_max..].fill(last.im);
+        for (ph, taps) in self.taps.iter().enumerate() {
+            // Grid points m−L+1 .. m+L sit at ext[m+1 .. m+2L+1].
+            fir(&self.ext_r[1..], taps, &mut self.mid[ph][0]);
+            fir(&self.ext_i[1..], taps, &mut self.mid[ph][1]);
+        }
+        // Into carrier order.
+        let k_total = self.k_total;
         for m in 0..m_max {
-            self.h[3 * m] = self.grid[m];
-            for (j, taps) in self.taps.iter().enumerate() {
-                let k = 3 * m + 1 + j;
-                if k >= self.k_total {
-                    break;
-                }
-                // Grid points m−L+1 .. m+L sit at ext[m+1 .. m+2L+1].
-                let win = &self.ext[m + 1..m + 1 + 2 * L];
-                let mut acc = Iq::new(0.0, 0.0);
-                for (g, &t) in win.iter().zip(taps) {
-                    acc += g * t;
-                }
-                self.h[k] = acc;
+            let k = 3 * m;
+            self.hr[k] = self.grid[m].re;
+            self.hi[k] = self.grid[m].im;
+            if k + 1 < k_total {
+                self.hr[k + 1] = self.mid[0][0][m];
+                self.hi[k + 1] = self.mid[0][1][m];
+            }
+            if k + 2 < k_total {
+                self.hr[k + 2] = self.mid[1][0][m];
+                self.hi[k + 2] = self.mid[1][1][m];
             }
         }
 
@@ -374,11 +494,11 @@ impl Equalizer {
         let mut run: f32 = (0..=NOISE_SPAN.min(m_max - 1)).map(|i| self.nz[i]).sum();
         let mut count = NOISE_SPAN.min(m_max - 1) as isize + 1;
         for m in 0..m_max {
-            let avg = run / count as f32;
+            let avg = (run / count as f32).max(1e-9);
             for j in 0..3 {
                 let k = 3 * m + j;
-                if k < self.k_total {
-                    self.noise[k] = avg.max(1e-9);
+                if k < k_total {
+                    self.noise[k] = avg;
                 }
             }
             // The window moves on: m + span + 1 in, m − span out.
@@ -394,18 +514,56 @@ impl Equalizer {
         }
 
         // 4. Equalise.
-        for (((zk, wk), &h), &ck) in self
+        for ((((zk, wk), &hr), &hi), ck) in self
             .z
             .iter_mut()
             .zip(&mut self.w)
-            .zip(&self.h)
+            .zip(&self.hr)
+            .zip(&self.hi)
             .zip(c.iter())
         {
-            let p = h.norm_sqr().max(1e-12);
-            *zk = ck * h.conj() / p;
+            let p = (hr * hr + hi * hi).max(1e-12);
+            let q = 1.0 / p;
+            *zk = Iq::new((ck.re * hr + ck.im * hi) * q, (ck.im * hr - ck.re * hi) * q);
             *wk = p;
         }
+        if self.diagnostics {
+            for (h, (&r, &i)) in self.h.iter_mut().zip(self.hr.iter().zip(&self.hi)) {
+                *h = Iq::new(r, i);
+            }
+        }
         self.symbols += 1;
+    }
+}
+
+/// Σ z·s over eight partial sums (which the compiler runs side by side as a
+/// vector): the coherent sum of the pilots against a row of the slope table.
+#[inline(always)]
+fn cdot(zr: &[f32], zi: &[f32], sr: &[f32], si: &[f32]) -> (f32, f32) {
+    let (mut ar, mut ai) = ([0.0f32; 8], [0.0f32; 8]);
+    let (zr, zi) = (zr.as_chunks::<8>().0, zi.as_chunks::<8>().0);
+    let (sr, si) = (sr.as_chunks::<8>().0, si.as_chunks::<8>().0);
+    for (((zr, zi), sr), si) in zr.iter().zip(zi).zip(sr).zip(si) {
+        for l in 0..8 {
+            ar[l] += zr[l] * sr[l] - zi[l] * si[l];
+            ai[l] += zr[l] * si[l] + zi[l] * sr[l];
+        }
+    }
+    (ar.iter().sum(), ai.iter().sum())
+}
+
+/// out[m] = Σ taps[i]·x[m + i]: eight taps, over every m the output holds.
+#[inline(always)]
+fn fir(x: &[f32], taps: &[f32; 2 * L], out: &mut [f32]) {
+    let n = out.len();
+    let x = &x[..n + 2 * L - 1];
+    for (m, o) in out.iter_mut().enumerate() {
+        let w = &x[m..m + 2 * L];
+        let mut acc = 0.0f32;
+        for i in 0..2 * L {
+            acc += taps[i] * w[i];
+        }
+        *o = acc;
     }
 }
 

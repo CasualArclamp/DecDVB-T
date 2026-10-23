@@ -10,9 +10,12 @@
 //! measures from the pilots, so a band an adjacent channel has leaked into
 //! counts for less), and quantised to eight bits. The
 //! cells are taken in the order the symbol deinterleaver puts them (a
-//! gather by a table, not a pass of moves) and each soft bit goes to the
-//! place the bit deinterleaver puts it (a scatter within the 126-cell
-//! block, which sits in the first-level cache).
+//! gather by a table, not a pass of moves). The soft bits are made a bit at
+//! a time over all the cells (a loop the compiler turns into vector code),
+//! as one array for each of the cell's v bits; the bit deinterleaver is then
+//! a rotation of each of those within a 126-cell block, and putting the v
+//! arrays' bytes side by side, cell by cell, a byte transposition done with
+//! shuffles eight cells at a time.
 
 use decdvbt_core::Iq;
 use decdvbt_core::dvbt::{FftSize, Modulation};
@@ -108,12 +111,22 @@ pub struct Demapper {
     /// For each symbol phase (index in the frame mod 4): the carrier each
     /// cell comes from, in the order the symbol deinterleaver outputs.
     src: [Vec<u16>; 4],
-    /// For interleaved cell w of a block and its bit e: where in the block's
-    /// 126·v soft bits the bit deinterleaver puts it.
-    dest: Vec<u16>,
     /// The mean gain |H|² of the data cells over the mean noise power at
     /// their carriers, as a ratio, followed over the symbols.
     snr: f32,
+    avx2: bool,
+    /// The interleaver (the plane) each place of a cell's v bits comes from.
+    order: Vec<usize>,
+    /// Scratch: the gathered cells, and a soft-bit array for each bit, and the
+    /// block's bit arrays rotated.
+    zr: Vec<f32>,
+    zi: Vec<f32>,
+    gain: Vec<f32>,
+    noise: Vec<f32>,
+    planes: Vec<i8>,
+    rot: Vec<i8>,
+    /// The shuffle masks that put three eight-word arrays side by side.
+    masks: [[[u8; 16]; 3]; 3],
 }
 
 impl Demapper {
@@ -135,14 +148,18 @@ impl Demapper {
         });
         // Bit deinterleaving: received bit y_e of cell w belongs to the
         // original cell (w + offset_e) mod 126, at the word position k that
-        // the demultiplexer sent to interleaver e.
-        let order = demux_order(modulation);
-        let mut dest = vec![0u16; BLOCK * v];
-        for w in 0..BLOCK {
-            for e in 0..v {
-                let k = order.iter().position(|&o| o == e).unwrap();
-                let i = (w + OFFSETS[e]) % BLOCK;
-                dest[w * v + e] = (i * v + k) as u16;
+        // the demultiplexer sent to interleaver e; so the output's bit k of
+        // cell i is plane e = order[k] at cell (i − offset_e) mod 126.
+        let order = demux_order(modulation).to_vec();
+        // Three eight-word arrays side by side: output word g (of 24) is word
+        // g/3 of array g%3.
+        let mut masks = [[[0x80u8; 16]; 3]; 3];
+        for (o, row) in masks.iter_mut().enumerate() {
+            for j in 0..8 {
+                let g = 8 * o + j;
+                let (c, comp) = (g / 3, g % 3);
+                row[comp][2 * j] = (2 * c) as u8;
+                row[comp][2 * j + 1] = (2 * c + 1) as u8;
             }
         }
         Demapper {
@@ -151,9 +168,34 @@ impl Demapper {
             cells,
             unit: unit_scale(modulation),
             src,
-            dest,
             snr: 0.0,
+            avx2: Self::detect(),
+            order,
+            zr: vec![0.0; cells],
+            zi: vec![0.0; cells],
+            gain: vec![0.0; cells],
+            noise: vec![0.0; cells],
+            planes: vec![0; cells * v],
+            rot: vec![0; BLOCK * v + 16],
+            masks,
         }
+    }
+
+    fn detect() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// Use the baseline code even where AVX2 is there (tests, comparison).
+    pub fn without_avx2(mut self) -> Demapper {
+        self.avx2 = false;
+        self
     }
 
     /// Soft bits a symbol gives.
@@ -197,42 +239,157 @@ impl Demapper {
     /// Returns the sums of the cells' gains and of the noise at their
     /// carriers.
     fn run<const V: usize>(
-        &self,
+        &mut self,
         l: usize,
         z: &[Iq],
         w: &[f32],
         noise: &[f32],
         out: &mut [i8],
     ) -> (f32, f32) {
+        // The cells in the order the symbol deinterleaver puts them.
+        let src = &self.src[l % 4];
+        for (p, &k) in src.iter().enumerate() {
+            let k = k as usize;
+            self.zr[p] = z[k].re;
+            self.zi[p] = z[k].im;
+            self.gain[p] = w[k];
+            self.noise[p] = noise[k];
+        }
+        let sums = (sum8(&self.gain), sum8(&self.noise));
+        #[cfg(target_arch = "x86_64")]
+        if self.avx2 {
+            // SAFETY: AVX2 and FMA were checked; the transposition's loads and
+            // stores stay inside the arrays (see there).
+            unsafe { self.make_avx2::<V>(out) };
+            return sums;
+        }
+        self.make::<V>(out);
+        sums
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn make_avx2<const V: usize>(&mut self, out: &mut [i8]) {
+        self.make::<V>(out);
+    }
+
+    /// The soft bits from the gathered cells, deinterleaved, into `out`.
+    #[inline(always)]
+    fn make<const V: usize>(&mut self, out: &mut [i8]) {
+        let cells = self.cells;
         // Log-likelihood ratio = (d1² − d0²) / (2 s²) for s² the noise power
         // on an axis of the equalised cell, in grid units: s² = u²·σ²/(2|H|²)
         // (σ² the noise at the carrier in the channel estimate's units).
-        // Quantised at GAIN.
-        let scale = GAIN / (self.unit * self.unit);
-        let src = &self.src[l % 4];
-        let (mut gain_sum, mut noise_sum) = (0.0f32, 0.0f32);
-        for (block, srcs) in out
-            .chunks_exact_mut(BLOCK * V)
-            .zip(src.as_chunks::<BLOCK>().0)
-        {
-            for (wi, &k) in srcs.iter().enumerate() {
-                let k = k as usize;
-                let c = z[k];
-                let llr = cell::<V>(c.re * self.unit, c.im * self.unit);
-                let s = scale * w[k] / noise[k];
-                gain_sum += w[k];
-                noise_sum += noise[k];
-                let d = &self.dest[wi * V..wi * V + V];
-                for e in 0..V {
-                    // Rounded to the nearest (copysign is a bit operation
-                    // where `round` is a library call); the cast saturates
-                    // at ±127/−128, which the decoder clips to ±127.
-                    let v = llr[e] * s;
-                    block[d[e] as usize] = (v + 0.5f32.copysign(v)) as i8;
-                }
+        // Quantised at GAIN, a bit of the cell at a time over all the cells.
+        let (u, scale) = (self.unit, GAIN / (self.unit * self.unit));
+        let planes = &mut self.planes;
+        for p in 0..cells {
+            let s = scale * self.gain[p] / self.noise[p];
+            let llr = cell::<V>(self.zr[p] * u, self.zi[p] * u);
+            for e in 0..V {
+                // Rounded to the nearest (copysign is a bit operation where
+                // `round` is a library call); the cast saturates at ±127/−128,
+                // which the decoder clips to ±127.
+                let v = llr[e] * s;
+                planes[e * cells + p] = (v + 0.5f32.copysign(v)) as i8;
             }
         }
-        (gain_sum, noise_sum)
+        // The bit deinterleaver, a block of 126 cells at a time: each bit's
+        // array rotated by its interleaver's offset, then the arrays' bytes
+        // put side by side.
+        for (b, block) in out.chunks_exact_mut(BLOCK * V).enumerate() {
+            let base = b * BLOCK;
+            for k in 0..V {
+                let e = self.order[k];
+                let off = OFFSETS[e];
+                let plane = &planes[e * cells + base..e * cells + base + BLOCK];
+                let dst = &mut self.rot[k * BLOCK..(k + 1) * BLOCK];
+                // dst[i] = plane[(i − off) mod 126].
+                dst[off..].copy_from_slice(&plane[..BLOCK - off]);
+                dst[..off].copy_from_slice(&plane[BLOCK - off..]);
+            }
+            interleave::<V>(&self.rot, &self.masks, block);
+        }
+    }
+}
+
+/// The sum of an array, eight partial sums at a time.
+#[inline(always)]
+fn sum8(x: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (chunks, tail) = x.as_chunks::<8>();
+    for c in chunks {
+        for l in 0..8 {
+            acc[l] += c[l];
+        }
+    }
+    acc.iter().sum::<f32>() + tail.iter().sum::<f32>()
+}
+
+/// `rot` holds V arrays of 126 bytes; `out` gets 126 cells of V bytes: cell i
+/// the i-th byte of each array in turn. Eight cells at a time by shuffles
+/// (SSSE3, which AVX2 implies), the last six by hand.
+#[inline(always)]
+fn interleave<const V: usize>(rot: &[i8], masks: &[[[u8; 16]; 3]; 3], out: &mut [i8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        if std::is_x86_feature_detected!("ssse3") {
+            // SAFETY: SSSE3 detected. Each 8-cell chunk reads 8 bytes from each
+            // of V arrays at offset 126·k + i with i + 8 ≤ 120 + 8 ≤ 126, and
+            // writes V·8 bytes (padded to 16 for the last register) inside
+            // `out`'s 126·V: the last chunk's store is of 16 bytes at
+            // V·112, ending at V·112 + 16 ≤ 126·V for V ≥ 2.
+            unsafe {
+                let ld = |k: usize, i: usize| {
+                    _mm_loadl_epi64(rot.as_ptr().add(k * BLOCK + i).cast::<__m128i>())
+                };
+                let dst = out.as_mut_ptr();
+                for i in (0..BLOCK - 6).step_by(8) {
+                    match V {
+                        2 => {
+                            let r = _mm_unpacklo_epi8(ld(0, i), ld(1, i));
+                            _mm_storeu_si128(dst.add(2 * i).cast(), r);
+                        }
+                        4 => {
+                            let x = _mm_unpacklo_epi8(ld(0, i), ld(1, i));
+                            let y = _mm_unpacklo_epi8(ld(2, i), ld(3, i));
+                            _mm_storeu_si128(dst.add(4 * i).cast(), _mm_unpacklo_epi16(x, y));
+                            _mm_storeu_si128(dst.add(4 * i + 16).cast(), _mm_unpackhi_epi16(x, y));
+                        }
+                        _ => {
+                            let x = _mm_unpacklo_epi8(ld(0, i), ld(1, i));
+                            let y = _mm_unpacklo_epi8(ld(2, i), ld(3, i));
+                            let z = _mm_unpacklo_epi8(ld(4, i), ld(5, i));
+                            for (o, mask) in masks.iter().enumerate() {
+                                let m = |c: usize| _mm_loadu_si128(mask[c].as_ptr().cast());
+                                let r = _mm_or_si128(
+                                    _mm_or_si128(
+                                        _mm_shuffle_epi8(x, m(0)),
+                                        _mm_shuffle_epi8(y, m(1)),
+                                    ),
+                                    _mm_shuffle_epi8(z, m(2)),
+                                );
+                                _mm_storeu_si128(dst.add(6 * i + 16 * o).cast(), r);
+                            }
+                        }
+                    }
+                }
+            }
+            // The last cells (126 = 15 × 8 + 6).
+            for i in 120..BLOCK {
+                for k in 0..V {
+                    out[i * V + k] = rot[k * BLOCK + i];
+                }
+            }
+            return;
+        }
+    }
+    let _ = masks;
+    for i in 0..BLOCK {
+        for k in 0..V {
+            out[i * V + k] = rot[k * BLOCK + i];
+        }
     }
 }
 

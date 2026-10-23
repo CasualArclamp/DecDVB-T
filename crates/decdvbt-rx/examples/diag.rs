@@ -155,6 +155,7 @@ fn main() {
     let every = env("EVERY", 20.0) as usize;
     let mut eq = Equalizer::new(l.fft);
     eq.alpha = env("EQA", 0.5) as f32;
+    eq.diagnostics = true;
     eq.use_cpe = env("CPE", 1.0) > 0.5;
 
     let dump = std::env::var("DUMP").ok();

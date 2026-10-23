@@ -462,12 +462,17 @@ mod tests {
     /// Run `seconds` of `mode_text` through `ch` and the receiver, in blocks
     /// of an awkward size; the transport stream it made, and the receiver.
     fn run(mode_text: &str, ch: Channel, seconds: f64) -> (Vec<u8>, Receiver) {
+        run_at(mode_text, ch, seconds, 10e6)
+    }
+
+    /// The same at the radio's rate `fs`.
+    fn run_at(mode_text: &str, ch: Channel, seconds: f64, fs: f64) -> (Vec<u8>, Receiver) {
         let opts = SimOptions {
             mode: Mode::parse(mode_text).unwrap(),
             cell_id: None,
             ts_file: None,
             seconds,
-            out_rate_hz: Some(10e6),
+            out_rate_hz: Some(fs),
             level_dbfs: -20.0,
             channel: ch,
         };
@@ -477,7 +482,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let mut rx = Receiver::new(ReceiverConfig::new(10e6, 0.0));
+        let mut rx = Receiver::new(ReceiverConfig::new(fs, 0.0));
         let mut ts = Vec::new();
         let mut at = 0;
         while at < x.len() {
@@ -540,6 +545,31 @@ mod tests {
         let (n, consecutive) = data_packets(&ts);
         assert!(n > 500, "only {n} data packets from {:?}", st.outer);
         assert!(consecutive + 5 >= n, "{n} packets, {consecutive} in a row");
+    }
+
+    #[test]
+    fn it_decodes_at_other_radio_rates_whole_or_not() {
+        // 20 and 8 MS/s make the symbol a whole number of samples (17920 and
+        // 7168), so it is read directly; 9.6 MS/s does not (8601.6), so it is
+        // interpolated. All three give the stream.
+        let ch = || Channel {
+            paths: vec![Path::echo(0.0, 0.0), Path::echo(2.0, -10.0)],
+            cn_db: Some(30.0),
+            ..Default::default()
+        };
+        for fs in [20e6, 8e6, 9.6e6] {
+            let (ts, rx) = run_at("64qam-2/3-8k-1/32", ch(), 1.0, fs);
+            let (n, consecutive) = data_packets(&ts);
+            assert!(
+                n > 300,
+                "{fs}: only {n} data packets from {:?}",
+                rx.status()
+            );
+            assert!(
+                consecutive + 5 >= n,
+                "{fs}: {n} packets, {consecutive} in a row"
+            );
+        }
     }
 
     #[test]

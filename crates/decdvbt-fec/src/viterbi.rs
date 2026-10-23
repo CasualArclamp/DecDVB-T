@@ -28,11 +28,12 @@
 //! states with a byte shuffle and a qword unpack, and puts the 64 decisions of
 //! a step in one `u64`.
 //!
-//! **Two trellises at once.** One trellis is a chain of dependent steps: each
-//! waits for the shuffle, the add and the compare of the one before, and the
-//! kernel spends its time waiting, not working. So the stream is cut into
-//! *segments* that are decoded in pairs, two independent chains interleaved in
-//! one loop. Each segment starts [`ACQ`] steps ahead of the bits it decides
+//! **Two trellises at once.** The stream is cut into *segments* that are
+//! decoded in pairs, one in each 128-bit lane of the vector registers. Every
+//! operation of the kernel then works inside a lane, none across them (a
+//! cross-lane permute costs three to four times a shuffle within one, and the
+//! even/odd split of the metrics needed six of them a step); the pair is also
+//! two independent chains for the CPU to overlap. Each segment starts [`ACQ`] steps ahead of the bits it decides
 //! (from an unknown state, all metrics equal: the first steps settle it) and
 //! ends [`DEPTH`] steps after them (the lookahead a traceback needs), so the
 //! segments overlap and the bits come out as if there had been no cut; the cost
@@ -81,6 +82,10 @@ struct Aligned<T, const N: usize>([T; N]);
 struct Core {
     x: Aligned<i16, 32>,
     y: Aligned<i16, 32>,
+    /// The signs for each group of eight butterflies, twice over (a copy for
+    /// each lane of the vector).
+    xg: [Aligned<i16, 16>; 4],
+    yg: [Aligned<i16, 16>; 4],
     avx2: bool,
 }
 
@@ -98,9 +103,12 @@ fn best16(m: &[i16; 64]) -> usize {
 impl Core {
     fn new() -> Core {
         let (x, y) = branch_signs();
+        let group = |t: &[i16; 32], g: usize| Aligned(std::array::from_fn(|i| t[8 * g + i % 8]));
         Core {
             x: Aligned(x),
             y: Aligned(y),
+            xg: std::array::from_fn(|g| group(&x, g)),
+            yg: std::array::from_fn(|g| group(&y, g)),
             avx2: Self::detect(),
         }
     }
@@ -132,7 +140,7 @@ impl Core {
         #[cfg(target_arch = "x86_64")]
         if self.avx2 {
             // SAFETY: AVX2 was detected at construction.
-            return unsafe { run16_avx2(&self.x.0, &self.y.0, pairs_a, pairs_b, dec_a, dec_b) };
+            return unsafe { run16_lanes(self, pairs_a, pairs_b, dec_a, dec_b) };
         }
         (
             seg16_scalar(&self.x.0, &self.y.0, pairs_a, dec_a),
@@ -179,108 +187,49 @@ fn seg16_scalar(x: &[i16; 32], y: &[i16; 32], pairs: &[i8], dec: &mut [u64]) -> 
     best16(&metric)
 }
 
-/// One step of the precise kernel on a set of four metric registers.
-#[cfg(target_arch = "x86_64")]
-macro_rules! step16 {
-    ($m0:ident, $m1:ident, $m2:ident, $m3:ident, $p:expr, $c:ident) => {{
-        use std::arch::x86_64::*;
-        let sx = _mm256_set1_epi16(i16::from($p[0]));
-        let sy = _mm256_set1_epi16(i16::from($p[1]));
-        let b_lo = _mm256_add_epi16(_mm256_sign_epi16(sx, $c.xlo), _mm256_sign_epi16(sy, $c.ylo));
-        let b_hi = _mm256_add_epi16(_mm256_sign_epi16(sx, $c.xhi), _mm256_sign_epi16(sy, $c.yhi));
-        // Even and odd states, in order: j = 0..15 from m0, m1 and
-        // j = 16..31 from m2, m3.
-        let (a, b) = (
-            _mm256_shuffle_epi8($m0, $c.shuf),
-            _mm256_shuffle_epi8($m1, $c.shuf),
-        );
-        let (c2, dd) = (
-            _mm256_shuffle_epi8($m2, $c.shuf),
-            _mm256_shuffle_epi8($m3, $c.shuf),
-        );
-        let e_lo = _mm256_permute4x64_epi64::<0xD8>(_mm256_unpacklo_epi64(a, b));
-        let o_lo = _mm256_permute4x64_epi64::<0xD8>(_mm256_unpackhi_epi64(a, b));
-        let e_hi = _mm256_permute4x64_epi64::<0xD8>(_mm256_unpacklo_epi64(c2, dd));
-        let o_hi = _mm256_permute4x64_epi64::<0xD8>(_mm256_unpackhi_epi64(c2, dd));
-        // States 0–15, 16–31 (input 0), 32–47, 48–63 (input 1).
-        let (p0, q0) = (_mm256_adds_epi16(e_lo, b_lo), _mm256_subs_epi16(o_lo, b_lo));
-        let (p1, q1) = (_mm256_adds_epi16(e_hi, b_hi), _mm256_subs_epi16(o_hi, b_hi));
-        let (p2, q2) = (_mm256_subs_epi16(e_lo, b_lo), _mm256_adds_epi16(o_lo, b_lo));
-        let (p3, q3) = (_mm256_subs_epi16(e_hi, b_hi), _mm256_adds_epi16(o_hi, b_hi));
-        $m0 = _mm256_max_epi16(p0, q0);
-        $m1 = _mm256_max_epi16(p1, q1);
-        $m2 = _mm256_max_epi16(p2, q2);
-        $m3 = _mm256_max_epi16(p3, q3);
-        let lo = _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi16(
-            _mm256_cmpgt_epi16(q0, p0),
-            _mm256_cmpgt_epi16(q1, p1),
-        ));
-        let hi = _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi16(
-            _mm256_cmpgt_epi16(q2, p2),
-            _mm256_cmpgt_epi16(q3, p3),
-        ));
-        u64::from(_mm256_movemask_epi8(lo) as u32)
-            | (u64::from(_mm256_movemask_epi8(hi) as u32) << 32)
-    }};
-}
-
-/// The precise kernel's constants, in registers.
-#[cfg(target_arch = "x86_64")]
-struct Consts16 {
-    xlo: std::arch::x86_64::__m256i,
-    xhi: std::arch::x86_64::__m256i,
-    ylo: std::arch::x86_64::__m256i,
-    yhi: std::arch::x86_64::__m256i,
-    shuf: std::arch::x86_64::__m256i,
-}
-
-/// Renormalise four metric registers against state 0 (the first lane of the
-/// first).
-#[cfg(target_arch = "x86_64")]
-macro_rules! renorm16 {
-    ($m0:ident, $m1:ident, $m2:ident, $m3:ident) => {{
-        use std::arch::x86_64::*;
-        let r = _mm256_broadcastw_epi16(_mm256_castsi256_si128($m0));
-        $m0 = _mm256_subs_epi16($m0, r);
-        $m1 = _mm256_subs_epi16($m1, r);
-        $m2 = _mm256_subs_epi16($m2, r);
-        $m3 = _mm256_subs_epi16($m3, r);
-    }};
-}
-
-/// Two segments, precise, interleaved.
+/// Two segments, precise: segment A in the low lane of eight registers of
+/// sixteen-bit metrics (register i holds states 8i … 8i+7), B in the high.
 ///
 /// # Safety
 /// AVX2 must be present.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn run16_avx2(
-    x: &[i16; 32],
-    y: &[i16; 32],
+unsafe fn run16_lanes(
+    core: &Core,
     pairs_a: &[i8],
     pairs_b: &[i8],
     dec_a: &mut [u64],
     dec_b: &mut [u64],
 ) -> (usize, usize) {
     use std::arch::x86_64::*;
-    // SAFETY: loads are of 16 i16 from arrays of 32, stores to local arrays
-    // of 64; the caller checked AVX2.
+    // SAFETY: loads are of 16 i16 from arrays of 16, stores to local arrays;
+    // the caller checked AVX2.
     unsafe {
-        let ld = |p: *const i16| _mm256_loadu_si256(p.cast());
-        let c = Consts16 {
-            xlo: ld(x.as_ptr()),
-            xhi: ld(x.as_ptr().add(16)),
-            ylo: ld(y.as_ptr()),
-            yhi: ld(y.as_ptr().add(16)),
-            shuf: _mm256_setr_epi8(
-                0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15, 0, 1, 4, 5, 8, 9, 12, 13, 2,
-                3, 6, 7, 10, 11, 14, 15,
-            ),
-        };
+        let ld = |a: &Aligned<i16, 16>| _mm256_loadu_si256(a.0.as_ptr().cast());
+        let xg: [__m256i; 4] = std::array::from_fn(|g| ld(&core.xg[g]));
+        let yg: [__m256i; 4] = std::array::from_fn(|g| ld(&core.yg[g]));
+        // Evens then odds, in each lane.
+        let split = _mm256_setr_epi8(
+            0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15, 0, 1, 4, 5, 8, 9, 12, 13, 2, 3,
+            6, 7, 10, 11, 14, 15,
+        );
+        // The first word of each lane, across it.
+        let first = _mm256_setr_epi8(
+            0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+            1, 0, 1,
+        );
+        // The pair of the step (sx, sy of A then of B) spread to a word each,
+        // and from there the word for each lane.
+        let pick_x = _mm256_setr_epi8(
+            0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4,
+            5, 4, 5,
+        );
+        let pick_y = _mm256_setr_epi8(
+            2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6,
+            7, 6, 7,
+        );
         let z = _mm256_setzero_si256();
-        let (mut a0, mut a1, mut a2, mut a3) = (z, z, z, z);
-        let (mut b0, mut b1, mut b2, mut b3) = (z, z, z, z);
-        // Blocks of 32 steps, the metrics renormalised after each.
+        let mut m = [z; 8];
         let blocks = pairs_a
             .as_chunks::<64>()
             .0
@@ -294,25 +243,61 @@ unsafe fn run16_avx2(
                     .zip(dec_b.as_chunks_mut::<32>().0.iter_mut()),
             );
         for ((pa, pb), (da, db)) in blocks {
-            let steps = pa
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(pb.as_chunks::<2>().0)
-                .zip(da.iter_mut().zip(db.iter_mut()));
-            for ((p, q), (d, e)) in steps {
-                *d = step16!(a0, a1, a2, a3, p, c);
-                *e = step16!(b0, b1, b2, b3, q, c);
+            for t in 0..32 {
+                // sx and sy of both segments, a word each: [sxA syA sxB syB].
+                let four = i32::from(pa[2 * t] as u8)
+                    | (i32::from(pa[2 * t + 1] as u8) << 8)
+                    | (i32::from(pb[2 * t] as u8) << 16)
+                    | (i32::from(pb[2 * t + 1] as u8) << 24);
+                let words = _mm_cvtepi8_epi16(_mm_cvtsi32_si128(four));
+                let both = _mm256_broadcastq_epi64(words);
+                let sx = _mm256_shuffle_epi8(both, pick_x);
+                let sy = _mm256_shuffle_epi8(both, pick_y);
+                // Even and odd states, in order, of each group of eight
+                // butterflies.
+                let mut x = [z; 8];
+                for i in 0..8 {
+                    x[i] = _mm256_shuffle_epi8(m[i], split);
+                }
+                let mut out = [z; 8];
+                let mut mask = [z; 8];
+                for g in 0..4 {
+                    let e = _mm256_unpacklo_epi64(x[2 * g], x[2 * g + 1]);
+                    let o = _mm256_unpackhi_epi64(x[2 * g], x[2 * g + 1]);
+                    let b = _mm256_add_epi16(
+                        _mm256_sign_epi16(sx, xg[g]),
+                        _mm256_sign_epi16(sy, yg[g]),
+                    );
+                    let (p0, q0) = (_mm256_adds_epi16(e, b), _mm256_subs_epi16(o, b));
+                    let (p1, q1) = (_mm256_subs_epi16(e, b), _mm256_adds_epi16(o, b));
+                    out[g] = _mm256_max_epi16(p0, q0);
+                    out[4 + g] = _mm256_max_epi16(p1, q1);
+                    mask[g] = _mm256_cmpgt_epi16(q0, p0);
+                    mask[4 + g] = _mm256_cmpgt_epi16(q1, p1);
+                }
+                m = out;
+                // The decisions: each pack puts 16 states of A in the low half
+                // and 16 of B in the high.
+                let v: [u32; 4] = std::array::from_fn(|i| {
+                    _mm256_movemask_epi8(_mm256_packs_epi16(mask[2 * i], mask[2 * i + 1])) as u32
+                });
+                da[t] = u64::from((v[0] & 0xFFFF) | (v[1] << 16))
+                    | (u64::from((v[2] & 0xFFFF) | (v[3] << 16)) << 32);
+                db[t] = u64::from((v[0] >> 16) | (v[1] & 0xFFFF_0000))
+                    | (u64::from((v[2] >> 16) | (v[3] & 0xFFFF_0000)) << 32);
             }
-            renorm16!(a0, a1, a2, a3);
-            renorm16!(b0, b1, b2, b3);
+            // Renormalised against state 0 of each segment.
+            let r = _mm256_shuffle_epi8(m[0], first);
+            for v in &mut m {
+                *v = _mm256_subs_epi16(*v, r);
+            }
         }
         let (mut ma, mut mb) = ([0i16; 64], [0i16; 64]);
-        for (i, v) in [a0, a1, a2, a3].into_iter().enumerate() {
-            _mm256_storeu_si256(ma.as_mut_ptr().add(16 * i).cast(), v);
-        }
-        for (i, v) in [b0, b1, b2, b3].into_iter().enumerate() {
-            _mm256_storeu_si256(mb.as_mut_ptr().add(16 * i).cast(), v);
+        for (i, v) in m.iter().enumerate() {
+            let mut tmp = [0i16; 16];
+            _mm256_storeu_si256(tmp.as_mut_ptr().cast(), *v);
+            ma[8 * i..8 * i + 8].copy_from_slice(&tmp[..8]);
+            mb[8 * i..8 * i + 8].copy_from_slice(&tmp[8..]);
         }
         (best16(&ma), best16(&mb))
     }

@@ -79,9 +79,15 @@ pub struct ReedSolomon {
     p: usize,
     /// Generator coefficients, g[0] the x^p term's (= 1), highest first.
     g: Vec<u8>,
-    /// `times[i][x]` = x·α^i: one lookup a byte per syndrome, the receiver's
-    /// hot path (most blocks are clean and cost nothing else).
+    /// `times[i][x]` = x·α^i: one lookup a byte per syndrome, for blocks that
+    /// are not clean.
     times: Vec<[u8; 256]>,
+    /// For 16 parity bytes: `rows[f]` = f·g_i for the 16 generator
+    /// coefficients, so one step of the encoder's shift register is a load and
+    /// an exclusive-or of 16 bytes. Running it over a block's message and
+    /// comparing the result with the block's parity is the receiver's hot path
+    /// (most blocks are clean and cost nothing else): about 0.5 µs.
+    rows: Vec<[u8; 16]>,
 }
 
 impl ReedSolomon {
@@ -109,7 +115,50 @@ impl ReedSolomon {
                 std::array::from_fn(|x| GF.mul(x as u8, a))
             })
             .collect();
-        ReedSolomon { n, k, p, g, times }
+        let rows = if p == 16 {
+            (0..256usize)
+                .map(|f| std::array::from_fn(|i| GF.mul(f as u8, g[1 + i])))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        ReedSolomon {
+            n,
+            k,
+            p,
+            g,
+            times,
+            rows,
+        }
+    }
+
+    /// Whether `block` is a codeword, by the encoder's shift register (only for
+    /// 16 parity bytes; `None` for other codes).
+    #[cfg(target_arch = "x86_64")]
+    fn is_codeword(&self, block: &[u8]) -> Option<bool> {
+        use std::arch::x86_64::*;
+        if self.rows.is_empty() {
+            return None;
+        }
+        // SAFETY: SSE2 is part of x86-64; the loads are of the 16 bytes of a
+        // row and of the 16 parity bytes (the block is `n` long).
+        unsafe {
+            let mut r = _mm_setzero_si128();
+            for &m in &block[..self.k] {
+                let fb = (m ^ _mm_cvtsi128_si32(r) as u8) as usize;
+                r = _mm_xor_si128(
+                    _mm_srli_si128::<1>(r),
+                    _mm_loadu_si128(self.rows.as_ptr().add(fb).cast()),
+                );
+            }
+            let parity = _mm_loadu_si128(block[self.k..].as_ptr().cast());
+            Some(_mm_movemask_epi8(_mm_cmpeq_epi8(r, parity)) == 0xFFFF)
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn is_codeword(&self, _block: &[u8]) -> Option<bool> {
+        None
     }
 
     /// DVB-S's RS(204, 188).
@@ -142,6 +191,9 @@ impl ReedSolomon {
     /// Correct `block` in place; returns the bytes corrected.
     pub fn decode(&self, block: &mut [u8]) -> Result<usize, RsUncorrectable> {
         assert_eq!(block.len(), self.n);
+        if self.is_codeword(block) == Some(true) {
+            return Ok(0);
+        }
         // Syndromes S_i = c(α^i), i = 0..p (Horner, highest degree first:
         // byte 0 is the coefficient of x^(n−1)).
         let mut s = vec![0u8; self.p];

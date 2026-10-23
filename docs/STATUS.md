@@ -353,13 +353,7 @@ signal** (64-QAM, 8k, release build):
 | outer (RS etc.) | 3 % | 5–7 % |
 | **total** | **72 %** | **89 %** |
 
-So a UK mux decodes in real time on one core, barely at 3/4. M7 has to bring
-this down, in order of size: the **Viterbi** (6 AVX2 cross-lane permutes a
-step; 8-bit metrics halve the ops; the traceback is another third), **reading
-symbols** (a decimating filter for the radio's rate and a window FFT with no
-per-sample interpolation, the timing as a phase ramp), the **equaliser**
-(per-carrier division, allocations, scalar interpolator, scalar atan2 in the
-fit: all vectorisable), and running Viterbi + outer on a second thread.
+(That was the first cut; the CPU pass below took it to 30–34 %.)
 
 **Also**: `Stage::Decoder` in the CPU meter, `Command::Decode(Some(rf_hz))`
 and `Rx::take_decoder()` (status and the transport stream, bounded); the GUI
@@ -374,3 +368,73 @@ decimating filter before the interpolator (it aliases the adjacent channels
 otherwise); the receiver and the sounder each acquire and read symbols (the
 channel panels should come from the receiver's own estimates); MER/SNR
 needs the threshold table in `dvbt.rs` checked against EN 300 744 Table A.1.
+
+## CPU pass (2026-10-23)
+
+Asked for: Viterbi, symbol reading and the equaliser, measured on the captures,
+before M4. Measured with `decdvbt decode … --seconds 4` (the per-stage times
+come from the receiver's own `profile`), one core, per second of signal, on
+the four-second amp-on captures, release build.
+
+| stage | before | after |
+|---|---|---|
+| read symbols | 19–20 % | **4.5 %** |
+| equalise | 13–14 % | **4.3 %** |
+| demap + deinterleave | 7.4 % | **4.7 %** |
+| Viterbi | 25–27 % | **12.6–14.5 %** |
+| outer | 3–6 % | **2.2–4.6 %** |
+| **receiver total** | **72 % (2/3), 89 % (3/4)** | **30 % (2/3), 32–34 % (3/4)** |
+| live GUI (the whole app, channel panels on) | 82–105 % | **41 %** (decoder 31 %) |
+
+And the decode got *better*, not just cheaper: C28 went from 2.3 % lost
+packets to none, C22 from 28 to 0, C25 from 86 to 2 (before RS 7e-4 → 2e-4 on
+C22, 3.5e-3 → 9e-7 on C28), because the cheaper way of reading symbols is also
+the more accurate one (below). What changed, largest first:
+
+- **Reading symbols straight from the radio's samples.** At 10 MS/s a symbol
+  is exactly 8960 samples and the carrier spacing is exactly one bin of the
+  transform, so there is nothing to interpolate: the FFT is taken on the radio's
+  samples from the nearest integer position (the 13 ns/sample interpolator was
+  80 % of a read) and the fraction of a sample the position missed becomes a
+  phase ramp over the carriers, the same one that undoes the early start. The
+  window is copied and rotated by the carrier offset in one pass (eight
+  independent phasor chains) and transformed (13 µs at 8960, 11.5 at 8192;
+  rustfft is fast). It gives up correcting the clock rate *within* a symbol
+  (the interpolating reader read the window at the tracked rate, which wandered
+  by ±10 ppm and added more error than it removed: the clock is still followed
+  from symbol to symbol). Any rate where 896 µs × fs is a whole number reads
+  directly (8, 10, 12.5, 16, 20 MS/s: a 20 MS/s radio needs no decimating
+  filter, the FFT does the channel selection); others fall back to the
+  interpolator (tested at 9.6 MS/s). The sounder reads this way too (2.5 → 0.9 %
+  of real time).
+- **Viterbi, 11–12 → 4.8–5.5 ns a bit.** Depuncturing by byte shuffle (3.0 →
+  0.45 ns/bit); the stream cut into overlapped segments (96 steps of
+  acquisition ahead of the bits, 96 of lookahead after; 5 % more steps) decoded
+  two at a time **one segment in each 128-bit lane**, so no operation crosses a
+  lane (a cross-lane `vpermq` costs about 0.4 ns on this CPU, six of them a step
+  in the first kernel: removing them was worth 2.5 ns a bit) and the traceback
+  of the two runs interleaved (1.7 → 0.65 ns/bit). Output lags input by up to
+  two segments (8k steps). An eight-bit-metric variant (4.7 vs 8.3 ns/bit then)
+  was built and dropped: with noise-weighted soft bits the useful range is far
+  wider than ±4 and at its best fixed scale it cost 0.3–0.4 dB.
+- **The equaliser**: the correction applied to every carrier was a `sin` and a
+  `cos` each (13 700 library calls a symbol), now a phasor stepped out from the
+  middle; the slope fit's second pass with its `atan2` and `sincos` per pilot is
+  one small-angle step from the coarse peak (the scan and the interpolation over
+  the grid as plain loops over real and imaginary arrays, compiled for AVX2+FMA
+  and for the baseline, chosen at run time); no allocations per symbol.
+- **The demapper**: soft bits made a bit at a time over all the cells (vector
+  code), the bit deinterleaver a rotation of each bit's array in a 126-cell
+  block and a byte transposition by shuffles eight cells at a time.
+- **Reed–Solomon**: a clean block (nearly all) is checked by running the
+  encoder's shift register over its message, a 16-byte load and exclusive-or a
+  byte (0.5 µs), and only a block that fails goes to the syndromes.
+
+**What is left** (30 % of a core for a 24 Mbit/s mux): the Viterbi is still
+40 % of it; its kernel is at about 47 vector operations a step and near what
+that design gives (the in-place layout that rotates the state bits and crosses
+a lane once in six steps would save perhaps another 25 % of the kernel and is
+a lot of bookkeeping). Then the demapper's scalar gather of the cells in
+deinterleaver order, reading (the FFT, the copy and the carrier ramp), the
+equaliser's grid update, the byte deinterleaver. A second thread for the
+Viterbi + outer would cut latency, not CPU.
