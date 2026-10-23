@@ -10,6 +10,7 @@ use decdvbt_dsp::Resampler;
 
 use crate::channel::{Channel, ChannelSim, RadioSim};
 use crate::modulator::Modulator;
+use crate::t2::{self, T2Config, T2Modulator};
 use crate::ts::{FileTs, TestStream, TsSource};
 
 /// The occupied bandwidth of an 8 MHz channel's block, Hz (§4.7: 6817 × 1/Tu).
@@ -132,6 +133,95 @@ pub fn generate(
     };
     let mut scaled = Vec::new();
     run_chain(o, symbols, |block| {
+        scaled.clear();
+        scaled.extend(block.iter().map(|c| *c * gain));
+        s.samples += scaled.len() as u64;
+        s.clipped += scaled
+            .iter()
+            .filter(|c| c.re.abs() >= 1.0 || c.im.abs() >= 1.0)
+            .count() as u64;
+        sink(&scaled)
+    })?;
+    Ok(s)
+}
+
+// ---- DVB-T2 -----------------------------------------------------------------
+
+/// A DVB-T2 test signal: like [`SimOptions`], in whole frames.
+#[derive(Debug, Clone)]
+pub struct T2SimOptions {
+    pub cfg: T2Config,
+    pub ts_file: Option<PathBuf>,
+    /// Frames to make (a frame is about 217 ms in the UK).
+    pub frames: usize,
+    pub out_rate_hz: Option<f64>,
+    pub level_dbfs: f64,
+    pub channel: Channel,
+}
+
+fn t2_source(o: &T2SimOptions) -> Result<Box<dyn TsSource>, String> {
+    Ok(match &o.ts_file {
+        Some(p) => Box::new(FileTs::open(p)?),
+        None => Box::<TestStream>::default(),
+    })
+}
+
+fn run_t2_chain(
+    o: &T2SimOptions,
+    frames: usize,
+    mut each: impl FnMut(&[Iq]) -> Result<(), String>,
+) -> Result<f64, String> {
+    let mut m = T2Modulator::new(o.cfg.clone(), t2_source(o)?)?;
+    let fs_in = t2::SAMPLE_RATE_HZ;
+    let mut sim = ChannelSim::new(&o.channel, fs_in, m.mean_power());
+    let fs_out = o.out_rate_hz.unwrap_or(fs_in);
+    let mode = o.cfg.mode;
+    // The occupied band: the carriers' span.
+    let occupied = mode.c_ps() as f64 * fs_in / mode.fft.n() as f64;
+    let mut radio = RadioSim::new(&o.channel, fs_out, sim.carrier_power(), 8e6);
+    let mut rs = match o.out_rate_hz {
+        Some(r) if (r - fs_in).abs() > 1.0 => Some(Resampler::for_rates(fs_in, r, occupied)?),
+        _ => None,
+    };
+    let (mut frame, mut chan, mut out, mut rx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut sum, mut n) = (0.0f64, 0u64);
+    for _ in 0..frames {
+        m.next_frame(&mut frame);
+        chan.clear();
+        sim.process(&frame, &mut chan);
+        let filtered: &[Iq] = match &mut rs {
+            Some(r) => {
+                out.clear();
+                r.process(&chan, &mut out);
+                &out
+            }
+            None => &chan,
+        };
+        rx.clear();
+        radio.process(filtered, &mut rx);
+        sum += rx.iter().map(|c| f64::from(c.norm_sqr())).sum::<f64>();
+        n += rx.len() as u64;
+        each(&rx)?;
+    }
+    Ok(sum / n.max(1) as f64)
+}
+
+/// Make the T2 signal, `sink` taking each frame's samples with the level
+/// applied. The first frame is made twice, to find the level.
+pub fn generate_t2(
+    o: &T2SimOptions,
+    mut sink: impl FnMut(&[Iq]) -> Result<(), String>,
+) -> Result<Summary, String> {
+    let probe = run_t2_chain(o, 1, |_| Ok(()))?;
+    let gain = (10f64.powf(o.level_dbfs / 20.0) / probe.sqrt()) as f32;
+    let mut s = Summary {
+        symbols: o.frames * (o.cfg.mode.fft.p2_symbols() + o.cfg.data_symbols),
+        gain,
+        out_rate_hz: o.out_rate_hz.unwrap_or(t2::SAMPLE_RATE_HZ),
+        ..Default::default()
+    };
+    let mut scaled = Vec::new();
+    run_t2_chain(o, o.frames, |block| {
         scaled.clear();
         scaled.extend(block.iter().map(|c| *c * gain));
         s.samples += scaled.len() as u64;

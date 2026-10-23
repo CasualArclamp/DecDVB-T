@@ -27,6 +27,8 @@ pub mod ldpc;
 pub mod outer;
 pub mod params;
 pub mod rs;
+pub mod t2;
+mod t2_tables;
 pub mod viterbi;
 pub mod vlsnr;
 

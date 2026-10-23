@@ -11,7 +11,8 @@ use decdvbt_core::channel::{parse_channel, uhf_centre_hz};
 use decdvbt_core::dvbt::Mode;
 use decdvbt_io::IqFileWriter;
 use decdvbt_mod::channel::{Channel, Impulse, PROFILES, Path as ChannelPath, profile};
-use decdvbt_mod::sim::{SimOptions, generate, symbols_for};
+use decdvbt_mod::sim::{SimOptions, T2SimOptions, generate, generate_t2, symbols_for};
+use decdvbt_mod::t2::{self, T2Config, T2Modulator};
 
 #[derive(clap::Args)]
 pub struct ModulateArgs {
@@ -22,6 +23,11 @@ pub struct ModulateArgs {
     /// 64qam-2/3-8k-1/32 (the UK's DVB-T), 16qam-3/4-2k-1/8.
     #[arg(long, default_value = "64qam-2/3-8k-1/32")]
     mode: String,
+    /// Make a DVB-T2 signal instead: `uk`, or FFT-GUARD-PPn-CONSTELLATION-RATE
+    /// with any of ext, rot, short, ti=N, blocks=N, syms=N, e.g.
+    /// 32k-1/128-pp7-256qam-2/3-ext-rot (which is `uk`).
+    #[arg(long)]
+    t2: Option<String>,
     /// Seconds of signal.
     #[arg(long, default_value_t = 3.0)]
     seconds: f64,
@@ -95,17 +101,7 @@ fn rate_text(out_rate_hz: f64) -> String {
     }
 }
 
-pub fn run(a: ModulateArgs) -> Result<()> {
-    let mode = Mode::parse(&a.mode).map_err(anyhow::Error::msg)?;
-    let chan_no =
-        parse_channel(&a.channel).with_context(|| format!("not a UHF channel: {}", a.channel))?;
-    let centre_mhz = uhf_centre_hz(chan_no).unwrap() / 1e6;
-    let out_rate = if a.rate == 0.0 {
-        mode.bandwidth.sample_rate_hz()
-    } else {
-        a.rate * 1e6
-    };
-
+fn channel_of(a: &ModulateArgs) -> Result<Channel> {
     let mut ch = Channel {
         cfo_hz: a.cfo,
         sco_ppm: a.sco,
@@ -140,6 +136,24 @@ pub fn run(a: ModulateArgs) -> Result<()> {
         let v = numbers(i, 2, "--iq")?;
         (ch.iq_gain_db, ch.iq_phase_deg) = (v[0], v[1]);
     }
+    Ok(ch)
+}
+
+pub fn run(a: ModulateArgs) -> Result<()> {
+    if a.t2.is_some() {
+        return run_t2(a);
+    }
+    let mode = Mode::parse(&a.mode).map_err(anyhow::Error::msg)?;
+    let chan_no =
+        parse_channel(&a.channel).with_context(|| format!("not a UHF channel: {}", a.channel))?;
+    let centre_mhz = uhf_centre_hz(chan_no).unwrap() / 1e6;
+    let out_rate = if a.rate == 0.0 {
+        mode.bandwidth.sample_rate_hz()
+    } else {
+        a.rate * 1e6
+    };
+
+    let ch = channel_of(&a)?;
 
     let fmt_name = a
         .format
@@ -217,6 +231,110 @@ pub fn run(a: ModulateArgs) -> Result<()> {
         s.clipped,
         100.0 * s.clipped as f64 / s.samples.max(1) as f64,
         symbols_for(&opts) as f64 * mode.symbol_s() / secs,
+    );
+    if s.clipped > 0 {
+        eprintln!("warning: {} samples clipped: lower --level", s.clipped);
+    }
+    Ok(())
+}
+
+/// A DVB-T2 test signal.
+fn run_t2(a: ModulateArgs) -> Result<()> {
+    let spec = a.t2.clone().expect("checked by the caller");
+    let cfg = T2Config::parse(&spec).map_err(anyhow::Error::msg)?;
+    let chan_no =
+        parse_channel(&a.channel).with_context(|| format!("not a UHF channel: {}", a.channel))?;
+    let centre_mhz = uhf_centre_hz(chan_no).unwrap() / 1e6;
+    let out_rate = if a.rate == 0.0 {
+        t2::SAMPLE_RATE_HZ
+    } else {
+        a.rate * 1e6
+    };
+    let ch = channel_of(&a)?;
+    let fmt_name = a
+        .format
+        .clone()
+        .or_else(|| {
+            a.out
+                .as_deref()
+                .and_then(|p| p.extension())
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| "cs8".into());
+    let fmt = match fmt_name.as_str() {
+        "cs8" => SampleFormat::Cs8,
+        "cs16" => SampleFormat::Cs16,
+        "cf32" => SampleFormat::Cf32,
+        o => bail!("format {o}: use cs8, cs16 or cf32"),
+    };
+    let out = a.out.clone().unwrap_or_else(|| {
+        let mut tags = String::new();
+        if let Some(cn) = a.cn {
+            tags += &format!("_cn{cn:.0}");
+        }
+        if let Some(p) = &a.profile {
+            tags += &format!("_{p}");
+        }
+        PathBuf::from(format!(
+            "captures/sim_t2_{}_C{chan_no}_{centre_mhz:.3}MHz_{}Msps{tags}.{fmt_name}",
+            spec.replace('/', "-"),
+            rate_text(out_rate)
+        ))
+    });
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Frames for the seconds asked.
+    let probe = T2Modulator::new(cfg.clone(), Box::<decdvbt_mod::ts::TestStream>::default())
+        .map_err(anyhow::Error::msg)?;
+    let frame_s = probe.frame_samples() as f64 / t2::SAMPLE_RATE_HZ;
+    let frames = ((a.seconds / frame_s).ceil() as usize).max(1);
+    let layout = *probe.layout();
+    println!(
+        "{} {} {} {} guard {} {}: {} FEC blocks of {} cells in {} frames of {} symbols ({:.0} ms)",
+        cfg.mode.fft,
+        cfg.qam.name(),
+        cfg.rate,
+        cfg.mode.pp,
+        cfg.mode.guard,
+        if cfg.rotated {
+            "rotated"
+        } else {
+            "not rotated"
+        },
+        cfg.fec_blocks,
+        cfg.cells_per_block(),
+        frames,
+        layout.symbols,
+        frame_s * 1e3,
+    );
+    if !ch.is_clean() {
+        println!("channel: {ch:?}");
+    }
+    let opts = T2SimOptions {
+        cfg,
+        ts_file: a.ts,
+        frames,
+        out_rate_hz: Some(out_rate),
+        level_dbfs: a.level,
+        channel: ch,
+    };
+    let mut w = IqFileWriter::create(&out, fmt)?;
+    let t0 = Instant::now();
+    let s = generate_t2(&opts, |block| w.write(block).map_err(|e| e.to_string()))
+        .map_err(anyhow::Error::msg)?;
+    w.finish()?;
+    let secs = t0.elapsed().as_secs_f64();
+    println!(
+        "{}: {:.2} s at {:.3} MS/s, {} samples, level {:.1} dBFS (gain {:.3}), clipped {}          ({:.4} %), made in {secs:.1} s",
+        out.display(),
+        s.samples as f64 / s.out_rate_hz,
+        s.out_rate_hz / 1e6,
+        s.samples,
+        a.level,
+        s.gain,
+        s.clipped,
+        100.0 * s.clipped as f64 / s.samples.max(1) as f64,
     );
     if s.clipped > 0 {
         eprintln!("warning: {} samples clipped: lower --level", s.clipped);

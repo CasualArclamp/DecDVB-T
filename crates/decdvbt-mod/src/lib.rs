@@ -12,6 +12,7 @@
 //! - [`channel`]: multipath, fading, Doppler, noise and the radio's faults.
 //! - [`rng`]: the seeded generator the channel uses.
 //! - [`sim`]: a whole test signal: modulator, channel, resampler, level.
+//! - [`t2`]: the DVB-T2 modulator.
 //!
 //! Hierarchical modulation is not supported yet.
 
@@ -21,6 +22,7 @@ pub mod modulator;
 pub mod outer;
 pub mod rng;
 pub mod sim;
+pub mod t2;
 pub mod ts;
 
 pub use channel::{Channel, ChannelSim, RadioSim};

@@ -7,8 +7,10 @@
 //! - [`tps`]: the 68-bit TPS block, its BCH code, and reading it back.
 //! - [`interleave`]: the inner interleavers: bits, then symbol cells.
 //! - [`mapping`]: the Gray-coded constellations.
+//! - [`t2`]: DVB-T2's carriers, pilots, frequency interleaver and P1 symbol.
 
 pub mod interleave;
 pub mod mapping;
 pub mod pilots;
+pub mod t2;
 pub mod tps;

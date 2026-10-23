@@ -18,6 +18,7 @@
 
 pub mod tables;
 pub mod tables_s2x;
+pub mod tables_t2;
 
 mod decoder;
 

@@ -6,6 +6,7 @@ use decdvbt_core::{CodeRate, FecFrame};
 
 use crate::ldpc::tables::{self, Table};
 use crate::ldpc::tables_s2x;
+use crate::ldpc::tables_t2;
 
 /// Sizes of one FECFRAME's codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,9 @@ pub struct FecParams {
     pub n_ldpc: usize,
     /// Errors the BCH code corrects.
     pub t: usize,
+    /// DVB-T2's codes: the same as DVB-S2's but for rate 2/3 of the normal
+    /// FECFRAME and rate 3/5 of the short one, which have tables of their own.
+    pub t2: bool,
 }
 
 impl FecParams {
@@ -95,6 +99,7 @@ impl FecParams {
             FecFrame::Medium => return None,
         };
         Some(FecParams {
+            t2: false,
             frame,
             rate,
             k_bch,
@@ -104,9 +109,36 @@ impl FecParams {
         })
     }
 
+    /// DVB-T2's code for a frame length and rate (EN 302 755 Tables 6a, 6b):
+    /// the normal FECFRAME has 1/2, 3/5, 2/3, 3/4, 4/5 and 5/6, the short one
+    /// those and 1/3 and 2/5.
+    pub fn new_t2(frame: FecFrame, rate: CodeRate) -> Option<Self> {
+        let ok = match frame {
+            FecFrame::Normal => matches!(
+                (rate.num, rate.den),
+                (1, 2) | (3, 5) | (2, 3) | (3, 4) | (4, 5) | (5, 6)
+            ),
+            FecFrame::Short => matches!(
+                (rate.num, rate.den),
+                (1, 3) | (2, 5) | (1, 2) | (3, 5) | (2, 3) | (3, 4) | (4, 5) | (5, 6)
+            ),
+            FecFrame::Medium => false,
+        };
+        let mut p = Self::new(frame, rate).filter(|_| ok)?;
+        p.t2 = true;
+        Some(p)
+    }
+
     /// The LDPC parity address table (Annex B / C).
     pub fn ldpc_table(&self) -> &'static Table {
         let normal = self.frame == FecFrame::Normal;
+        if self.t2 {
+            match ((self.rate.num, self.rate.den), normal) {
+                ((2, 3), true) => return &tables_t2::T2_NORMAL_2_3,
+                ((3, 5), false) => return &tables_t2::T2_SHORT_3_5,
+                _ => {}
+            }
+        }
         match ((self.rate.num, self.rate.den), normal) {
             ((1, 4), true) => &tables::NORMAL_1_4,
             ((1, 3), true) => &tables::NORMAL_1_3,
