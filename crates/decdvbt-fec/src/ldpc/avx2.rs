@@ -222,6 +222,63 @@ pub(super) unsafe fn layer(d: &mut LdpcDecoder, layer: usize) {
     }
 }
 
+/// The information bits' LLRs into the posteriors, a group at a time.
+///
+/// # Safety
+/// The CPU must have AVX2; `llr` holds the groups' 360 bytes each (and 8 more
+/// bytes after the last, read and not used); `v` is laid out as the decoder's.
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn load_info(v: &mut [i16], llr: &[i8], groups: usize) {
+    assert!(llr.len() >= groups * LANES + 8 && v.len() >= groups * GROUP_STRIDE);
+    unsafe {
+        for g in 0..groups {
+            let (src, dst) = (
+                llr.as_ptr().add(g * LANES),
+                v.as_mut_ptr().add(g * GROUP_STRIDE),
+            );
+            for b in 0..BLOCKS - 1 {
+                let x = _mm256_cvtepi8_epi16(_mm_loadu_si128(src.add(16 * b) as *const __m128i));
+                st(dst.add(16 * b), x);
+            }
+            let i0 = (BLOCKS - 1) * 16;
+            let x = _mm_cvtepi8_epi16(_mm_loadl_epi64(src.add(i0) as *const __m128i));
+            _mm_storeu_si128(dst.add(i0) as *mut __m128i, x);
+        }
+    }
+}
+
+/// The hard decisions of the information groups as bytes, MSB first: a bit is
+/// 1 where the posterior is negative.
+///
+/// # Safety
+/// The CPU must have AVX2; `info` has 45 bytes for each of the `groups`.
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn read_out(v: &[i16], groups: usize, info: &mut [u8]) {
+    assert!(info.len() >= groups * (LANES / 8) && v.len() >= groups * GROUP_STRIDE);
+    unsafe {
+        // Each eight lanes in reverse, so that the first lane is a byte's MSB
+        // once the sign bits are gathered.
+        let reverse8 = _mm_setr_epi8(7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8);
+        for g in 0..groups {
+            let src = v.as_ptr().add(g * GROUP_STRIDE);
+            let dst = info.as_mut_ptr().add(g * (LANES / 8));
+            for b in 0..BLOCKS - 1 {
+                let x = ld(src.add(16 * b));
+                let packed =
+                    _mm_packs_epi16(_mm256_castsi256_si128(x), _mm256_extracti128_si256::<1>(x));
+                let m = _mm_movemask_epi8(_mm_shuffle_epi8(packed, reverse8)) as u16;
+                let bytes = m.to_le_bytes();
+                *dst.add(2 * b) = bytes[0];
+                *dst.add(2 * b + 1) = bytes[1];
+            }
+            let i0 = (BLOCKS - 1) * 16;
+            let x = _mm_loadu_si128(src.add(i0) as *const __m128i);
+            let m = _mm_movemask_epi8(_mm_shuffle_epi8(_mm_packs_epi16(x, x), reverse8)) as u8;
+            *dst.add(2 * (BLOCKS - 1)) = m;
+        }
+    }
+}
+
 /// How many parity checks the hard decisions leave unsatisfied, as
 /// `LdpcDecoder::unsatisfied`.
 ///
@@ -290,6 +347,44 @@ mod tests {
                     .clamp(-127.0, 127.0) as i8
             })
             .collect()
+    }
+
+    /// The hard decisions come out as the bytes the portable read-out makes.
+    #[test]
+    fn the_read_out_matches_a_plain_one() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let groups = 3;
+        let mut next = rng(9);
+        let mut v = vec![0i16; groups * GROUP_STRIDE + 16];
+        for x in v.iter_mut() {
+            *x = (next() % 2001) as i16 - 1000;
+        }
+        let mut fast = vec![0u8; groups * 45];
+        // SAFETY: AVX2 was checked.
+        unsafe { read_out(&v, groups, &mut fast) };
+        let mut plain = vec![0u8; groups * 45];
+        for g in 0..groups {
+            for c in 0..LANES {
+                if v[g * GROUP_STRIDE + c] < 0 {
+                    let bit = g * LANES + c;
+                    plain[bit / 8] |= 0x80 >> (bit % 8);
+                }
+            }
+        }
+        // One negative lane: its place in the bytes.
+        for lane in [0usize, 7, 8, 9, 15, 16, 351, 359] {
+            let mut one = vec![1i16; GROUP_STRIDE + 16];
+            one[lane] = -1;
+            let mut o = vec![0u8; 45];
+            // SAFETY: AVX2 was checked.
+            unsafe { read_out(&one, 1, &mut o) };
+            let mut want = vec![0u8; 45];
+            want[lane / 8] = 0x80 >> (lane % 8);
+            assert_eq!(o, want, "lane {lane}");
+        }
+        assert_eq!(fast, plain);
     }
 
     /// The kernel and the portable code reach the same decisions in the same

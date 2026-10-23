@@ -118,5 +118,15 @@ pub fn ldpc_iteration_time(frame: FecFrame, rate: CodeRate) {
         dec.decode(&llr, &mut info, iterations);
     }
     let per = t.elapsed().as_secs_f64() / (reps * iterations) as f64;
-    println!("LDPC {frame:?} {rate}: {:.0} us an iteration", per * 1e6);
+    // Without iterating: the load, one syndrome check and the read-out.
+    let t = Instant::now();
+    for _ in 0..reps * 4 {
+        dec.decode(&llr, &mut info, 0);
+    }
+    let fixed = t.elapsed().as_secs_f64() / (reps * 4) as f64;
+    println!(
+        "LDPC {frame:?} {rate}: {:.0} us an iteration; {:.0} us to load, check once and read out",
+        per * 1e6,
+        fixed * 1e6
+    );
 }

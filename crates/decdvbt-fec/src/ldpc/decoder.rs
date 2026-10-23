@@ -212,6 +212,20 @@ impl LdpcDecoder {
         self.decode_budget_body::<false>(llr, info, max_iterations, hurried)
     }
 
+    /// The information bits' LLRs into the posteriors.
+    fn load_info(&mut self, llr: &[i8], groups: usize) {
+        for (g, chunk) in llr[..groups * LANES]
+            .as_chunks::<LANES>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            for (d, &s) in self.v[g * GROUP_STRIDE..][..LANES].iter_mut().zip(chunk) {
+                *d = s as i16;
+            }
+        }
+    }
+
     /// One layer, by the kernel `AVX2` names.
     #[inline(always)]
     fn sweep_layer<const AVX2: bool>(&mut self, layer: usize) {
@@ -246,16 +260,23 @@ impl LdpcDecoder {
         assert_eq!(llr.len(), n);
         assert_eq!(info.len() * 8, k);
 
-        for (g, chunk) in llr[..k].as_chunks::<LANES>().0.iter().enumerate() {
-            for (d, &s) in self.v[g * GROUP_STRIDE..][..LANES].iter_mut().zip(chunk) {
-                *d = s as i16;
-            }
-        }
-        // Parity bit j = c·q + r lives in group k/360 + r, lane c.
         let info_groups = k / LANES;
-        for (j, &s) in llr[k..].iter().enumerate() {
-            let (c, r) = (j / q, j % q);
-            self.v[(info_groups + r) * GROUP_STRIDE + c] = s as i16;
+        #[cfg(target_arch = "x86_64")]
+        if AVX2 {
+            // SAFETY: only instantiated inside functions compiled with AVX2.
+            unsafe { super::avx2::load_info(&mut self.v, llr, info_groups) };
+        } else {
+            self.load_info(llr, info_groups);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        self.load_info(llr, info_groups);
+        // Parity bit j = c·q + r lives in group k/360 + r, lane c: written
+        // group by group, read with a stride.
+        for r in 0..q {
+            let group = &mut self.v[(info_groups + r) * GROUP_STRIDE..][..LANES];
+            for (c, d) in group.iter_mut().enumerate() {
+                *d = llr[k + c * q + r] as i16;
+            }
         }
         for g in 0..n / LANES {
             let base = g * GROUP_STRIDE;
@@ -299,6 +320,13 @@ impl LdpcDecoder {
             }
         }
 
+        info.fill(0);
+        #[cfg(target_arch = "x86_64")]
+        if AVX2 {
+            // SAFETY: only instantiated inside functions compiled with AVX2.
+            unsafe { super::avx2::read_out(&self.v, k / LANES, info) };
+            return outcome;
+        }
         info.fill(0);
         for g in 0..k / LANES {
             for (c, &x) in self.v[g * GROUP_STRIDE..][..LANES].iter().enumerate() {
