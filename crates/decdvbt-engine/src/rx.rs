@@ -443,6 +443,8 @@ fn run(
     let new_decoder = |vfo_hz: f64, centre: f64, rate: f64, heat: Option<f64>| {
         let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
         let mut d = AutoReceiver::new(rate, offset);
+        // A file is held to real time here too.
+        d.set_realtime(true);
         d.set_heat(heat.unwrap_or(0.0));
         d
     };

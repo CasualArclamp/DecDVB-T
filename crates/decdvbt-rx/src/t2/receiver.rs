@@ -56,6 +56,10 @@ pub struct T2Config {
     pub fec_threads: usize,
     /// The PLP to decode by its id; `None`: the first data PLP (type 1).
     pub plp: Option<u8>,
+    /// The samples come in real time (a radio): a frame the FEC stage has no
+    /// room for is given up, not waited for. False for a file read as fast
+    /// as it can be, where nothing may be lost.
+    pub realtime: bool,
 }
 
 impl T2Config {
@@ -68,6 +72,7 @@ impl T2Config {
             fec_threads: (std::thread::available_parallelism().map_or(2, |n| n.get()) / 4)
                 .clamp(2, 4),
             plp: None,
+            realtime: false,
         }
     }
 }
@@ -150,6 +155,9 @@ pub struct T2Status {
     /// last frame took on them.
     pub fec_threads: usize,
     pub fec_load: f32,
+    /// Frames given up because the FEC stage was two frames behind (real
+    /// time only).
+    pub fec_dropped: u64,
     /// The PLPs L1 lists: id and type (0 common, 1 and 2 data).
     pub plp_ids: Vec<(u8, u8)>,
     /// What the last frame looked like, for a developer.
@@ -247,6 +255,12 @@ impl T2Receiver {
 
     pub fn status(&self) -> &T2Status {
         &self.status
+    }
+
+    /// The samples come in real time: give up a frame's FEC rather than hold
+    /// the receive thread (see [`T2Config::realtime`]).
+    pub fn set_realtime(&mut self, on: bool) {
+        self.cfg.realtime = on;
     }
 
     /// Decode this PLP (by id) from the next frame on; `None` for the first
@@ -822,12 +836,16 @@ impl T2Receiver {
                     period: Duration::from_secs_f64(t.geo.frame_samples() as f64 / FS_NATIVE),
                 };
                 let threads = self.cfg.fec_threads;
-                let done = self
+                let wait = !self.cfg.realtime;
+                let (done, taken) = self
                     .fec
                     .get_or_insert_with(|| FecPipe::new(threads))
-                    .submit(job);
+                    .submit(job, wait);
                 for d in done {
                     self.absorb(d);
+                }
+                if !taken {
+                    self.status.fec_dropped += 1;
                 }
                 self.status.plp_id = post.plps[i].plp_id;
                 self.status.blocks_per_frame = dynamic.plp_num_blocks as usize;

@@ -77,10 +77,16 @@ impl FecPipe {
         }
     }
 
-    /// Hand a frame over, waiting first while two are already in hand.
-    /// Returns every frame finished meanwhile.
-    pub fn submit(&mut self, job: Job) -> Vec<Done> {
+    /// Hand a frame over, waiting first while two are already in hand; with
+    /// `wait` false the frame is given up instead (`None`: the FEC stage is
+    /// behind, and holding the receive thread would lose the radio's samples,
+    /// and the lock, rather than one frame's blocks). Returns every frame
+    /// finished meanwhile.
+    pub fn submit(&mut self, job: Job, wait: bool) -> (Vec<Done>, bool) {
         let mut done = self.poll();
+        if !wait && self.in_flight >= MAX_IN_FLIGHT {
+            return (done, false);
+        }
         while self.in_flight >= MAX_IN_FLIGHT {
             match self.rx.recv() {
                 Ok(d) => {
@@ -98,7 +104,7 @@ impl FecPipe {
         {
             self.in_flight += 1;
         }
-        done
+        (done, true)
     }
 
     /// The frames finished, without waiting.

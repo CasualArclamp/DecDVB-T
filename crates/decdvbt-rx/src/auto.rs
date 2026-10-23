@@ -50,6 +50,12 @@ impl AutoReceiver {
         }
     }
 
+    /// The samples come from a radio (or are paced like one): the T2 FEC
+    /// gives up a frame rather than hold the receive thread when it is behind.
+    pub fn set_realtime(&mut self, on: bool) {
+        self.t2.set_realtime(on);
+    }
+
     /// The DVB-T2 PLP to decode, by id (`None`: the first data PLP).
     pub fn set_plp(&mut self, plp: Option<u8>) {
         self.t2.set_plp(plp);

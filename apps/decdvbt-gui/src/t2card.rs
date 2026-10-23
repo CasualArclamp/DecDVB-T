@@ -67,5 +67,11 @@ pub fn card(t2: &T2Status, stream_mbps: Option<f64>) -> T2Card {
             ),
         ));
     }
+    if t2.fec_dropped > 0 {
+        details.push(kv(
+            "FEC behind",
+            format!("{} frames given up", t2.fec_dropped),
+        ));
+    }
     T2Card { name, details }
 }
