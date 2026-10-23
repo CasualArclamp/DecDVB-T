@@ -658,7 +658,8 @@ pub(crate) mod tests {
             rho,
             mode.bandwidth.sample_rate_hz(),
             0.0,
-            0.0,
+            // A symbol with room before it for the interpolator to read.
+            200.0,
         )
         .expect("lock");
         let mut reader = SymbolReader::new(

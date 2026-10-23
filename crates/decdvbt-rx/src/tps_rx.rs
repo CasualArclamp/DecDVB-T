@@ -221,7 +221,7 @@ mod tests {
         let interp = Interpolator::new();
         let rho = 10e6 / mode.bandwidth.sample_rate_hz();
         let fs = mode.bandwidth.sample_rate_hz();
-        let l = lock_on(&interp, &head, 0, rho, fs, 0.0, 0.0).expect("lock");
+        let l = lock_on(&interp, &head, 0, rho, fs, 0.0, 200.0).expect("lock");
         let mut reader = SymbolReader::new(l.fft, l.guard, l.apex, l.f_total, rho, fs, 1);
         reader.alpha_cp = 0.05;
         reader.beta_cp = 0.0005;

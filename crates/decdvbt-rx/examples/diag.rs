@@ -142,7 +142,7 @@ fn main() {
     let interp = Interpolator::new();
     let fs_native = Bandwidth::Mhz8.sample_rate_hz();
     let rho = if native { 1.0 } else { 10e6 / fs_native };
-    let l = lock_on(&interp, &head, 0, rho, fs_native, 0.0, 0.0).expect("lock");
+    let l = lock_on(&interp, &head, 0, rho, fs_native, 0.0, 200.0).expect("lock");
     println!("{l:?}");
     let k_total = l.fft.active_carriers();
     let plan = SymbolPlan::new(l.fft);
