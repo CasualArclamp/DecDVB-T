@@ -1,8 +1,9 @@
 // made by CasualArclamp
 //! The stretch of the radio's stream a reader is waiting for: the caller says
 //! which samples it needs next, blocks of the stream are offered in order, and
-//! when the stretch is whole it is there as separate real and imaginary
-//! arrays, which is what the interpolator reads.
+//! when the stretch is whole it is there as it came, and (made when asked for)
+//! as separate real and imaginary arrays, which is what the interpolator
+//! reads.
 
 use decdvbt_core::Iq;
 
@@ -13,8 +14,9 @@ pub struct Window {
     /// length.
     want: Option<(u64, usize)>,
     win: Vec<Iq>,
-    /// The stretch, once whole.
-    pub planar: Planar,
+    /// The stretch as real and imaginary arrays, made by [`Window::planar`].
+    planar: Planar,
+    planar_ready: bool,
     filled: usize,
 }
 
@@ -30,6 +32,7 @@ impl Window {
             want: None,
             win: Vec::new(),
             planar: Planar::default(),
+            planar_ready: false,
             filled: 0,
         }
     }
@@ -53,11 +56,27 @@ impl Window {
         self.want = Some((start, len));
         self.win.clear();
         self.win.resize(len, Iq::new(0.0, 0.0));
+        self.planar_ready = false;
         self.filled = 0;
     }
 
+    /// The stretch, once whole.
+    pub fn samples(&self) -> &[Iq] {
+        &self.win
+    }
+
+    /// The stretch as separate real and imaginary arrays (made the first
+    /// time it is asked for after the stretch is whole).
+    pub fn planar(&mut self) -> &Planar {
+        if !self.planar_ready {
+            self.planar.set(&self.win);
+            self.planar_ready = true;
+        }
+        &self.planar
+    }
+
     /// Offer a block whose first sample is the stream's `abs_start`-th.
-    /// True once the stretch is whole (and in [`Window::planar`]); a stretch
+    /// True once the stretch is whole; a stretch
     /// that lay in samples already gone is asked for again from the end of
     /// this block.
     pub fn feed(&mut self, block: &[Iq], abs_start: u64) -> bool {
@@ -79,7 +98,6 @@ impl Window {
             }
             return false;
         }
-        self.planar.set(&self.win);
         true
     }
 }
@@ -106,7 +124,7 @@ mod tests {
             }
         }
         assert!(done);
-        assert_eq!(w.planar.len(), 40);
+        assert_eq!(w.samples().len(), 40);
     }
 
     #[test]

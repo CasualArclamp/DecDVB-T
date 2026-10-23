@@ -243,11 +243,13 @@ impl Sounder {
     }
 
     fn process(&mut self) {
-        self.planar.set(&self.win);
         self.status.tracking = self.track.is_some();
         if self.track.is_some() {
             self.track_symbol();
         } else {
+            // Acquisition interpolates: the stretch as separate real and
+            // imaginary arrays.
+            self.planar.set(&self.win);
             self.try_acquire();
         }
     }
@@ -349,10 +351,15 @@ impl Sounder {
             return;
         };
         let mut carriers = std::mem::take(&mut self.carriers);
-        if t.reader
-            .read(&self.interp, &self.planar, self.win_start, &mut carriers)
-            .is_err()
-        {
+        let read = if t.reader.is_direct() {
+            t.reader
+                .read_direct(&self.win, self.win_start, &mut carriers)
+        } else {
+            self.planar.set(&self.win);
+            t.reader
+                .read(&self.interp, &self.planar, self.win_start, &mut carriers)
+        };
+        if read.is_err() {
             self.carriers = carriers;
             self.after_failed_attempt();
             return;

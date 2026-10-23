@@ -224,7 +224,11 @@ impl Demapper {
                 noise_sum += noise[k];
                 let d = &self.dest[wi * V..wi * V + V];
                 for e in 0..V {
-                    block[d[e] as usize] = (llr[e] * s) as i8;
+                    // Rounded to the nearest (copysign is a bit operation
+                    // where `round` is a library call); the cast saturates
+                    // at ±127/−128, which the decoder clips to ±127.
+                    let v = llr[e] * s;
+                    block[d[e] as usize] = (v + 0.5f32.copysign(v)) as i8;
                 }
             }
         }

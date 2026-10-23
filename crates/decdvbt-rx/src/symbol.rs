@@ -17,6 +17,19 @@
 //!    Doppler and the carriers' phase from symbol to symbol), and transformed.
 //! 3. The K active carriers are picked out, the early start's phase ramp
 //!    e^{+j2πkΔ/N} undone.
+//!
+//! **Direct reading.** When the radio's rate makes the symbol a whole number of
+//! samples (8960 at 10 MS/s: the carrier spacing is then exactly a bin of the
+//! transform) there is no need to interpolate at all: the window is the
+//! radio's samples from the nearest integer position, transformed as they
+//! are, and the fraction of a sample by which the position missed becomes a
+//! phase ramp over the carriers (the same one, in fact, that undoes the early
+//! start). That drops the interpolator's 13 ns a sample, 80 % of what a read
+//! cost. What it gives up is the clock rate's correction *within* a symbol
+//! (the window is not stretched by the rate tracked): at 10 ppm that is an
+//! inter-carrier interference of −29 dB at the band's very edge, under the
+//! noise of any real signal; the position still follows the clock from symbol
+//! to symbol.
 
 use decdvbt_core::Iq;
 use decdvbt_core::dvbt::{FftSize, Guard};
@@ -85,6 +98,35 @@ pub struct SymbolReader {
     ramp: Vec<Iq>,
     rho: f64,
     fs_native: f64,
+    /// Direct reading: the symbol's length and the guard's in the radio's
+    /// samples (0: the symbol is not a whole number of them), the transform
+    /// of that size, and scratch (the window, the correlation, the ramp).
+    n_in: usize,
+    g_in: usize,
+    search_in: usize,
+    plan_in: Option<Fft1>,
+    window: Vec<Iq>,
+    corr: Vec<Iq>,
+    ramp_in: Vec<Iq>,
+}
+
+/// The peak of the correlation magnitudes: its place (with a parabola's
+/// fraction), its height and the mean.
+fn find_peak(c: &[Iq]) -> (usize, f64, f32, f32) {
+    let mag: Vec<f32> = c.iter().map(|v| v.norm()).collect();
+    let (j0, &peak) = mag
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap();
+    let edge = j0 == 0 || j0 == mag.len() - 1;
+    let sub = if edge {
+        0.0
+    } else {
+        parabola(mag[j0 - 1], peak, mag[j0 + 1])
+    };
+    let mean = mag.iter().sum::<f32>() / mag.len() as f32;
+    (j0, sub, peak, mean)
 }
 
 impl SymbolReader {
@@ -111,7 +153,7 @@ impl SymbolReader {
                 Iq::new(ph.cos() as f32, ph.sin() as f32)
             })
             .collect();
-        SymbolReader {
+        let mut r = SymbolReader {
             fft,
             guard,
             n,
@@ -132,7 +174,30 @@ impl SymbolReader {
             ramp,
             rho,
             fs_native,
+            n_in: 0,
+            g_in: 0,
+            search_in: 0,
+            plan_in: None,
+            window: Vec::new(),
+            corr: Vec::new(),
+            ramp_in: Vec::new(),
+        };
+        // A whole number of the radio's samples to the symbol?
+        let n_in = n as f64 * rho;
+        if (n_in - n_in.round()).abs() < 1e-6 && n_in.round() >= n as f64 * 0.5 {
+            r.n_in = n_in.round() as usize;
+            r.g_in = (g as f64 * rho).round() as usize;
+            r.search_in = (SEARCH as f64 * rho).ceil() as usize;
+            r.plan_in = Some(Fft1::new(r.n_in));
+            r.window = vec![Iq::new(0.0, 0.0); r.n_in];
+            r.ramp_in = vec![Iq::new(1.0, 0.0); k_total];
         }
+        r
+    }
+
+    /// Whether [`SymbolReader::read_direct`] can be used.
+    pub fn is_direct(&self) -> bool {
+        self.n_in > 0
     }
 
     /// The carrier spacing, Hz.
@@ -144,6 +209,13 @@ impl SymbolReader {
     /// start index and a length; `None` if it would start before the
     /// stream does.
     pub fn want(&self) -> Option<(u64, usize)> {
+        if self.is_direct() {
+            // The correlation's two regions (the second the farther) and the
+            // window, which lies inside them.
+            let a = (self.apex * self.rho).floor() as i64 - self.search_in as i64 - 2;
+            let len = self.n_in + self.g_in + 2 * self.search_in + 8;
+            return (a >= 0).then_some((a as u64, len));
+        }
         let lo = self.apex - SEARCH as f64 - 4.0;
         let hi = self.apex + SEARCH as f64 + self.per as f64 + 4.0;
         let a = (lo * self.rho).floor() as i64 - PAD as i64;
@@ -161,6 +233,147 @@ impl SymbolReader {
         self.rate -= FINE_BETA * tau / step_len;
     }
 
+    /// The loops: the cyclic prefix put the symbol at `measured` (native
+    /// samples) and its correlation there, `peak`, has the phase of the
+    /// carrier offset's fraction.
+    fn follow(&mut self, measured: f64, peak: Iq) {
+        let df = self.spacing_hz();
+        let eps_meas = -f64::from(peak.im).atan2(f64::from(peak.re)) / std::f64::consts::TAU;
+        let expected = self.f_total / df;
+        let eps_exp = expected - expected.round();
+        let mut resid = eps_meas - eps_exp;
+        resid -= resid.round();
+        let step_len = (self.interval * self.per) as f64;
+        let err = measured - self.apex;
+        self.apex += self.alpha_cp * err;
+        self.rate += self.beta_cp * err / step_len;
+        self.f_total += GAMMA * resid * df;
+    }
+
+    /// Read the next symbol straight from the radio's samples `x` (the
+    /// first the stream's `base`-th): see the module's note. Needs
+    /// [`SymbolReader::is_direct`].
+    pub fn read_direct(
+        &mut self,
+        x: &[Iq],
+        base: u64,
+        out: &mut Vec<Iq>,
+    ) -> Result<ReadInfo, ReadError> {
+        debug_assert!(self.is_direct());
+        let (n_in, g_in, search) = (self.n_in, self.g_in, self.search_in);
+        let rho = self.rho;
+        let two_pi = std::f64::consts::TAU;
+
+        // 1. The cyclic prefix near the prediction, on the radio's samples: no
+        // copy, the two regions are slices of the stream.
+        let a_int = (self.apex * rho).floor() as i64 - search as i64;
+        let len = g_in + 2 * search + 1;
+        let off = a_int - base as i64;
+        if off < 0 || off as usize + n_in + len > x.len() {
+            return Err(ReadError::OutOfRange);
+        }
+        let off = off as usize;
+        let (r1, r2) = (&x[off..off + len], &x[off + n_in..off + n_in + len]);
+        self.corr.clear();
+        let mut acc = Iq::new(0.0, 0.0);
+        for m in 0..g_in {
+            acc += r1[m] * r2[m].conj();
+        }
+        self.corr.push(acc);
+        for j in 0..2 * search {
+            acc += r1[j + g_in] * r2[j + g_in].conj() - r1[j] * r2[j].conj();
+            self.corr.push(acc);
+        }
+        let (j0, sub, peak, mean) = find_peak(&self.corr);
+        let measured = (a_int as f64 + j0 as f64 + sub) / rho;
+        let at_peak = self.corr[j0];
+
+        // 2. The loops.
+        self.follow(measured, at_peak);
+        let step_len = (self.interval * self.per) as f64;
+
+        // 3. The window: the radio's samples from the integer position nearest
+        // where the filtered timing puts it, `delta` native samples ahead of the
+        // useful part, rotated by the integrated offset as it is copied.
+        let useful_in = (self.apex + self.g as f64) * rho;
+        let start_f = useful_in - self.delta as f64 * rho;
+        let s = start_f.round() as i64;
+        let from = s - base as i64;
+        if from < 0 || from as usize + n_in > x.len() {
+            return Err(ReadError::OutOfRange);
+        }
+        let from = from as usize;
+        // How many of the radio's samples (a fraction) the window starts
+        // before the useful part.
+        let early = useful_in - s as f64;
+
+        let tt = 1.0 / (self.fs_native * rho);
+        let start_native = s as f64 / rho;
+        self.rot_phase = (self.rot_phase
+            + two_pi * self.f_total * (start_native - self.rot_at) / self.fs_native)
+            .rem_euclid(two_pi);
+        self.rot_at = start_native;
+        let w = -two_pi * self.f_total * tt;
+        // Eight chains of phasors a step of eight apart, which the CPU can run
+        // side by side (one chain is a wait of four multiplies' latency a
+        // sample); no renormalising over 1120 steps each.
+        let mut rots = [Iq::new(1.0, 0.0); 8];
+        for (t, r) in rots.iter_mut().enumerate() {
+            let ph = -self.rot_phase + w * t as f64;
+            *r = Iq::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        let step8 = Iq::new((8.0 * w).cos() as f32, (8.0 * w).sin() as f32);
+        let src = &x[from..from + n_in];
+        let (src8, tail) = src.as_chunks::<8>();
+        let (dst8, _) = self.window.as_chunks_mut::<8>();
+        for (d, sx) in dst8.iter_mut().zip(src8) {
+            for t in 0..8 {
+                d[t] = sx[t] * rots[t];
+                rots[t] *= step8;
+            }
+        }
+        let done = src8.len() * 8;
+        for (t, v) in tail.iter().enumerate() {
+            self.window[done + t] = v * rots[t];
+        }
+        self.plan_in.as_mut().unwrap().forward(&mut self.window);
+
+        // 4. The carriers, the ramp of the early start (and of the fraction of
+        // a sample the position missed by) undone: e^{+j2π(k − kmid)·early/N}.
+        let th = two_pi * early / n_in as f64;
+        let step = Iq::new(th.cos() as f32, th.sin() as f32);
+        let mut p = Iq::new(1.0, 0.0);
+        self.ramp_in[self.kmid] = p;
+        for i in 1..=self.kmid {
+            p *= step;
+            if i % 256 == 0 {
+                let a = th * i as f64;
+                p = Iq::new(a.cos() as f32, a.sin() as f32);
+            }
+            self.ramp_in[self.kmid + i] = p;
+            self.ramp_in[self.kmid - i] = p.conj();
+        }
+        out.clear();
+        out.reserve(self.k_total);
+        // Carriers below the middle are the transform's upper bins.
+        let lower = &self.window[n_in - self.kmid..];
+        let upper = &self.window[..self.kmid + 1];
+        out.extend(
+            lower
+                .iter()
+                .chain(upper)
+                .zip(&self.ramp_in)
+                .map(|(b, r)| b * r),
+        );
+
+        let info = ReadInfo {
+            apex: self.apex,
+            cp_contrast: peak / mean.max(1e-20),
+        };
+        self.apex += step_len * (1.0 + self.rate);
+        Ok(info)
+    }
+
     /// Read the next symbol: its K carriers into `out`, from `x`, whose
     /// first sample is the stream's `base`-th. Moves the prediction on by
     /// `interval` symbols.
@@ -174,7 +387,8 @@ impl SymbolReader {
         let (n, g) = (self.n, self.g);
         let tt = 1.0 / self.fs_native;
         let two_pi = std::f64::consts::TAU;
-        let pos = |native: f64| native * self.rho - base as f64;
+        let rho = self.rho;
+        let pos = |native: f64| native * rho - base as f64;
 
         // 1. The cyclic prefix near the prediction: two regions a symbol
         // apart, read on the native grid.
@@ -198,34 +412,12 @@ impl SymbolReader {
             acc += r1[j + g] * r2[j + g].conj() - r1[j] * r2[j].conj();
             c.push(acc);
         }
-        let mag: Vec<f32> = c.iter().map(|v| v.norm()).collect();
-        let (j0, &peak) = mag
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap();
-        let edge = j0 == 0 || j0 == mag.len() - 1;
-        let sub = if edge {
-            0.0
-        } else {
-            parabola(mag[j0 - 1], peak, mag[j0 + 1])
-        };
+        let (j0, sub, peak, mean) = find_peak(&c);
         let measured = a_int + j0 as f64 + sub;
-        let mean = mag.iter().sum::<f32>() / mag.len() as f32;
-        // The carrier offset's fraction, against what we expect.
-        let df = self.spacing_hz();
-        let eps_meas = -f64::from(c[j0].im).atan2(f64::from(c[j0].re)) / two_pi;
-        let expected = self.f_total / df;
-        let eps_exp = expected - expected.round();
-        let mut resid = eps_meas - eps_exp;
-        resid -= resid.round();
 
         // 2. The loops.
+        self.follow(measured, c[j0]);
         let step_len = (self.interval * self.per) as f64;
-        let err = measured - self.apex;
-        self.apex += self.alpha_cp * err;
-        self.rate += self.beta_cp * err / step_len;
-        self.f_total += GAMMA * resid * df;
 
         // 3. The useful part, from where the filtered timing puts it,
         // rotated by the integrated offset.

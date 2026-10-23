@@ -266,7 +266,7 @@ impl Receiver {
         let min_apex = next as f64 / self.rho + (8192 + 2048) as f64;
         let l = match lock_on(
             &self.interp,
-            &self.win.planar,
+            self.win.planar(),
             start,
             self.rho,
             self.fs_native,
@@ -329,10 +329,14 @@ impl Receiver {
         let (win_start, _) = self.win.wanted().unwrap();
         let mut carriers = std::mem::take(&mut self.carriers);
         let t0 = Instant::now();
-        if t.reader
-            .read(&self.interp, &self.win.planar, win_start, &mut carriers)
-            .is_err()
-        {
+        let read = if t.reader.is_direct() {
+            t.reader
+                .read_direct(self.win.samples(), win_start, &mut carriers)
+        } else {
+            t.reader
+                .read(&self.interp, self.win.planar(), win_start, &mut carriers)
+        };
+        if read.is_err() {
             self.carriers = carriers;
             self.drop_lock();
             return;
