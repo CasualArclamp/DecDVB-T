@@ -1,0 +1,13 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-ofdm"
+description = "DVB-T OFDM definitions shared by the modulator and the receiver: pilots, TPS, interleavers, constellations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvbt-core = { path = "../decdvbt-core" }
+num-complex.workspace = true

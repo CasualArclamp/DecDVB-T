@@ -590,6 +590,7 @@ dependencies = [
  "decdvbt-core",
  "decdvbt-engine",
  "decdvbt-io",
+ "decdvbt-mod",
 ]
 
 [[package]]
@@ -652,6 +653,27 @@ dependencies = [
  "seify-hackrfone",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "decdvbt-mod"
+version = "0.1.0"
+dependencies = [
+ "decdvbt-core",
+ "decdvbt-dsp",
+ "decdvbt-fec",
+ "decdvbt-ofdm",
+ "decdvbt-ts",
+ "num-complex",
+ "rustfft",
+]
+
+[[package]]
+name = "decdvbt-ofdm"
+version = "0.1.0"
+dependencies = [
+ "decdvbt-core",
+ "num-complex",
 ]
 
 [[package]]

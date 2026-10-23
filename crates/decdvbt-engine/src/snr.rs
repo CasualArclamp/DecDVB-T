@@ -8,7 +8,8 @@
 //! and a modest one:
 //!
 //! - The noise is the quietest 100 kHz window in the zones either side of
-//!   the block (3.9–4.9 MHz out). Neighbouring channels fill much of that
+//!   the block (3.9–4.75 MHz out: short of the span's edge, where the radio's
+//!   own filter rolls off). Neighbouring channels fill much of that
 //!   (a UK mux often has a mux either side), but their blocks do not touch:
 //!   the gap between them is empty down to the noise, and the minimum finds
 //!   it. If no gap is clean, N comes out high and the C/N low: the error is
@@ -20,7 +21,7 @@
 /// band (the occupied band reaches ±3.805 MHz, ±3.47 MHz at the worst UK
 /// offset), and the zones either side searched for the noise.
 const SIGNAL_HZ: f64 = 3.4e6;
-const GUARD_HZ: (f64, f64) = (3.9e6, 4.9e6);
+const GUARD_HZ: (f64, f64) = (3.9e6, 4.75e6);
 /// The width the noise is averaged over, Hz: wide enough for a steady
 /// reading (a few dozen bins), narrow enough to fit a gap between blocks.
 const WINDOW_HZ: f64 = 100e3;

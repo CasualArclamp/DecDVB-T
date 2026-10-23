@@ -4,11 +4,15 @@
 //! - `channels`, `channel`: the UHF channel plan.
 //! - `scan`: step the HackRF over the UK channels and say which look like
 //!   digital TV (a flat 7.6 MHz block with steep shoulders).
+//! - `modulate`: a DVB-T test signal as an IQ file, through a channel with
+//!   multipath, fading, noise and the radio's faults.
 //! - `capture`: run the receive engine on the HackRF (or replay a file) for a
 //!   few seconds, print level, drops and CPU, and optionally record the IQ.
 //!   The headless check of the front end, and the first CPU benchmark.
 //!
 //! Decoding arrives with M3.
+
+mod modulate;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -17,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use decdvbt_core::SampleFormat;
 use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_channels};
-use decdvbt_engine::{Command as RxCommand, CpuGauge, Rx, RxOptions, Stage};
+use decdvbt_engine::{Command as RxCommand, CpuGauge, Rx, RxOptions, Stage, spectral_cn_db};
 use decdvbt_io::{IqFileReader, IqSource, format_from_path, name_hint};
 
 #[derive(Parser)]
@@ -47,6 +51,8 @@ enum Command {
         #[arg(long, default_value_t = 0.6)]
         dwell: f64,
     },
+    /// Make a DVB-T test signal as an IQ file, optionally through a channel.
+    Modulate(Box<modulate::ModulateArgs>),
     /// Run the receive engine for a few seconds and report what it sees.
     Capture {
         /// A UHF channel ("C34") for the HackRF, or an IQ file to replay.
@@ -94,6 +100,7 @@ fn main() -> Result<()> {
                 bail!("not a channel or a frequency: {which}");
             }
         }
+        Command::Modulate(a) => modulate::run(*a)?,
         Command::Scan {
             lna,
             vga,
@@ -151,20 +158,30 @@ fn capture(
     let mut cpu = CpuGauge::default();
     let t0 = Instant::now();
     let mut rows = 0usize;
+    // The spectral C/N of the channel under the centre, smoothed over rows.
+    let mut cn: Option<f32> = None;
     while t0.elapsed().as_secs_f64() < seconds && rx.running() {
         std::thread::sleep(Duration::from_millis(500));
-        rows += rx.take_rows().len();
+        for r in rx.take_rows() {
+            rows += 1;
+            let vfo = uhf_channel_at(r.center_hz).and_then(uhf_centre_hz);
+            if let Some(e) = vfo.and_then(|v| spectral_cn_db(&r.db, r.center_hz, r.sample_rate, v))
+            {
+                cn = Some(cn.map_or(e, |c| c + 0.1 * (e - c)));
+            }
+        }
         let s = rx.stats();
         let [src_load, rec_load, spec_load] = s.load.percent;
         println!(
             "{:5.1} s  rms {:6.1} dBFS  peak {:.2}  clip {:4.2}%  dropped {}  rows {}  \
-             CPU {:5.1}%  [{}: {:.1}%  {}: {:.1}%  {}: {:.1}%]{}",
+             C/N {}  CPU {:5.1}%  [{}: {:.1}%  {}: {:.1}%  {}: {:.1}%]{}",
             t0.elapsed().as_secs_f64(),
             s.rms_dbfs,
             s.peak,
             s.clip_percent,
             s.dropped,
             rows,
+            cn.map_or("  - ".into(), |c| format!("{c:4.1}")),
             cpu.poll(),
             Stage::Source.name(),
             src_load,

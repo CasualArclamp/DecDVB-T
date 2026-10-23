@@ -44,7 +44,7 @@ ring overflow on one DVB-T mux). Every design choice is weighed against this:
 | Antenna | Rooftop aerial with a TV-band band-pass filter. **Heavy multipath on some channels.** |
 | Robustness | **Robust from the start**: SFN and long echoes (beyond the guard), Doppler and impulsive noise taken into account in the first design. |
 | Real time | **Real-time DVB-T2 HD mux** (~40 Mbit/s, 256-QAM, 32k, LDPC 64800). |
-| Test signals | Build a **DVB-T/T2 modulator** (IQ file + HackRF TX) with channel models, and use live HackRF captures. |
+| Test signals | Build a **DVB-T/T2 modulator** (IQ file; no over-the-air transmit) with channel models, and use live HackRF captures. |
 | References | gr-dtv (DecSAT `reference/`), Ron Economos's DVB-T2 receiver work, DecDRM's OFDM code, OnAir, ETSI specs (EN 300 744, EN 302 755, TS 102 831). |
 | Licence | GPL-3.0-or-later, `made by CasualArclamp` file headers. |
 | Repo | Local git; GitHub **CasualArclamp/DecDVB-T, private**, with CI + release workflows copied from DecSAT. |
@@ -96,7 +96,7 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
 - **M1** — HackRF/Airspy/file front end, spectrum and waterfall, channel tuning,
   IQ recorder; first captures of the local muxes. *(done, 2026-10-23, except
   Airspy; the band scan CLI and the signal card came with it)*
-- **M2** — DVB-T modulator plus channel models (multipath, Doppler, noise).
+- **M2** — DVB-T modulator plus channel models (multipath, Doppler, noise). *(done, 2026-10-23)*
 - **M3** — DVB-T receiver: time/frequency sync, TPS, channel estimation,
   demapping, inner deinterleavers, Viterbi, RS → TS. Live Freeview DVB-T.
 - **M4** — player, PSI/SI, service panel, scopes, measurements.

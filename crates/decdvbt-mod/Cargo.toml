@@ -1,0 +1,20 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-mod"
+description = "DVB-T modulator and channel models: test signals for the receiver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvbt-core = { path = "../decdvbt-core" }
+decdvbt-ofdm = { path = "../decdvbt-ofdm" }
+decdvbt-fec = { path = "../decdvbt-fec" }
+decdvbt-dsp = { path = "../decdvbt-dsp" }
+num-complex.workspace = true
+rustfft.workspace = true
+
+[dev-dependencies]
+decdvbt-ts = { path = "../decdvbt-ts" }
