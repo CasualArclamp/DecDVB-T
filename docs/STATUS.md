@@ -756,9 +756,9 @@ gains, the channel and the SDR settings, as the radio is the user's.
 Asked for: the DVB-T2 modulator and receiver, validated on the real UK
 multiplex on C30 (256-QAM 2/3 rotated, 32K extended, GI 1/128, PP7, 64K LDPC,
 one PLP, 202 FEC blocks a frame). Done: it decodes C30 from a HackRF capture
-and live, 13 services, no block lost over 40 s, the engine thread at about 36 %
-of real time and the whole app at about 175 % of one core (the FEC on its own
-threads). 356 tests pass, clippy and rustfmt are clean.
+and live, 13 services, no block lost in 120 s, the engine thread at about 36 %
+of real time and the whole app at about 125 to 165 % of one core (the FEC on its
+own threads). 360 tests pass, clippy and rustfmt are clean.
 
 **What is supported.** SISO T2 base: every FFT size (1K to 32K, normal and
 extended carriers), every guard interval and pilot pattern (PP1 to PP8), QPSK
