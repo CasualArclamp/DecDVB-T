@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_channels};
-use decdvbt_core::dvbt::{self, Modulation, Rate};
+use decdvbt_core::dvbt::Mode;
 use decdvbt_engine::{Command, CpuGauge, Row, Stats, spectral_cn_db};
 use decdvbt_io::name_hint;
 use eframe::egui::{self, Color32, RichText};
@@ -43,7 +43,7 @@ struct Options {
     /// GUI's.
     fps: f64,
     /// A mode to hold the C/N against, until the receiver reads the TPS.
-    assume: Option<(Modulation, Rate)>,
+    assume: Option<Mode>,
 }
 
 impl Options {
@@ -70,8 +70,8 @@ impl Options {
                 }
                 "--screenshot" => o.screenshot = Some(value("a .png path")?.into()),
                 "--assume" => {
-                    let v = value("a mode, e.g. 64qam-2/3")?;
-                    o.assume = Some(parse_mode(&v).ok_or(format!("not a DVB-T mode: {v}"))?);
+                    let v = value("a mode, e.g. 64qam-2/3-8k-1/32")?;
+                    o.assume = Some(Mode::parse(&v)?);
                 }
                 "--fps" => o.fps = value("frames a second")?.parse().map_err(|_| "bad --fps")?,
                 "--after" => o.after = value("seconds")?.parse().map_err(|_| "bad --after")?,
@@ -81,23 +81,6 @@ impl Options {
         }
         Ok(o)
     }
-}
-
-/// "64qam-2/3", "16QAM-3/4", "qpsk-1/2".
-fn parse_mode(s: &str) -> Option<(Modulation, Rate)> {
-    let s = s.to_ascii_lowercase();
-    let (m, r) = s.split_once('-')?;
-    let m = match m {
-        "qpsk" => Modulation::Qpsk,
-        "16qam" => Modulation::Qam16,
-        "64qam" => Modulation::Qam64,
-        _ => return None,
-    };
-    // `find` takes the first rate whose printed name ("2/3") matches.
-    let r = [Rate::R1_2, Rate::R2_3, Rate::R3_4, Rate::R5_6, Rate::R7_8]
-        .into_iter()
-        .find(|rate| rate.name() == r)?;
-    Some((m, r))
 }
 
 fn main() -> eframe::Result {
@@ -112,7 +95,7 @@ fn main() -> eframe::Result {
             eprintln!("decdvbt-gui: {e}");
             eprintln!(
                 "usage: decdvbt-gui [capture.cs8] [--channel C26] [--rate MSPS] \
-                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3]"
+                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32]"
             );
             std::process::exit(2);
         }
@@ -463,12 +446,13 @@ impl App {
     }
 
     fn card(&self) -> card::Card {
-        let assumed = self.opts.assume;
+        let mode = self.opts.assume;
         card::Card {
-            standard: assumed.map(|_| card::Standard::DvbT),
-            mode: assumed.map(|_| "assumed".to_string()),
-            name: assumed.map(|(m, r)| format!("{} {}", m.name(), r.name())),
-            qef_db: assumed.map(|(m, r)| dvbt::qef_cn_db(m, r)),
+            standard: mode.map(|_| card::Standard::DvbT),
+            assumed: mode.is_some(),
+            name: mode.map(|m| format!("{} {}", m.modulation.name(), m.rate_hp.name())),
+            qef_db: mode.and_then(|m| m.qef_cn_db()),
+            details: mode.map(|m| mode_details(&m)).unwrap_or_default(),
             cn_db: self.cn_db,
             cn_source: "spectrum",
             channel: self.vfo_hz.and_then(uhf_channel_at),
@@ -840,6 +824,48 @@ impl eframe::App for App {
         }
         self.frame_cost[1] += t0.elapsed();
     }
+}
+
+/// A mode's parameters for the signal card, as label / value pairs.
+fn mode_details(m: &Mode) -> Vec<(String, String)> {
+    let kv = |k: &str, v: String| (k.to_string(), v);
+    let mut d = vec![
+        kv("FFT size", m.fft.name().to_string()),
+        kv(
+            "guard",
+            format!("{} ({:.0} µs)", m.guard.name(), m.guard_s() * 1e6),
+        ),
+        kv("bandwidth", format!("{} MHz", m.bandwidth.mhz())),
+        kv("symbol", format!("{:.0} µs", m.symbol_s() * 1e6)),
+        kv(
+            "carriers",
+            format!(
+                "{} ({} data)",
+                m.fft.active_carriers(),
+                m.fft.data_carriers()
+            ),
+        ),
+        kv("hierarchy", m.alpha.name().to_string()),
+    ];
+    match m.bitrate_lp() {
+        Some(lp) => {
+            d.push(kv(
+                "HP rate",
+                format!("{} · {:.2} Mbit/s", m.rate_hp.name(), m.bitrate_hp() / 1e6),
+            ));
+            d.push(kv(
+                "LP rate",
+                format!("{} · {:.2} Mbit/s", m.rate_lp.name(), lp / 1e6),
+            ));
+        }
+        None => {
+            d.push(kv(
+                "bit rate",
+                format!("{:.2} Mbit/s", m.bitrate_hp() / 1e6),
+            ));
+        }
+    }
+    d
 }
 
 /// "20261023-094512" (UTC) for file names, without a date library: the

@@ -58,8 +58,11 @@ impl Standard {
 pub struct Card {
     /// `None` until the receiver knows which.
     pub standard: Option<Standard>,
-    /// "8k · GI 1/32", once the TPS is read.
-    pub mode: Option<String>,
+    /// The mode's other parameters, as label / value pairs (FFT size, guard
+    /// interval, bit rate…), shown under the bar; empty until they are known.
+    pub details: Vec<(String, String)>,
+    /// The mode is the user's assumption, not read from the signal.
+    pub assumed: bool,
     /// "64-QAM 3/4", the constellation and rate being received.
     pub name: Option<String>,
     /// The C/N that mode needs, dB.
@@ -90,10 +93,10 @@ pub fn show(ui: &mut Ui, c: &Card) {
     let health = margin.map(|m| margin_colour(Some(m)));
 
     // ---- the title bar: standard · mode, and where it is
-    let title = match (c.standard, &c.mode) {
-        (Some(s), Some(m)) => format!("{} · {m}", s.name()),
-        (Some(s), None) => s.name().to_string(),
-        (None, _) => "DVB-T / T2".to_string(),
+    let title = match c.standard {
+        Some(s) if c.assumed => format!("{} · assumed", s.name()),
+        Some(s) => s.name().to_string(),
+        None => "DVB-T / T2".to_string(),
     };
     let bar = egui::Frame::new()
         .fill(colour.gamma_multiply(0.15))
@@ -228,6 +231,33 @@ pub fn show(ui: &mut Ui, c: &Card) {
             });
         }
     });
+
+    // ---- the rest of the mode: pairs of label and value, two pairs a row
+    ui.add_space(6.0);
+    if c.details.is_empty() {
+        if c.active {
+            ui.label(
+                RichText::new(
+                    "FFT size, guard interval and code rate are read from the TPS once                      the receiver locks.",
+                )
+                .size(12.0)
+                .weak(),
+            );
+        }
+        return;
+    }
+    egui::Grid::new("card_details")
+        .num_columns(4)
+        .spacing([10.0, 3.0])
+        .show(ui, |ui| {
+            for pair in c.details.chunks(2) {
+                for (k, v) in pair {
+                    ui.label(RichText::new(k).size(12.0).weak());
+                    ui.label(RichText::new(v).size(12.0).color(strong));
+                }
+                ui.end_row();
+            }
+        });
 }
 
 #[cfg(test)]
