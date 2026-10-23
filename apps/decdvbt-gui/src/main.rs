@@ -1,4 +1,8 @@
 // made by CasualArclamp
+// A release exe is a Windows GUI program: no console window opens with it
+// (`attach_console` joins the one that started it, if there is one). Debug
+// builds keep theirs, for the log.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! DecDVB-T desktop GUI.
 //!
 //! A HackRF (or an IQ file) in, the spectrum and waterfall over the UHF band,
@@ -162,7 +166,54 @@ impl Options {
     }
 }
 
+/// A program built for the Windows GUI subsystem starts with no console and
+/// its output goes nowhere. Started from a terminal, join that terminal's
+/// console (so `--version`, usage errors and the `--screenshot` report print
+/// as they did) and point the standard handles at it unless they were
+/// redirected; started from Explorer there is none to join and nothing happens.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_console() {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        SetStdHandle,
+    };
+    // SAFETY: plain Win32 calls with valid arguments; the handles given to
+    // `SetStdHandle` are leaked on purpose, as the standard handles are for
+    // the life of the process.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = GetStdHandle(which);
+            // No handle (-1 is INVALID_HANDLE_VALUE): not redirected, so
+            // the console.
+            if h.is_null() || h as isize == -1 {
+                if let Ok(f) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+                    SetStdHandle(which, f.into_raw_handle() as _);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_console() {}
+
+/// The window's icon (the same picture as the exe's), from the PNG built in.
+fn window_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(include_bytes!("../assets/icon-256.png")).ok()?;
+    let rgba = img.to_rgba8();
+    Some(egui::IconData {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw(),
+    })
+}
+
 fn main() -> eframe::Result {
+    attach_console();
     // `--version` alone: print it and stop (the release workflow checks it).
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("decdvbt-gui {}", env!("CARGO_PKG_VERSION"));
@@ -181,12 +232,16 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1400.0, 860.0])
+        .with_min_inner_size([900.0, 560.0])
+        .with_title("DecDVB-T")
+        .with_drag_and_drop(true);
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 860.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("DecDVB-T")
-            .with_drag_and_drop(true),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

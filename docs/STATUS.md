@@ -549,3 +549,22 @@ handing the pixels to egui without the copy; perhaps 3–4 % of a core.
   simulcast descriptor 0x88 are not read.
 - DVB text uses Latin-1 for tables other than UTF-8; ISO 6937's accents in the
   default table are not translated.
+
+## App icon, no console window (2026-10-23)
+
+- **Icon.** A dark-blue rounded square with a 16-QAM constellation (4 × 4 dots,
+  the corners amber; 3 × 3 at 16 and 24 px where sixteen do not read), drawn by
+  `apps/decdvbt-gui/examples/make_icon.rs` from distance functions at each size
+  (16 to 256 px, PNG inside the .ico). It is the exe's icon (`build.rs`, through
+  `winresource` and the SDK's `rc.exe`; without `rc.exe` the build warns and goes
+  on without) and the window's (`ViewportBuilder::with_icon`, the 256 px PNG
+  compiled in). The exe's file properties now name the product and version.
+- **No console.** A release `decdvbt-gui.exe` is a Windows GUI-subsystem
+  program (`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`),
+  so double-clicking it opens no black window; debug builds keep theirs for the
+  log. Started from a terminal it attaches to that terminal's console and points
+  its output there unless redirected, so `--version`, usage errors and the
+  `--screenshot` report still print (checked in a PowerShell terminal and
+  through a pipe). ffmpeg already ran with no window. The CLI (`decdvbt.exe`)
+  stays a console program.
+

@@ -35,6 +35,15 @@ rfd = "0.17.2"
 # PNG output for --screenshot (documentation and smoke tests).
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 
+# The icon in the Windows exe (needs the SDK's rc.exe; without it a warning).
+[build-dependencies]
+winresource = "0.1"
+
+# A release exe has no console window; it attaches to the one that started it,
+# if any, so `--version` and the like still print.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 # With eframe's defaults off, re-enable winit's (Linux only) so building needs
 # no X11/Wayland dev packages.
 [target.'cfg(target_os = "linux")'.dependencies]
