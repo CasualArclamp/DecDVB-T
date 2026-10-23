@@ -62,6 +62,98 @@ impl DelayDoppler {
     }
 }
 
+/// The Doppler spectrum at each carrier: how fast each part of the band
+/// fades. A static channel is a line at 0 Hz across the band; a path that
+/// moves puts energy at its Doppler shift at the carriers where it is strong
+/// against the others, so a fast fade shows as a pair of bright patches
+/// either side of 0 Hz that swell and shrink across the band.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FreqDoppler {
+    /// Power, dB relative to the strongest point (down to [`FLOOR_DB`]):
+    /// `dopplers` rows of `cols` values, the lowest Doppler first.
+    pub db: Vec<f32>,
+    pub cols: usize,
+    pub dopplers: usize,
+    /// Frequency of the first column from the middle of the band, and the
+    /// step between columns, MHz.
+    pub freq_start_mhz: f64,
+    pub freq_step_mhz: f64,
+    pub doppler_start_hz: f64,
+    pub doppler_step_hz: f64,
+    pub window_s: f64,
+}
+
+impl FreqDoppler {
+    pub fn at(&self, r: usize, c: usize) -> f32 {
+        self.db[r * self.cols + c]
+    }
+
+    pub fn freq_mhz(&self, c: usize) -> f64 {
+        self.freq_start_mhz + c as f64 * self.freq_step_mhz
+    }
+
+    pub fn doppler_hz(&self, r: usize) -> f64 {
+        self.doppler_start_hz + r as f64 * self.doppler_step_hz
+    }
+}
+
+/// The Doppler spectrum of every `stride`-th pilot's transfer function over
+/// `rows` (`row_s` apart): `None` for too few rows or a channel of zeros.
+pub fn freq_doppler(
+    rows: &[Vec<Iq>],
+    pilot_spacing_hz: f64,
+    row_s: f64,
+    doppler_max_hz: f64,
+    stride: usize,
+) -> Option<FreqDoppler> {
+    let t_len = rows.len();
+    let n_p = rows.first()?.len();
+    if t_len < 8 || n_p < 8 || rows.iter().any(|r| r.len() != n_p) {
+        return None;
+    }
+    let stride = stride.max(1);
+    let win = hann(t_len);
+    let nf = t_len.next_power_of_two().max(256);
+    let doppler_step_hz = 1.0 / (nf as f64 * row_s);
+    let half = ((doppler_max_hz / doppler_step_hz).floor() as usize).min(nf / 2 - 1);
+    let dopplers = 2 * half + 1;
+    let fft: Arc<dyn Fft<f32>> = FftPlanner::<f32>::new().plan_fft_forward(nf);
+    let mut scratch = vec![Iq::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+    let mut col = vec![Iq::new(0.0, 0.0); nf];
+    let picks: Vec<usize> = (0..n_p).step_by(stride).collect();
+    let cols = picks.len();
+    let mut power = vec![0.0f32; dopplers * cols];
+    for (c, &p) in picks.iter().enumerate() {
+        col.fill(Iq::new(0.0, 0.0));
+        for (t, row) in rows.iter().enumerate() {
+            col[t] = row[p] * win[t];
+        }
+        fft.process_with_scratch(&mut col, &mut scratch);
+        for (r, m) in (-(half as i64)..=half as i64).enumerate() {
+            power[r * cols + c] = col[m.rem_euclid(nf as i64) as usize].norm_sqr();
+        }
+    }
+    let peak = power.iter().copied().fold(0.0, f32::max);
+    if peak <= 0.0 || !peak.is_finite() {
+        return None;
+    }
+    let db = power
+        .iter()
+        .map(|&p| (10.0 * (p / peak).max(1e-12).log10()).max(FLOOR_DB))
+        .collect();
+    let step_mhz = stride as f64 * pilot_spacing_hz / 1e6;
+    Some(FreqDoppler {
+        db,
+        cols,
+        dopplers,
+        freq_start_mhz: -((n_p - 1) as f64 / 2.0) * pilot_spacing_hz / 1e6,
+        freq_step_mhz: step_mhz,
+        doppler_start_hz: -(half as f64) * doppler_step_hz,
+        doppler_step_hz,
+        window_s: t_len as f64 * row_s,
+    })
+}
+
 fn hann(n: usize) -> Vec<f32> {
     if n < 2 {
         return vec![1.0; n];
@@ -168,6 +260,8 @@ pub struct ChannelHistory {
     guard_us: f64,
     doppler_max_hz: f64,
     map: Option<DelayDoppler>,
+    freq_map: Option<FreqDoppler>,
+    freq_stale: bool,
 }
 
 impl ChannelHistory {
@@ -181,6 +275,8 @@ impl ChannelHistory {
             guard_us,
             doppler_max_hz: (0.45 / row_s).min(100.0),
             map: None,
+            freq_map: None,
+            freq_stale: false,
         }
     }
 
@@ -197,12 +293,15 @@ impl ChannelHistory {
         r.extend_from_slice(row);
         self.rows.push_back(r);
         self.stale = true;
+        self.freq_stale = true;
     }
 
     pub fn clear(&mut self) {
         self.rows.clear();
         self.stale = false;
         self.map = None;
+        self.freq_stale = false;
+        self.freq_map = None;
     }
 
     pub fn len(&self) -> usize {
@@ -211,6 +310,23 @@ impl ChannelHistory {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// The Doppler spectrum at each carrier from the rows so far, made anew
+    /// if rows have come since the last; none before half the window is
+    /// filled.
+    pub fn freq_map(&mut self) -> Option<&FreqDoppler> {
+        if self.freq_stale && self.rows.len() >= self.max_rows / 2 {
+            self.freq_stale = false;
+            self.freq_map = freq_doppler(
+                self.rows.make_contiguous(),
+                self.pilot_spacing_hz,
+                self.row_s,
+                self.doppler_max_hz,
+                2,
+            );
+        }
+        self.freq_map.as_ref()
     }
 
     /// The map of the rows so far, made anew if rows have come since the
@@ -300,6 +416,41 @@ mod tests {
         let c0 = ((20.0 - m.delay_start_us) / m.delay_step_us).round() as usize;
         assert!(m.at(m.dopplers / 2, c0) < -30.0);
         assert!((m.window_s - 540.0 * ROW_S).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_moving_path_shows_at_its_doppler_across_the_band() {
+        // A static path, and two of equal strength 8 Hz away in Doppler, 3.5 µs
+        // apart. Each carrier has its energy at 0 Hz and at 8 Hz; the 8 Hz
+        // pair add and cancel from carrier to carrier (once every 1/3.5 µs =
+        // 286 kHz), so that line comes and goes across the band while the
+        // static one is steady.
+        let r = rows(&[(0.0, 1.0, 0.0), (0.0, 0.5, 8.0), (3.5, 0.5, 8.0)], 540);
+        let m = freq_doppler(&r, SPACING, ROW_S, 60.0, 2).unwrap();
+        assert_eq!(m.cols, N_P / 2);
+        assert!((m.freq_step_mhz - 2.0 * SPACING / 1e6).abs() < 1e-9);
+        let row_of = |hz: f64| ((hz - m.doppler_start_hz) / m.doppler_step_hz).round() as usize;
+        let near = |hz: f64, c: usize| {
+            let r0 = row_of(hz);
+            (r0.saturating_sub(2)..=r0 + 2)
+                .map(|r| m.at(r, c))
+                .fold(f32::MIN, f32::max)
+        };
+        let across = |hz: f64| {
+            (0..m.cols).fold((f32::MAX, f32::MIN), |(lo, hi), c| {
+                (lo.min(near(hz, c)), hi.max(near(hz, c)))
+            })
+        };
+        // The static path is the peak of all, and steady.
+        let (lo0, hi0) = across(0.0);
+        assert!(hi0.abs() < 0.5 && hi0 - lo0 < 1.0, "{lo0} .. {hi0}");
+        // The moving pair: as strong as it when they add, gone when they cancel.
+        let (lo8, hi8) = across(8.0);
+        assert!(hi8 > -1.5, "{hi8}");
+        assert!(hi8 - lo8 > 12.0, "{lo8} .. {hi8}");
+        // Elsewhere the map is far down in every column.
+        let r_other = row_of(30.0);
+        assert!((0..m.cols).all(|c| m.at(r_other, c) < -25.0));
     }
 
     #[test]

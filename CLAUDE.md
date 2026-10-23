@@ -24,8 +24,11 @@ cargo run --release -p decdvbt-gui -- captures/c23_490.000MHz_10Msps_amp.cs8 --d
 cargo run -p decdvbt-gui --example make_icon                      # redraws apps/decdvbt-gui/assets/icon.ico and icon-256.png (preview in out/)
 cargo run --release -p decdvbt-gui --example retune_soak -- C23 C26 C28 --rounds 20   # HackRF: tune between channels like the GUI, time each lock
 cargo run --release -p decdvbt-rx --example splice -- A.cs8 B.cs8 24            # offline: the old channel's samples then the new one's; ACQSCAN=1 for first-attempt acquisition
-# the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|none, --window ts|epg,
-# --service ID (select), --play ID, --http 127.0.0.1:8001, --udp 127.0.0.1:1234, --record
+# the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|maps|history|none,
+# --window ts|epg|sdr, --service ID (select), --play ID, --http 127.0.0.1:8001,
+# --udp 127.0.0.1:1234, --record, --fps 60 (smooth), --optimise (live: run the gain optimiser
+# after the lock; it changes the radio's gains and writes learned offsets to
+# %APPDATA%\DecDVB-T\prefs.txt)
 ```
 
 Captures live in `captures/` and are named by their tuning

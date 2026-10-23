@@ -48,12 +48,15 @@ pub enum Spec {
 }
 
 type GainSetter = Box<dyn Fn(Gains) -> Result<(), String>>;
+type Setter<T> = Box<dyn Fn(T) -> Result<(), String>>;
 
 /// A running source.
 pub struct Session {
     pub rx: Rx,
     pub live: bool,
     set_gains: Option<GainSetter>,
+    set_filter: Option<Setter<Option<f32>>>,
+    set_ppm: Option<Setter<f32>>,
 }
 
 impl Session {
@@ -78,6 +81,7 @@ impl Session {
                 .map_err(|e| e.to_string())?;
                 let ctl = src.control();
                 let probe = ctl.clone();
+                let (filter_ctl, ppm_ctl) = (ctl.clone(), ctl.clone());
                 let rx = Rx::start(
                     Box::new(src),
                     RxOptions::default(),
@@ -93,6 +97,14 @@ impl Session {
                             vga_db: g.vga,
                         })
                         .map_err(|e| e.to_string())
+                    })),
+                    set_filter: Some(Box::new(move |mhz| {
+                        filter_ctl
+                            .set_filter_bandwidth(mhz.map(|f| (f * 1e6) as u32))
+                            .map_err(|e| e.to_string())
+                    })),
+                    set_ppm: Some(Box::new(move |ppm| {
+                        ppm_ctl.set_ppm(f64::from(ppm)).map_err(|e| e.to_string())
                     })),
                 })
             }
@@ -112,9 +124,21 @@ impl Session {
                     rx: Rx::start(src, RxOptions::default(), None),
                     live: false,
                     set_gains: None,
+                    set_filter: None,
+                    set_ppm: None,
                 })
             }
         }
+    }
+
+    /// The HackRF's baseband filter, MHz (`None`: automatic); no-op for a file.
+    pub fn set_filter_mhz(&self, mhz: Option<f32>) -> Result<(), String> {
+        self.set_filter.as_ref().map_or(Ok(()), |f| f(mhz))
+    }
+
+    /// The HackRF's frequency error, ppm; no-op for a file.
+    pub fn set_ppm(&self, ppm: f32) -> Result<(), String> {
+        self.set_ppm.as_ref().map_or(Ok(()), |f| f(ppm))
     }
 
     /// Change the HackRF's gains (no-op for a file).

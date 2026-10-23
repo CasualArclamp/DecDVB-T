@@ -14,13 +14,14 @@
 use std::sync::Arc;
 
 use decdvbt_engine::SounderUpdate;
-use decdvbt_rx::delay_doppler::{DelayDoppler, FLOOR_DB};
+use decdvbt_rx::delay_doppler::{DelayDoppler, FLOOR_DB, FreqDoppler};
 use decdvbt_rx::sounder::{Geometry, Status};
 use eframe::egui::{
     self, Align2, Color32, ColorImage, CornerRadius, FontId, Rect, RichText, Sense, Stroke,
     TextureHandle, TextureOptions, Ui, pos2,
 };
 
+use crate::errormaps::ErrorMaps;
 use crate::waterfall::{History, ROWS, RingImage, palette};
 
 /// The colour range starts this far below the median gain, dB.
@@ -76,6 +77,8 @@ pub struct ChannelView {
     fading: FadingMap,
     map: Option<Arc<DelayDoppler>>,
     map_tex: Option<TextureHandle>,
+    freq_map: Option<Arc<FreqDoppler>>,
+    freq_tex: Option<TextureHandle>,
     pub status: Status,
     /// Half the Doppler range shown, Hz.
     pub doppler_view: f64,
@@ -89,6 +92,8 @@ impl Default for ChannelView {
             fading: FadingMap::default(),
             map: None,
             map_tex: None,
+            freq_map: None,
+            freq_tex: None,
             status: Status::default(),
             doppler_view: DOPPLER_VIEWS[1],
             columns: 0,
@@ -102,6 +107,8 @@ impl ChannelView {
         self.fading.reset();
         self.map = None;
         self.map_tex = None;
+        self.freq_map = None;
+        self.freq_tex = None;
         self.status = Status::default();
         self.columns = 0;
     }
@@ -119,6 +126,10 @@ impl ChannelView {
         if let Some(m) = u.map {
             self.map = Some(m);
             self.map_tex = None; // rebuilt on the next draw
+        }
+        if let Some(m) = u.freq_map {
+            self.freq_map = Some(m);
+            self.freq_tex = None;
         }
     }
 
@@ -156,6 +167,30 @@ impl ChannelView {
                     ui.label(RichText::new("searching for a DVB-T signal…").weak());
                 }
             }
+        });
+    }
+
+    /// The maps that are not about time: paths by delay and Doppler, the
+    /// Doppler spectrum at each carrier, and what is wrong with the cells.
+    pub fn show_maps(&mut self, ui: &mut Ui, errors: &mut ErrorMaps) {
+        self.header(ui);
+        let avail = ui.available_size();
+        let gap = 10.0;
+        let height = (avail.y - 4.0).max(60.0);
+        // The two Doppler maps are wide; the two constellation ones squarish.
+        let wide = ((avail.x - 3.0 * gap) * 0.3).max(100.0);
+        let sq = ((avail.x - 3.0 * gap) * 0.2).max(100.0);
+        let g = self.status.geometry.filter(|_| self.status.tracking);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            ui.allocate_ui(egui::vec2(wide, height), |ui| self.map_plot(ui, g));
+            ui.allocate_ui(egui::vec2(wide, height), |ui| self.freq_plot(ui, g));
+            ui.allocate_ui(egui::vec2(sq, height), |ui| {
+                errors.cloud(ui, ui.available_size());
+            });
+            ui.allocate_ui(egui::vec2(sq, height), |ui| {
+                errors.points(ui, ui.available_size());
+            });
         });
     }
 
@@ -300,7 +335,7 @@ impl ChannelView {
         let (x0, x1) = (m.delay_us(0), m.delay_us(m.delays - 1));
         let x_of = |us: f64| plot.left() + ((us - x0) / (x1 - x0)) as f32 * plot.width();
         let y_of = |hz: f64| plot.top() + ((view - hz) / (2.0 * view)) as f32 * plot.height();
-        // Delay ticks every 5 us, Doppler ticks at a sensible step.
+        // Delay ticks every 5 us.
         let mut us = (x0 / 5.0).ceil() * 5.0;
         while us <= x1 {
             let x = x_of(us);
@@ -324,36 +359,7 @@ impl ChannelView {
             font.clone(),
             DIM,
         );
-        let step = if view <= 6.0 {
-            2.0
-        } else if view <= 20.0 {
-            5.0
-        } else {
-            10.0
-        };
-        let mut hz = (-view / step).ceil() * step;
-        while hz <= view {
-            let y = y_of(hz);
-            p.line_segment(
-                [pos2(plot.left() - 3.0, y), pos2(plot.left(), y)],
-                Stroke::new(1.0, DIM),
-            );
-            p.text(
-                pos2(plot.left() - 5.0, y),
-                Align2::RIGHT_CENTER,
-                format!("{hz:+.0}"),
-                font.clone(),
-                DIM,
-            );
-            hz += step;
-        }
-        p.text(
-            pos2(rect.left() + 4.0, plot.bottom() + 3.0),
-            Align2::LEFT_TOP,
-            "Hz",
-            font.clone(),
-            DIM,
-        );
+        doppler_axis(&p, rect, plot, view, &font);
         // The guard interval: later echoes interfere with the next symbol.
         for us in [0.0, m.guard_us] {
             let x = x_of(us);
@@ -407,6 +413,156 @@ impl ChannelView {
             );
         }
     }
+
+    /// The Doppler spectrum at each carrier: frequency across, Doppler shift
+    /// up. Two paths that move differently swell and shrink against each
+    /// other from carrier to carrier; a fast fade that is only at some
+    /// carriers (a narrow echo cluster) shows as patches, one that is
+    /// everywhere as a flat band.
+    fn freq_plot(&mut self, ui: &mut Ui, g: Option<Geometry>) {
+        let (resp, p) = ui.allocate_painter(ui.available_size(), Sense::hover());
+        let rect = resp.rect;
+        p.rect_filled(rect, CornerRadius::ZERO, PANEL_BG);
+        let font = FontId::monospace(11.0);
+        let plot = Rect::from_min_max(
+            pos2(rect.left() + 48.0, rect.top() + 18.0),
+            pos2(rect.right() - 6.0, rect.bottom() - 16.0),
+        );
+        p.text(
+            pos2(rect.left() + 4.0, rect.top() + 1.0),
+            Align2::LEFT_TOP,
+            "fading by carrier: frequency and Doppler shift",
+            font.clone(),
+            DIM,
+        );
+        let (Some(m), Some(_g)) = (self.freq_map.clone(), g) else {
+            p.text(
+                plot.center(),
+                Align2::CENTER_CENTER,
+                "the map appears a few seconds after the lock",
+                font,
+                DIM,
+            );
+            return;
+        };
+        let tex = self.freq_tex.get_or_insert_with(|| {
+            ui.ctx()
+                .load_texture("freq_doppler", freq_image(&m), TextureOptions::LINEAR)
+        });
+        let (d0, d1) = (m.doppler_start_hz, -m.doppler_start_hz);
+        let view = self.doppler_view.min(d1).max(1.0);
+        let v = |d: f64| ((d1 - d) / (d1 - d0)) as f32;
+        let uv = Rect::from_min_max(pos2(0.0, v(view)), pos2(1.0, v(-view)));
+        p.image(tex.id(), plot, uv, Color32::WHITE);
+
+        let (x0, x1) = (m.freq_mhz(0), m.freq_mhz(m.cols - 1));
+        let x_of = |mhz: f64| plot.left() + ((mhz - x0) / (x1 - x0)) as f32 * plot.width();
+        let mut mhz = x0.ceil();
+        while mhz <= x1 {
+            let x = x_of(mhz);
+            p.line_segment(
+                [pos2(x, plot.bottom()), pos2(x, plot.bottom() + 3.0)],
+                Stroke::new(1.0, DIM),
+            );
+            p.text(
+                pos2(x, plot.bottom() + 3.0),
+                Align2::CENTER_TOP,
+                format!("{mhz:+.0}"),
+                font.clone(),
+                DIM,
+            );
+            mhz += 1.0;
+        }
+        p.text(
+            pos2(plot.right(), plot.bottom() + 3.0),
+            Align2::RIGHT_TOP,
+            "MHz",
+            font.clone(),
+            DIM,
+        );
+        doppler_axis(&p, rect, plot, view, &font);
+        let y0 = plot.top() + (plot.height() / 2.0);
+        p.line_segment(
+            [pos2(plot.left(), y0), pos2(plot.right(), y0)],
+            Stroke::new(1.0, Color32::from_white_alpha(40)),
+        );
+        p.rect_stroke(
+            plot,
+            CornerRadius::ZERO,
+            Stroke::new(1.0, Color32::from_gray(70)),
+            egui::StrokeKind::Outside,
+        );
+        if let Some(pt) = resp.hover_pos()
+            && plot.contains(pt)
+        {
+            let mhz = x0 + ((pt.x - plot.left()) / plot.width()) as f64 * (x1 - x0);
+            let hz = view - ((pt.y - plot.top()) / plot.height()) as f64 * 2.0 * view;
+            let c = ((mhz - x0) / m.freq_step_mhz)
+                .round()
+                .clamp(0.0, (m.cols - 1) as f64) as usize;
+            let r = ((hz - d0) / m.doppler_step_hz)
+                .round()
+                .clamp(0.0, (m.dopplers - 1) as f64) as usize;
+            p.text(
+                pos2(plot.right() - 4.0, plot.bottom() - 4.0),
+                Align2::RIGHT_BOTTOM,
+                format!("{mhz:+.2} MHz  {hz:+.1} Hz  {:.0} dB", m.at(r, c)),
+                FontId::monospace(12.0),
+                Color32::WHITE,
+            );
+        }
+    }
+}
+
+/// The Doppler axis down the left of a plot: ticks at a step that suits the
+/// range shown, and the unit under them.
+fn doppler_axis(p: &egui::Painter, rect: Rect, plot: Rect, view: f64, font: &FontId) {
+    let step = if view <= 6.0 {
+        2.0
+    } else if view <= 20.0 {
+        5.0
+    } else {
+        10.0
+    };
+    let y_of = |hz: f64| plot.top() + ((view - hz) / (2.0 * view)) as f32 * plot.height();
+    let mut hz = (-view / step).ceil() * step;
+    while hz <= view {
+        let y = y_of(hz);
+        p.line_segment(
+            [pos2(plot.left() - 3.0, y), pos2(plot.left(), y)],
+            Stroke::new(1.0, DIM),
+        );
+        p.text(
+            pos2(plot.left() - 5.0, y),
+            Align2::RIGHT_CENTER,
+            format!("{hz:+.0}"),
+            font.clone(),
+            DIM,
+        );
+        hz += step;
+    }
+    p.text(
+        pos2(rect.left() + 4.0, plot.bottom() + 3.0),
+        Align2::LEFT_TOP,
+        "Hz",
+        font.clone(),
+        DIM,
+    );
+}
+
+/// The frequency–Doppler map as an image: carriers across, the highest Doppler
+/// shift at the top.
+fn freq_image(m: &FreqDoppler) -> ColorImage {
+    let lut = palette();
+    let scale = (lut.len() - 1) as f32 / -FLOOR_DB;
+    let mut pixels = Vec::with_capacity(m.cols * m.dopplers);
+    for r in (0..m.dopplers).rev() {
+        for c in 0..m.cols {
+            let i = ((m.at(r, c) - FLOOR_DB) * scale).clamp(0.0, (lut.len() - 1) as f32);
+            pixels.push(lut[i as usize]);
+        }
+    }
+    ColorImage::new([m.cols, m.dopplers], pixels)
 }
 
 /// The map as an image: delays across, the highest Doppler shift at the top;

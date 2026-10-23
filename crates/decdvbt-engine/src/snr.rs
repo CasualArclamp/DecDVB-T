@@ -88,9 +88,142 @@ pub fn spectral_cn_db(db: &[f32], centre_hz: f64, span_hz: f64, vfo_hz: f64) -> 
     (excess >= MIN_EXCESS_DB).then(|| 10.0 * ((signal - noise) / noise).log10())
 }
 
+/// Widths, Hz, that count as the occupied band of a DVB-T or DVB-T2 block
+/// (7.61 MHz, and up to 7.77 with T2's extended carriers).
+const BLOCK_WIDTH_HZ: (f64, f64) = (6.8e6, 8.1e6);
+/// An edge of the block is where the spectrum has dropped this far under the
+/// block's level and stays down for [`EDGE_RUN_HZ`]: a fade inside the block
+/// is deep but narrow, the edge is a cliff and then nothing.
+const EDGE_DROP_DB: f32 = 10.0;
+const EDGE_RUN_HZ: f64 = 150e3;
+/// How far from the nominal centre the edges are looked for, Hz.
+const EDGE_REACH_HZ: f64 = 4.3e6;
+
+/// Where a block really is, for a signal whose centre is not where the channel
+/// plan puts it (the UK's muxes are transmitted up to a third of a megahertz
+/// off): its centre and its width, Hz, from a spectrum row (dBFS per bin,
+/// most negative frequency first) spanning `span_hz` around `centre_hz`, looking
+/// out from the channel's `nominal_hz`. `None` if the span does not hold the
+/// block with room either side, nothing stands clear of the noise, or what
+/// stands is not as wide as a block.
+pub fn signal_block(
+    db: &[f32],
+    centre_hz: f64,
+    span_hz: f64,
+    nominal_hz: f64,
+) -> Option<(f64, f64)> {
+    let n = db.len();
+    if n < 64 || span_hz <= 0.0 {
+        return None;
+    }
+    let lo_hz = centre_hz - span_hz / 2.0;
+    if nominal_hz - EDGE_REACH_HZ < lo_hz || nominal_hz + EDGE_REACH_HZ > lo_hz + span_hz {
+        return None;
+    }
+    let hz_per_bin = span_hz / n as f64;
+    let bin = |hz: f64| ((hz - lo_hz) / hz_per_bin) as usize;
+    // The block's level: the middle of its inner part, which any offset the
+    // plan can have leaves inside it.
+    let mut inner: Vec<f32> = db[bin(nominal_hz - 2.5e6)..bin(nominal_hz + 2.5e6)].to_vec();
+    inner.sort_by(f32::total_cmp);
+    let level = inner[inner.len() / 2];
+    // Something has to stand clear of the quiet part of the band round it.
+    let mut all: Vec<f32> =
+        db[bin(nominal_hz - EDGE_REACH_HZ)..bin(nominal_hz + EDGE_REACH_HZ)].to_vec();
+    all.sort_by(f32::total_cmp);
+    if level - all[all.len() / 33] < EDGE_DROP_DB + 2.0 {
+        return None;
+    }
+    let threshold = level - EDGE_DROP_DB;
+    let run = (EDGE_RUN_HZ / hz_per_bin).ceil().max(2.0) as usize;
+    let start = bin(nominal_hz) as isize;
+    let reach = (EDGE_REACH_HZ / hz_per_bin) as isize;
+    // Out from the middle until the spectrum is down and stays down: the
+    // edge is where that run began.
+    let edge = |dir: isize| -> Option<f64> {
+        let mut below = 0usize;
+        for k in 1..=reach {
+            let i = start + dir * k;
+            if db[i as usize] < threshold {
+                below += 1;
+                if below >= run {
+                    let first = i - dir * (run as isize - 1);
+                    return Some(lo_hz + (first as f64 + 0.5) * hz_per_bin);
+                }
+            } else {
+                below = 0;
+            }
+        }
+        None
+    };
+    let (low, high) = (edge(-1)?, edge(1)?);
+    let width = high - low;
+    (BLOCK_WIDTH_HZ.0..=BLOCK_WIDTH_HZ.1)
+        .contains(&width)
+        .then_some(((low + high) / 2.0, width))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block of `level` dB between `lo` and `hi` Hz from the row's centre,
+    /// noise at `floor`, with fades (100 kHz wide, 25 dB deep) at `notches`.
+    fn block(floor: f32, level: f32, lo: f64, hi: f64, notches: &[f64]) -> Vec<f32> {
+        (0..4096)
+            .map(|k| {
+                let hz = (k as f64 / 4096.0 - 0.5) * 10e6;
+                if hz < lo || hz > hi {
+                    floor
+                } else if notches.iter().any(|n| (hz - n).abs() < 50e3) {
+                    level - 25.0
+                } else {
+                    level
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_offset_block_is_found_by_its_edges_through_fades() {
+        // A block 167 kHz low of its channel, with three fades in it.
+        let r = block(-85.0, -50.0, -3.97e6, 3.64e6, &[-2.0e6, 0.4e6, 2.9e6]);
+        let (centre, width) = signal_block(&r, 546e6, 10e6, 546e6).unwrap();
+        assert!((centre - (546e6 - 165e3)).abs() < 15e3, "{centre}");
+        assert!((width - 7.61e6).abs() < 80e3, "{width}");
+    }
+
+    #[test]
+    fn neighbours_across_a_gap_do_not_move_the_edges() {
+        // Blocks either side 0.4 MHz clear, at the same level.
+        let mut r = block(-85.0, -50.0, -3.8e6, 3.8e6, &[]);
+        for (k, v) in r.iter_mut().enumerate() {
+            let hz = (k as f64 / 4096.0 - 0.5) * 10e6;
+            if hz.abs() > 4.2e6 {
+                *v = -50.0;
+            }
+        }
+        let (centre, _) = signal_block(&r, 546e6, 10e6, 546e6).unwrap();
+        assert!((centre - 546e6).abs() < 15e3, "{centre}");
+    }
+
+    #[test]
+    fn noise_and_narrow_things_are_not_blocks() {
+        assert_eq!(
+            signal_block(&block(-85.0, -84.0, -3.8e6, 3.8e6, &[]), 546e6, 10e6, 546e6),
+            None
+        );
+        // A 2 MHz carrier is not a mux.
+        assert_eq!(
+            signal_block(&block(-85.0, -50.0, -1.0e6, 1.0e6, &[]), 546e6, 10e6, 546e6),
+            None
+        );
+        // The span too narrow to see round it.
+        assert_eq!(
+            signal_block(&block(-85.0, -50.0, -3.8e6, 3.8e6, &[]), 546e6, 8e6, 546e6),
+            None
+        );
+    }
 
     /// A row of 4096 bins over 10 MHz: flat noise at `floor` dB, and a block
     /// of `block` dB (S + N) to ±`half` Hz of the centre.

@@ -108,7 +108,7 @@ pub fn show(ui: &mut egui::Ui, inp: &BandInput) -> Option<Action> {
     let selected = inp
         .vfo_hz
         .and_then(uhf_channel_at)
-        .filter(|&n| uhf_centre_hz(n).is_some_and(|c| (c - inp.vfo_hz.unwrap()).abs() < 1e3));
+        .filter(|&n| uhf_centre_hz(n).is_some_and(|c| (c - inp.vfo_hz.unwrap()).abs() < 400e3));
     for n in UHF_FIRST..=UHF_LAST {
         let c = uhf_centre_hz(n).unwrap();
         let (x0, x1) = (

@@ -27,7 +27,7 @@ use decdvbt_core::Iq;
 use decdvbt_core::dvbt::{Bandwidth, FftSize, Guard};
 use decdvbt_ofdm::pilots::prbs;
 
-use crate::delay_doppler::{ChannelHistory, DelayDoppler};
+use crate::delay_doppler::{ChannelHistory, DelayDoppler, FreqDoppler};
 use crate::interp::{Interpolator, Planar};
 use crate::lock::{ACQ_NATIVE, Failure, lock_on};
 use crate::symbol::{PAD, SymbolReader};
@@ -185,6 +185,11 @@ impl Sounder {
     /// The delay–Doppler map of the last few seconds' rows.
     pub fn delay_doppler(&mut self) -> Option<&DelayDoppler> {
         self.track.as_mut()?.hist.map()
+    }
+
+    /// The Doppler spectrum at each carrier over the last few seconds' rows.
+    pub fn freq_doppler(&mut self) -> Option<&FreqDoppler> {
+        self.track.as_mut()?.hist.freq_map()
     }
 
     /// Hand over a block of the radio's samples, whose first is the stream's

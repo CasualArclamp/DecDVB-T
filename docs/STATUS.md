@@ -629,3 +629,107 @@ five captures decode as before (one lock each, same Reed–Solomon counts, CPU
 unchanged at 30 %). The receiver status counts the acquisitions that failed
 and the locks given up (`acq_no_prefix`, `acq_not_dvbt`, `stalled_locks`).
 
+## Frequency dial, SDR settings, gain optimiser, maps, 60 fps (2026-10-23)
+
+Asked for after the C30 screenshot and "nearly ready to make public": more
+channel metrics as 2-D heat maps that are not time on an axis (like DecDRM's
+delay–Doppler chart), a 60 fps mode, DecSAT's frequency bar, retuning of
+carriers that are off their channel's centre, SDR settings (DC removal and so
+on), and an "optimise gain" button that finds the best MER.
+
+**The dial.** DecSAT's big-digit frequency display (`freq_display.rs`) is the
+top-left of the control bar: wheel or click a digit to step it, type a number
+to jump, right-click zeroes the digit and those below. It tunes a live radio
+or moves the VFO in a capture, like the channel box beside it.
+
+**Carriers off their centre.** UK muxes sit at {-333.333, -166.667, 0,
++166.667, +333.333} kHz from the raster. After the receiver locks the app
+reads the carrier's offset and retunes the radio onto it
+(`auto_centre`; the note says "C28 is -167 kHz off: retuned"): from the
+receiver's own carrier frequency error while it is locked, else (a signal it
+cannot lock to, such as a T2 mux) from the spectrum's block edges, taken only
+if the result is within 40 kHz of one of those five offsets (the spectral
+estimate alone was out by +65 kHz on C23, whose real error is +78 Hz). Learned
+offsets are remembered per channel (`offset_C28=-166667` in prefs.txt); the SDR
+window lists them and can forget them. Live: C28 and C30 both go to -166.667
+kHz, C26 and C23 stay at 0.
+
+**SDR settings (the SDR button).** `frontend.rs` works on the samples after the
+level reading and the recorder, so captures stay raw: **DC removal** (on by
+default; the offset it removes is shown), **I/Q balance** (blind image
+correction y = x - b x*, b = E[x^2] / 2E|x|^2, off by default; shows the image
+rejection in dB), the HackRF's **baseband filter** (auto = 0.75 x the sample
+rate, or any of the chip's 13 widths) and **frequency correction** in ppm
+(`HackRfControl`'s trim). The front end costs 0.7 % of a core and is its own
+line in the stage list. Settings persist (`sdr_dc`, `sdr_iq`, `sdr_filter`,
+`sdr_ppm`, `auto_centre`).
+
+**Optimise gain** (in the SDR window): tries total gains in 4 dB steps from 20
+dB under the present setting (LNA first to 40 dB, the VGA for the rest), 0.8 s
+to settle and 1.3 s to measure each, stopping on clipping, a level over -12
+dBFS (an OFDM signal's peaks are 10 dB over its rms, so that keeps them off the
+8-bit converter's limit), two points 3 dB under the best, or 90 dB; then the
+LNA/VGA splits (16, 24, 32, 40) of the best total. The figure is the MER while
+the receiver is locked, else the spectrum's C/N. Of the points within 0.3 dB of
+the best it takes the coolest. It puts back the old gains if cancelled or if
+nothing could be measured. Live on C28: from LNA 32 / VGA 8 (24.1 dB MER) it
+found **LNA 40 / VGA 4, 24.6 dB MER at -14 dBFS in 11 settings** (about 25 s).
+(The first version took -6 dBFS as its limit and chose LNA 32 / VGA 16, 24.9 dB
+at a peak of 100 % of full scale: better on the day, no headroom for a fade.)
+
+**Maps** (a new bottom tab, no time on any axis; the old "heatmaps" tab, which
+is, is now **history**). From the left:
+
+1. *paths: delay and Doppler shift*, the sounder's map as before.
+2. *fading by carrier: frequency and Doppler shift* (new, `FreqDoppler` in
+   `delay_doppler.rs`): the Doppler spectrum of the channel at each carrier,
+   from the same history of pilot rows, every other pilot, about once a
+   second. A static channel is a line at 0 Hz; two paths that move differently
+   show as patches that swell and shrink from carrier to carrier, where they
+   add and cancel. (The test puts a static path and a moving one 3.5 us later:
+   the moving one is 6 dB down, as made, and its power varies by over 6 dB
+   across the band.)
+3. *error cloud* (`errormaps.rs`): every data cell's error against its nearest
+   constellation point in one density map, with 1 and 2 sigma rings: round is
+   noise, stretched across the radii is phase noise, an ellipse an I/Q
+   imbalance or compression, off-centre a bias. The square edge on 64-QAM is
+   the neighbouring decision regions.
+4. *MER per point*: the signal-to-noise ratio at each point of the
+   constellation (8 x 8 for 64-QAM). Outer points worse than inner ones show
+   compression or a clipping converter; the corners worse than the rest a phase
+   error. On C28 the corners are 1-2 dB under the rest.
+
+3 and 4 are made in the GUI from the scope's data cells (a few thousand, ten
+times a second, decayed by 0.9 per snapshot), so they cost the receiver
+nothing; the sounder and the scopes run only while the tab is open.
+
+**History** keeps the earlier three waterfalls: gain per carrier, SNR per
+carrier and echoes over the last 25 s, from the receiver's own per-symbol
+estimate (`Command::Heat`, 20 or 60 rows a second).
+
+**60 fps ("smooth").** The display list has 60 fps; at that rate the engine
+cuts the spectrum waterfall's rows three times as often (a third of the
+segments per row) and publishes every 33 ms, history rows come at 60 a second,
+and the traces' smoothing is reduced to match. Whole-app CPU on the C23
+capture, decoding at 10 MS/s (percent of one core):
+
+| bottom | 15 fps | 60 fps |
+|---|---|---|
+| none | 39.1 | 54.4 |
+| scopes | 43.0 | 57.1 |
+| maps | 41.7 | 61.6 |
+| history | 40.3 | 55.8 |
+
+Thread by thread (maps): the engine thread is 35 % at both rates; the GUI
+thread goes from 3 % to 21 % and a second thread (unnamed, probably the
+graphics driver's) from 2 % to 10 %. The
+frames themselves cost 0.8 ms (logic and layout), so the rest, about 3 ms a
+frame, is egui's tessellation and the OpenGL driver on this laptop (an AMD
+iGPU and an RTX 3050 behind a remote display). It is opt-in, and 15 fps stays
+the default.
+
+Tests: the workspace passes and clippy is clean (new: the frequency-Doppler
+map, the heat rows and smooth pacing in the engine thread, the sounder's map in
+the thread, the SDR front end, the optimiser, the error maps). New test aids:
+`--bottom maps|history`, `--window sdr`, `--optimise` (start the optimiser
+after the lock), `--fps 60`.

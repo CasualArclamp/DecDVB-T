@@ -16,22 +16,29 @@ mod band;
 mod card;
 mod channel_view;
 mod epg_view;
+mod errormaps;
 mod external;
+mod freq_display;
+mod heatmaps;
 mod player;
 mod prefs;
 mod scopes;
+mod sdr;
 mod services;
 mod source;
 mod ts_viewer;
 mod waterfall;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_channels};
 use decdvbt_core::dvbt::Mode;
-use decdvbt_engine::{Command, CpuGauge, Outputs, Row, Stats, TsView, spectral_cn_db};
+use decdvbt_engine::{
+    Command, CpuGauge, FrontEndSettings, Outputs, Row, Stats, TsView, signal_block, spectral_cn_db,
+};
 use decdvbt_io::name_hint;
 use decdvbt_rx::receiver::ReceiverStatus;
 use decdvbt_rx::sounder::Geometry;
@@ -48,6 +55,12 @@ const GREEN: Color32 = Color32::from_rgb(110, 220, 130);
 /// the scopes.
 const CHANNEL_PANEL_H: f32 = 270.0;
 const SCOPES_PANEL_H: f32 = 250.0;
+/// The display rate from which the smooth mode (60 frames a second) applies.
+const SMOOTH_FPS: f64 = 45.0;
+/// The channel plan's transmitter offsets, Hz: a carrier found within
+/// [`SNAP_HZ`] of one is taken to be on it.
+const PLAN_OFFSETS_HZ: [f64; 5] = [-333_333.0, -166_667.0, 0.0, 166_667.0, 333_333.0];
+const SNAP_HZ: f64 = 40e3;
 /// HackRF sample rates with the least clock jitter that hold a channel.
 const RATES_MSPS: [f64; 4] = [10.0, 12.5, 16.0, 20.0];
 /// Half a channel plus a margin: a channel is received without retuning only
@@ -82,6 +95,8 @@ struct Options {
     http: Option<String>,
     udp: Option<String>,
     record: bool,
+    /// Run the gain optimiser once the receiver has locked (a test aid).
+    optimise: bool,
 }
 
 /// What the bottom panel shows.
@@ -91,6 +106,13 @@ enum Bottom {
     Scopes,
     /// The sounder's fading waterfall and delay–Doppler map.
     Channel,
+    /// The channel over time: gain and SNR across the band, and the echoes,
+    /// as waterfalls.
+    Heat,
+    /// Maps with no time axis: the paths by delay and Doppler, the fading by
+    /// carrier and Doppler, and the data cells' error as a cloud and per
+    /// constellation point.
+    Maps,
     Hidden,
 }
 
@@ -113,6 +135,7 @@ impl Options {
             http: None,
             udp: None,
             record: false,
+            optimise: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -132,17 +155,24 @@ impl Options {
                 }
                 "--no-channel" => o.bottom = Bottom::Hidden,
                 "--bottom" => {
-                    o.bottom = match value("scopes, channel or none")?.as_str() {
+                    o.bottom = match value("scopes, channel, maps, history or none")?.as_str() {
                         "scopes" => Bottom::Scopes,
                         "channel" => Bottom::Channel,
+                        "maps" => Bottom::Maps,
+                        "history" | "heat" => Bottom::Heat,
                         "none" => Bottom::Hidden,
-                        v => return Err(format!("--bottom: not scopes, channel or none: {v}")),
+                        v => {
+                            return Err(format!(
+                                "--bottom: not scopes, channel, maps, history or none: {v}"
+                            ));
+                        }
                     };
                 }
-                "--window" => o.window = Some(value("ts or epg")?),
+                "--window" => o.window = Some(value("ts, epg or sdr")?),
                 "--http" => o.http = Some(value("an address, e.g. 127.0.0.1:8001")?),
                 "--udp" => o.udp = Some(value("an address, e.g. 127.0.0.1:1234")?),
                 "--record" => o.record = true,
+                "--optimise" => o.optimise = true,
                 "--subs" => o.subs = true,
                 "--play" => {
                     o.play = Some(value("a service id")?.parse().map_err(|_| "bad --play")?)
@@ -212,6 +242,16 @@ fn window_icon() -> Option<egui::IconData> {
     })
 }
 
+/// The offsets learned for the channels, from the prefs.
+fn load_offsets() -> HashMap<u8, f64> {
+    (21..=69u8)
+        .filter_map(|c| {
+            let o: f64 = prefs::get(&format!("offset_C{c}"))?.parse().ok()?;
+            Some((c, o))
+        })
+        .collect()
+}
+
 fn main() -> eframe::Result {
     attach_console();
     // `--version` alone: print it and stop (the release workflow checks it).
@@ -226,7 +266,7 @@ fn main() -> eframe::Result {
             eprintln!(
                 "usage: decdvbt-gui [capture.cs8] [--channel C26] [--rate MSPS] \
                  [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] \
-                 [--bottom scopes|channel|none] [--window ts|epg] [--service ID] [--play ID] [--subs] \
+                 [--bottom scopes|channel|heat|none] [--window ts|epg|sdr] [--service ID] [--play ID] [--subs] \
                  [--http ADDR] [--udp ADDR] [--record] [--no-decode]"
             );
             std::process::exit(2);
@@ -348,11 +388,48 @@ struct App {
     cpu: CpuGauge,
     cpu_percent: f32,
     note: String,
+
+    /// The frequency the radio is tuned to (before a source runs: to be
+    /// tuned to), the dial's value while it is being edited, and when the
+    /// last edit was (the radio follows once it has stopped).
+    tune_hz: f64,
+    dial_hz: f64,
+    dial_edit: Option<Instant>,
+    /// How far each channel's carrier was found from its place in the plan,
+    /// Hz; when the tuning was last changed and whether the carrier has been
+    /// looked for since.
+    offsets: HashMap<u8, f64>,
+    tuned_at: Instant,
+    centre_checked: bool,
+    centre_tries: u8,
+    /// The SDR settings, what was last sent to the radio and the engine, the
+    /// window, the gain optimiser (while it runs) and what it last found.
+    sdr: sdr::SdrSettings,
+    sdr_sent: Option<sdr::SdrSettings>,
+    sdr_open: bool,
+    optimiser: Option<sdr::Optimiser>,
+    opt_result: Option<String>,
+    /// The smooth (60 frames a second) mode and what the engine was last told:
+    /// it, the heat maps' rate, the scopes and measurements.
+    smooth_mode: bool,
+    smooth_sent: bool,
+    heat: heatmaps::HeatView,
+    errors: errormaps::ErrorMaps,
+    heat_sent: Option<f64>,
 }
 
 impl App {
     fn new(opts: Options) -> App {
         let channel = opts.channel.unwrap_or(26);
+        let sdr = sdr::SdrSettings::load();
+        let offsets = load_offsets();
+        let tune_hz = uhf_centre_hz(channel).map_or(0.0, |c| {
+            c + if sdr.auto_centre {
+                offsets.get(&channel).copied().unwrap_or(0.0)
+            } else {
+                0.0
+            }
+        });
         let mut app = App {
             started: Instant::now(),
             shot_sent: false,
@@ -373,7 +450,7 @@ impl App {
             file_rate_msps: 10.0,
             centre_hz: 0.0,
             span_hz: 0.0,
-            vfo_hz: uhf_centre_hz(channel),
+            vfo_hz: Some(tune_hz).filter(|h| *h > 0.0),
             tuning: 0,
             smooth: Vec::new(),
             history: History::default(),
@@ -417,6 +494,23 @@ impl App {
             cpu: CpuGauge::default(),
             cpu_percent: 0.0,
             note: String::new(),
+            tune_hz,
+            dial_hz: tune_hz,
+            dial_edit: None,
+            offsets,
+            tuned_at: Instant::now(),
+            centre_checked: false,
+            centre_tries: 0,
+            sdr,
+            sdr_sent: None,
+            sdr_open: opts.window.as_deref() == Some("sdr"),
+            optimiser: None,
+            opt_result: None,
+            smooth_mode: opts.fps >= SMOOTH_FPS,
+            smooth_sent: false,
+            heat: heatmaps::HeatView::default(),
+            errors: errormaps::ErrorMaps::default(),
+            heat_sent: None,
             opts,
         };
         // Started from the command line: begin at once.
@@ -434,9 +528,10 @@ impl App {
         self.stop();
         match self.kind {
             SourceKind::HackRf => {
-                let Some(fc) = uhf_centre_hz(self.channel) else {
+                let fc = self.tune_hz;
+                if fc <= 0.0 {
                     return;
-                };
+                }
                 let spec = Spec::HackRf {
                     center_hz: fc,
                     rate_hz: self.rate_msps * 1e6,
@@ -476,6 +571,17 @@ impl App {
                 self.vfo_hz = vfo;
                 self.reset_view();
                 self.note.clear();
+                // A new engine knows nothing of what the last was told.
+                (
+                    self.scopes_sent,
+                    self.sdr_sent,
+                    self.smooth_sent,
+                    self.heat_sent,
+                ) = (false, None, false, None);
+                self.optimiser = None;
+                self.tuned_at = Instant::now();
+                self.centre_checked = false;
+                self.centre_tries = 0;
             }
             Err(e) => self.note = e,
         }
@@ -510,6 +616,8 @@ impl App {
         self.span_hz = 0.0;
         self.chan_view.reset();
         self.scope.reset();
+        self.heat.reset();
+        self.errors.reset();
     }
 
     /// A different multiplex (or none): the services, the guide and the
@@ -523,8 +631,9 @@ impl App {
         self.tap = None;
     }
 
+    /// The sounder runs for the panels that show its estimates.
     fn show_channel(&self) -> bool {
-        self.bottom == Bottom::Channel
+        matches!(self.bottom, Bottom::Channel | Bottom::Maps)
     }
 
     /// Ask the engine to run the sounder on the signal under the VFO while
@@ -575,13 +684,14 @@ impl App {
     /// scopes are shown and the receiver is decoding, and to stop when not.
     fn sync_scopes(&mut self) {
         let Some(s) = &self.session else { return };
-        let want = self.bottom == Bottom::Scopes && self.decode;
+        let want = matches!(self.bottom, Bottom::Scopes | Bottom::Maps) && self.decode;
         if want != self.scopes_sent {
             s.rx.send(Command::Scopes(want));
             s.rx.send(Command::Measure(want));
             self.scopes_sent = want;
             if !want {
                 self.scope.reset();
+                self.errors.reset();
             }
         }
     }
@@ -718,9 +828,14 @@ impl App {
     /// Receive channel `n`: move the VFO if the span already holds the whole
     /// channel, retune the radio if not.
     fn tune_channel(&mut self, n: u8) {
-        let Some(fc) = uhf_centre_hz(n) else { return };
+        let Some(fc) = self.channel_hz(n) else { return };
+        self.cancel_optimiser();
         self.channel = n;
         self.channel_text = format!("C{n}");
+        self.tune_hz = fc;
+        self.tuned_at = Instant::now();
+        self.centre_checked = false;
+        self.centre_tries = 0;
         let fits = self.span_hz > 0.0
             && (fc - self.centre_hz).abs() + CHANNEL_HALF_NEEDED_HZ <= self.span_hz / 2.0;
         match &self.session {
@@ -750,6 +865,245 @@ impl App {
             list[at.saturating_sub(1)]
         };
         self.tune_channel(next);
+    }
+
+    /// Where channel `n` is tuned: its place in the plan, and, with centring
+    /// on, the offset found for it.
+    fn channel_hz(&self, n: u8) -> Option<f64> {
+        let nominal = uhf_centre_hz(n)?;
+        let off = if self.sdr.auto_centre {
+            self.offsets.get(&n).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        Some(nominal + off)
+    }
+
+    /// Tune to `hz`: retune a live radio, move the VFO within a capture.
+    fn set_frequency(&mut self, hz: f64) {
+        self.cancel_optimiser();
+        self.tune_hz = hz;
+        self.tuned_at = Instant::now();
+        self.centre_checked = true;
+        if let Some(ch) = uhf_channel_at(hz) {
+            self.channel = ch;
+            self.channel_text = format!("C{ch}");
+        }
+        match &self.session {
+            Some(s) if s.live => {
+                s.rx.send(Command::Retune(hz));
+                self.centre_hz = hz;
+                self.reset_view();
+                self.reset_stream();
+                self.vfo_hz = Some(hz);
+            }
+            Some(_) => {
+                let fits = self.span_hz > 0.0
+                    && (hz - self.centre_hz).abs() + CHANNEL_HALF_NEEDED_HZ <= self.span_hz / 2.0;
+                if fits {
+                    self.vfo_hz = Some(hz);
+                    self.reset_stream();
+                } else {
+                    self.note = format!("{:.3} MHz is outside this capture", hz / 1e6);
+                }
+            }
+            None => self.vfo_hz = Some(hz),
+        }
+    }
+
+    /// The big frequency digits: scroll or click a digit to tune. The radio
+    /// follows when the editing has paused.
+    fn freq_dial(&mut self, ui: &mut egui::Ui) {
+        if self.dial_edit.is_none() {
+            self.dial_hz = self.vfo_hz.unwrap_or(self.tune_hz);
+        }
+        if freq_display::show(ui, &mut self.dial_hz, 1e6, 6e9, 34.0) {
+            self.dial_edit = Some(Instant::now());
+        }
+    }
+
+    fn apply_dial(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self.dial_edit {
+            if t.elapsed() >= Duration::from_millis(150) {
+                self.dial_edit = None;
+                self.set_frequency(self.dial_hz);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(160));
+            }
+        }
+    }
+
+    /// A few seconds after tuning, find where the carrier really is: UK muxes
+    /// are transmitted up to a third of a megahertz off their channel's centre.
+    /// If the receiver has locked it knows to the hertz (its carrier offset),
+    /// else the edges of the block in the spectrum say, to a few tens of
+    /// kilohertz: good enough to tell which of the plan's offsets it is, not
+    /// to retune by, so that is all that is taken from them. The offset found
+    /// is remembered for the channel, and the radio retuned to the carrier.
+    fn auto_centre(&mut self) {
+        if !self.sdr.auto_centre || self.centre_checked || self.session.is_none() {
+            return;
+        }
+        if self.tuned_at.elapsed() < Duration::from_secs(2) || self.span_hz <= 0.0 {
+            return;
+        }
+        let Some(nominal) = uhf_centre_hz(self.channel) else {
+            self.centre_checked = true;
+            return;
+        };
+        let locked = self.decode && self.dec.tracking && self.dec.tps_synced;
+        let snap = |off: f64| {
+            PLAN_OFFSETS_HZ
+                .iter()
+                .find(|p| (off - **p).abs() < SNAP_HZ)
+                .copied()
+        };
+        let found = if locked {
+            // The carrier's offset from the radio's centre, to the hertz; the
+            // radio's own clock error is in it, which the plan's offsets are
+            // not: snap to them if one is near.
+            let off = self.centre_hz + self.dec.cfo_hz - nominal;
+            Some(snap(off).unwrap_or(off))
+        } else {
+            signal_block(&self.smooth, self.centre_hz, self.span_hz, nominal)
+                .and_then(|(centre, _)| snap(centre - nominal))
+        };
+        let Some(off) = found.filter(|o| o.abs() < 600e3) else {
+            // Nothing to go on yet: look again, a few times.
+            self.centre_tries += 1;
+            self.tuned_at = Instant::now() - Duration::from_secs(1);
+            self.centre_checked = self.centre_tries >= 4;
+            return;
+        };
+        let ch = self.channel;
+        self.offsets.insert(ch, off);
+        prefs::set(&format!("offset_C{ch}"), &format!("{off:.0}"));
+        let target = nominal + off;
+        if (target - self.tune_hz).abs() > 25e3 {
+            self.set_frequency(target);
+            self.note = format!("C{ch} is {:+.0} kHz off: retuned", off / 1e3);
+        }
+        self.centre_checked = true;
+    }
+
+    /// Send the SDR settings to the radio and the engine when they change.
+    fn sync_sdr(&mut self) {
+        let Some(s) = &self.session else { return };
+        if self.sdr_sent == Some(self.sdr) {
+            return;
+        }
+        let first = self.sdr_sent.is_none();
+        s.rx.send(Command::FrontEnd(FrontEndSettings {
+            dc_removal: self.sdr.dc_removal,
+            iq_balance: self.sdr.iq_balance,
+        }));
+        let mut errors = Vec::new();
+        if (!first || self.sdr.filter_mhz.is_some())
+            && let Err(e) = s.set_filter_mhz(self.sdr.filter_mhz)
+        {
+            errors.push(e);
+        }
+        if (!first || self.sdr.ppm != 0.0)
+            && let Err(e) = s.set_ppm(self.sdr.ppm)
+        {
+            errors.push(e);
+        }
+        if let Some(e) = errors.pop() {
+            self.note = e;
+        }
+        self.sdr_sent = Some(self.sdr);
+        self.sdr.save();
+    }
+
+    /// The smooth mode follows the display rate.
+    fn sync_smooth(&mut self) {
+        self.smooth_mode = self.opts.fps >= SMOOTH_FPS;
+        let Some(s) = &self.session else { return };
+        if self.smooth_sent != self.smooth_mode {
+            s.rx.send(Command::Smooth(self.smooth_mode));
+            self.smooth_sent = self.smooth_mode;
+        }
+        // Twenty-five seconds of waterfall at the rate the rows come.
+        let rows_per_s = if self.smooth_mode { 60.0 } else { 20.0 };
+        self.history.set_capacity((25.0 * rows_per_s) as usize);
+    }
+
+    /// Rows of the channel while the heat maps are shown.
+    fn sync_heat(&mut self) {
+        let Some(s) = &self.session else { return };
+        let want = (self.bottom == Bottom::Heat && self.decode).then_some(if self.smooth_mode {
+            60.0
+        } else {
+            20.0
+        });
+        if self.heat_sent != want {
+            s.rx.send(Command::Heat(want));
+            self.heat_sent = want;
+            if want.is_none() {
+                self.heat.reset();
+            }
+        }
+    }
+
+    fn start_optimiser(&mut self) {
+        if !self.session.as_ref().is_some_and(|s| s.live) {
+            self.note = "Optimising the gain needs a live radio".into();
+            return;
+        }
+        self.opt_result = None;
+        self.optimiser = Some(sdr::Optimiser::new(self.gains));
+    }
+
+    /// Stop the optimiser and put back the gains it began with.
+    fn cancel_optimiser(&mut self) {
+        if let Some(o) = self.optimiser.take() {
+            self.gains = o.original;
+            self.change_gains();
+            self.opt_result = Some("cancelled".into());
+        }
+    }
+
+    /// One step of the gain optimiser each frame.
+    fn optimise_tick(&mut self) {
+        let Some(o) = self.optimiser.as_mut() else {
+            return;
+        };
+        if self.session.is_none() {
+            self.optimiser = None;
+            return;
+        }
+        let reading = sdr::Reading {
+            now: Instant::now(),
+            mer: (self.dec.decoding && self.dec.snr_db.is_finite()).then_some(self.dec.snr_db),
+            cn: self.cn_db,
+            rms_dbfs: self.stats.rms_dbfs,
+            clip_percent: self.stats.clip_percent,
+        };
+        match o.tick(&reading) {
+            sdr::Action::Wait => {}
+            sdr::Action::Apply(g) => {
+                self.gains = g;
+                self.change_gains();
+            }
+            sdr::Action::Finish(best) => {
+                let o = self.optimiser.take().expect("running");
+                let found = best.zip(o.best());
+                self.gains = best.unwrap_or(o.original);
+                self.change_gains();
+                self.opt_result = Some(match found {
+                    Some((g, p)) => format!(
+                        "best: LNA {} VGA {}, {:.1} dB {} (level {:.0} dBFS), {} settings tried",
+                        g.lna,
+                        g.vga,
+                        p.mer.or(p.cn).unwrap_or(0.0),
+                        if p.mer.is_some() { "MER" } else { "C/N" },
+                        p.rms_dbfs,
+                        o.done()
+                    ),
+                    None => "nothing to measure (no signal, or clipping at every setting)".into(),
+                });
+            }
+        }
     }
 
     fn change_gains(&mut self) {
@@ -799,7 +1153,7 @@ impl App {
         // them every frame would be waste.
         let new_stats =
             (self.stats_at.elapsed() >= Duration::from_millis(250)).then(|| s.rx.stats());
-        if self.bottom == Bottom::Channel {
+        if self.show_channel() {
             self.chan_view.update(s.rx.take_sounder());
         }
         if self.decode {
@@ -808,7 +1162,16 @@ impl App {
             let u = s.rx.take_decoder();
             self.dec = u.status;
             self.dec_packets = u.packets;
-            self.scope.update(u.scopes, u.measurements);
+            if self.bottom == Bottom::Maps {
+                if let Some(c) = &u.scopes {
+                    self.errors.add(c);
+                }
+            } else {
+                self.scope.update(u.scopes, u.measurements);
+            }
+            if self.bottom == Bottom::Heat {
+                self.heat.update(u.heat);
+            }
             let now = Instant::now();
             match &mut self.dec_rate {
                 Some((at, t, rate)) if t.elapsed() >= Duration::from_secs(1) => {
@@ -829,12 +1192,14 @@ impl App {
             }
             self.centre_hz = row.center_hz;
             self.span_hz = row.sample_rate;
-            // A calm trace: each row pulled a third of the way in (in dB).
+            // A calm trace: each row pulled a third of the way in (in dB), a
+            // seventh when they come three times as often.
+            let pull = if self.smooth_sent { 0.14 } else { 0.35 };
             if self.smooth.len() != row.db.len() {
                 self.smooth.clone_from(&row.db);
             } else {
                 for (s, v) in self.smooth.iter_mut().zip(&row.db) {
-                    *s += 0.35 * (v - *s);
+                    *s += pull * (v - *s);
                 }
             }
             self.estimate_cn(&row);
@@ -1000,6 +1365,17 @@ impl App {
 
     fn control_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            self.freq_dial(ui);
+            ui.add_space(10.0);
+            ui.vertical(|ui| self.control_rows(ui));
+        });
+        ui.add_space(2.0);
+    }
+
+    /// The controls beside the dial: the source, the channel and the radio on
+    /// the first line, the level, the panels and the display on the second.
+    fn control_rows(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             let running = self.session.is_some();
             let live = self.kind == SourceKind::HackRf;
@@ -1115,6 +1491,16 @@ impl App {
                     self.toggle_record();
                 }
             }
+            ui.separator();
+            if ui
+                .selectable_label(self.sdr_open, "⚙ SDR")
+                .on_hover_text(
+                    "DC removal, I/Q balance, filter, frequency correction, gain optimiser",
+                )
+                .clicked()
+            {
+                self.sdr_open = !self.sdr_open;
+            }
         });
         ui.horizontal(|ui| {
             let s = &self.stats;
@@ -1140,6 +1526,8 @@ impl App {
             ui.label("panel");
             ui.selectable_value(&mut self.bottom, Bottom::Scopes, "scopes");
             ui.selectable_value(&mut self.bottom, Bottom::Channel, "channel");
+            ui.selectable_value(&mut self.bottom, Bottom::Maps, "maps");
+            ui.selectable_value(&mut self.bottom, Bottom::Heat, "history");
             ui.selectable_value(&mut self.bottom, Bottom::Hidden, "none");
             if self.show_channel() {
                 egui::ComboBox::from_id_salt("doppler")
@@ -1161,8 +1549,13 @@ impl App {
                 .selected_text(format!("{} fps", self.opts.fps))
                 .width(70.0)
                 .show_ui(ui, |ui| {
-                    for f in [5.0, 10.0, 15.0, 20.0, 30.0] {
-                        ui.selectable_value(&mut self.opts.fps, f, format!("{f} fps"));
+                    for f in [5.0, 10.0, 15.0, 20.0, 30.0, 60.0] {
+                        let label = if f >= SMOOTH_FPS {
+                            format!("{f} fps (smooth)")
+                        } else {
+                            format!("{f} fps")
+                        };
+                        ui.selectable_value(&mut self.opts.fps, f, label);
                     }
                 });
             if !self.note.is_empty() {
@@ -1319,8 +1712,18 @@ impl eframe::App for App {
         self.sync_sounder();
         self.sync_decoder();
         self.sync_scopes();
+        self.sync_sdr();
+        self.sync_smooth();
+        self.sync_heat();
         self.poll_stream();
         self.sync_outputs();
+        self.auto_centre();
+        if self.opts.optimise && self.dec.decoding {
+            self.opts.optimise = false;
+            self.start_optimiser();
+        }
+        self.optimise_tick();
+        self.apply_dial(ctx);
         self.cpu_percent = self.cpu.poll();
         self.handle_screenshot(ctx);
         if self.session.is_some() || self.opts.screenshot.is_some() {
@@ -1345,6 +1748,12 @@ impl eframe::App for App {
                         self.chan_view.show(ui);
                     });
             }
+            Bottom::Maps => {
+                egui::Panel::bottom("maps").resizable(false).show(ui, |ui| {
+                    ui.set_min_height(CHANNEL_PANEL_H);
+                    self.chan_view.show_maps(ui, &mut self.errors);
+                });
+            }
             Bottom::Scopes => {
                 egui::Panel::bottom("scopes")
                     .resizable(false)
@@ -1352,6 +1761,13 @@ impl eframe::App for App {
                         ui.set_min_height(SCOPES_PANEL_H);
                         self.scope.show(ui, &self.dec);
                     });
+            }
+            Bottom::Heat => {
+                egui::Panel::bottom("heat").resizable(false).show(ui, |ui| {
+                    ui.set_min_height(CHANNEL_PANEL_H);
+                    let rate = if self.smooth_sent { 60.0 } else { 20.0 };
+                    self.heat.show(ui, rate);
+                });
             }
             Bottom::Hidden => {}
         }
@@ -1380,6 +1796,42 @@ impl eframe::App for App {
             });
         let ctx = ui.ctx().clone();
         self.ts_window.show(&ctx, &self.ts);
+        if self.sdr_open {
+            let live = self.session.as_ref().is_some_and(|s| s.live);
+            let asks = sdr::show(
+                &ctx,
+                &mut self.sdr_open,
+                sdr::SdrView {
+                    settings: &mut self.sdr,
+                    gains: &mut self.gains,
+                    live,
+                    front_end: self.stats.front_end,
+                    optimiser: self.optimiser.as_ref(),
+                    last_result: self.opt_result.as_deref(),
+                    offsets: &self.offsets,
+                },
+            );
+            if asks.gains_changed {
+                self.change_gains();
+            }
+            if asks.optimise {
+                self.start_optimiser();
+            }
+            if asks.cancel {
+                self.cancel_optimiser();
+            }
+            if asks.clear_offsets {
+                for c in 21..=69u8 {
+                    prefs::set(&format!("offset_C{c}"), "");
+                }
+                self.offsets.clear();
+            }
+            if asks.reset {
+                self.sdr = sdr::SdrSettings::default();
+                self.gains = Gains::default();
+                self.change_gains();
+            }
+        }
         let report = Arc::clone(&self.ts.report);
         if let Some(sid) = self.epg_window.show(&ctx, &self.epg, &report) {
             self.watch(sid);

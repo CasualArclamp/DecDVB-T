@@ -18,7 +18,9 @@ use eframe::egui::{
     pos2,
 };
 
-/// Rows kept: ~20 s at 25 rows/s.
+/// Rows kept by default: ~25 s at 20 rows/s. A history can hold another
+/// number (see [`History::set_capacity`]): the faster the rows come, the more
+/// are needed to hold the same time.
 pub const ROWS: usize = 512;
 /// Smallest level range shown, dB.
 const MIN_RANGE_DB: f32 = 25.0;
@@ -61,6 +63,11 @@ pub struct History {
     pub auto: bool,
     /// Manual levels, dB.
     pub manual: (f32, f32),
+    /// Rows kept.
+    capacity: usize,
+    /// Whether the floor and the peak are followed (a sort of every row):
+    /// not needed with fixed levels.
+    pub track: bool,
     floor: Option<f32>,
     peak: Option<f32>,
 }
@@ -74,6 +81,8 @@ impl Default for History {
             epoch: 0,
             auto: true,
             manual: (-110.0, -40.0),
+            capacity: ROWS,
+            track: true,
             floor: None,
             peak: None,
         }
@@ -83,13 +92,34 @@ impl Default for History {
 impl History {
     /// Forget everything (a new source or FFT size).
     pub fn reset(&mut self) {
-        let (auto, manual, epoch) = (self.auto, self.manual, self.epoch + 1);
+        let (auto, manual, epoch, track, capacity) = (
+            self.auto,
+            self.manual,
+            self.epoch + 1,
+            self.track,
+            self.capacity,
+        );
         *self = History {
             auto,
             manual,
             epoch,
+            track,
+            capacity,
             ..History::default()
         };
+    }
+
+    /// Keep this many rows (starting afresh if it is a change).
+    pub fn set_capacity(&mut self, rows: usize) {
+        let rows = rows.clamp(64, 4096);
+        if rows != self.capacity {
+            self.capacity = rows;
+            self.reset();
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     pub fn push(&mut self, row: Vec<f32>) {
@@ -100,16 +130,18 @@ impl History {
             self.reset();
             self.width = row.len();
         }
-        // Track floor (20th percentile) and peak (99.5th) with some inertia,
-        // so the colours do not pump with every row.
-        let mut sorted = row.clone();
-        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let q = |p: f32| sorted[((sorted.len() - 1) as f32 * p) as usize];
-        let (f, p) = (q(0.2), q(0.995));
-        self.floor = Some(self.floor.map_or(f, |x| x + 0.05 * (f - x)));
-        self.peak = Some(self.peak.map_or(p, |x| x + 0.05 * (p - x)));
+        if self.track {
+            // Track floor (20th percentile) and peak (99.5th) with some
+            // inertia, so the colours do not pump with every row.
+            let mut sorted = row.clone();
+            sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let q = |p: f32| sorted[((sorted.len() - 1) as f32 * p) as usize];
+            let (f, p) = (q(0.2), q(0.995));
+            self.floor = Some(self.floor.map_or(f, |x| x + 0.05 * (f - x)));
+            self.peak = Some(self.peak.map_or(p, |x| x + 0.05 * (p - x)));
+        }
 
-        if self.rows.len() == ROWS {
+        if self.rows.len() >= self.capacity {
             self.rows.pop_front();
         }
         self.rows.push_back(row);
@@ -150,6 +182,7 @@ impl RingImage {
     /// that put the newest row at the top; `None` while there are no rows.
     pub fn update(&mut self, ctx: &egui::Context, h: &History) -> Option<(TextureId, Rect)> {
         let width = h.rows.back()?.len().max(1);
+        let cap = h.capacity;
         if self.lut.is_empty() {
             self.lut = palette();
         }
@@ -157,30 +190,24 @@ impl RingImage {
         let new = h.pushed.saturating_sub(self.uploaded);
         if self.handle.is_none()
             || self.epoch != Some(h.epoch)
-            || self.size != [width, ROWS]
-            || new >= ROWS as u64
+            || self.size != [width, cap]
+            || new >= cap as u64
         {
             let image = ColorImage::new(
-                [width, ROWS],
-                render(
-                    h.rows.iter().rev().take(ROWS),
-                    width,
-                    ROWS,
-                    levels,
-                    &self.lut,
-                ),
+                [width, cap],
+                render(h.rows.iter().rev().take(cap), width, cap, levels, &self.lut),
             );
             match &mut self.handle {
                 Some(t) => t.set(image, OPTIONS),
                 None => self.handle = Some(ctx.load_texture("waterfall", image, OPTIONS)),
             }
-            self.size = [width, ROWS];
+            self.size = [width, cap];
             self.head = 0;
             self.epoch = Some(h.epoch);
         } else if new > 0 {
             let k = (new as usize).min(h.rows.len());
             let block = render(h.rows.iter().rev().take(k), width, k, levels, &self.lut);
-            let (head, parts) = plan(self.head, k, ROWS);
+            let (head, parts) = plan(self.head, k, cap);
             let handle = self.handle.as_mut()?;
             for (row, range) in parts {
                 let pixels = block[range.start * width..range.end * width].to_vec();
@@ -193,7 +220,7 @@ impl RingImage {
             self.head = head;
         }
         self.uploaded = h.pushed;
-        let v0 = self.head as f32 / ROWS as f32;
+        let v0 = self.head as f32 / cap as f32;
         Some((
             self.handle.as_ref()?.id(),
             Rect::from_min_max(pos2(0.0, v0), pos2(1.0, v0 + 1.0)),

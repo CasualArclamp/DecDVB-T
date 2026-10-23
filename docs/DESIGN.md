@@ -59,6 +59,11 @@ ring overflow on one DVB-T mux). Every design choice is weighed against this:
     (state, SNR/MER, CFO, FFT/GI, TPS/L1, modulation, packets, FEC counters);
   - the **right-side service panel** (services with bitrate, type tags,
     now/next EPG, click to play, small preview, file/UDP outputs).
+- **Bottom panel**: scopes | channel (fading waterfall and delay–Doppler) |
+  maps (no time axis: delay–Doppler, frequency–Doppler, the data cells' error
+  cloud and the MER per constellation point) | history (gain, SNR and echoes
+  over 25 s) | none. A frequency dial heads the control bar and an SDR window
+  holds the front-end settings and the gain optimiser.
 - **Discovery**: automatic T vs T2 detection (P1 symbol → T2, else T with TPS
   sync; FFT size and guard interval found blind), a **UHF band scan** (channels
   21–48, NIT network name and services listed), and **channel-number tuning**
@@ -111,6 +116,11 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
   five muxes decode from the HackRF with the RF amp on, two error-free)*
 - **M4** — player, PSI/SI, service panel, scopes, measurements. *(done,
   2026-10-23; the player runs live with sound and DVB subtitles, see
+  STATUS.md)*
+- **M4b** — the frequency dial, SDR settings (DC removal, I/Q balance, filter,
+  ppm), automatic centring of carriers that sit off their channel, the gain
+  optimiser, the non-time maps (delay–Doppler, frequency–Doppler, error cloud,
+  MER per constellation point) and a 60 fps mode. *(done, 2026-10-23, see
   STATUS.md)*
 - **M5** — DVB-T2 modulator.
 - **M6** — DVB-T2 receiver: P1, P2/L1, LDPC/BCH, TI, rotated QAM → TS.

@@ -58,6 +58,8 @@ const STALLED_LOOKS: u32 = 4;
 /// the pilots still seem to line up, which is why this is not left to
 /// coherence.
 const QUALITY_SYMBOLS: u64 = 128;
+/// Heat rows kept for a consumer that is slow to take them.
+const HEAT_QUEUE: usize = 256;
 const MIN_SNR_DB: f32 = 2.0;
 const UNDECODABLE_DB: f32 = 8.0;
 const POOR_LOOKS: u32 = 4;
@@ -249,6 +251,10 @@ pub struct Receiver {
     raw: Vec<Iq>,
     plan: Option<SymbolPlan>,
     measure_state: MeasureState,
+    /// Rows of the channel's gain, signal-to-noise ratio and impulse response
+    /// wanted a second (0: none), and the ones made and not yet taken.
+    heat_rate: f64,
+    heat: Vec<Measurements>,
 }
 
 impl Receiver {
@@ -270,6 +276,8 @@ impl Receiver {
             raw: Vec::new(),
             plan: None,
             measure_state: MeasureState::default(),
+            heat_rate: 0.0,
+            heat: Vec::new(),
         }
     }
 
@@ -286,6 +294,21 @@ impl Receiver {
     /// The cells asked for, once the next symbol has come.
     pub fn take_scopes(&mut self) -> Option<Scopes> {
         self.scopes.take()
+    }
+
+    /// Make a row of the channel (as [`measure`](Self::measure) gives it)
+    /// `rows_per_s` times a second, for a heat map of it over time; 0 stops.
+    /// Rows cost a transform each and are made only while asked for.
+    pub fn set_heat(&mut self, rows_per_s: f64) {
+        self.heat_rate = rows_per_s.max(0.0);
+        if self.heat_rate == 0.0 {
+            self.heat.clear();
+        }
+    }
+
+    /// The rows made since the last call, oldest first, appended to `out`.
+    pub fn take_heat(&mut self, out: &mut Vec<Measurements>) {
+        out.append(&mut self.heat);
     }
 
     /// The channel as the last symbol's estimate has it (the gain and the
@@ -521,6 +544,29 @@ impl Receiver {
         let phase_now = t.phase;
         t.phase = (t.phase + 1) % 4;
         t.symbols += 1;
+
+        if self.heat_rate > 0.0 && t.eq.ready() {
+            // A row every so many symbols (the symbol rate over the rows').
+            let fft = t.reader.fft;
+            let sym_s = (fft.n() + fft.n() / t.guard.divisor()) as f64 / self.fs_native;
+            let every = (1.0 / (sym_s * self.heat_rate)).round().max(1.0) as u64;
+            if t.symbols % every == 0 {
+                let guard_us =
+                    (fft.n() as f64 / t.guard.divisor() as f64 / self.fs_native * 1e6) as f32;
+                if self.heat.len() >= HEAT_QUEUE {
+                    self.heat.remove(0);
+                }
+                self.heat.push(scope::measure(
+                    &mut self.measure_state,
+                    fft,
+                    self.fs_native,
+                    guard_us,
+                    t.eq.channel(),
+                    &t.eq.w,
+                    &t.eq.noise,
+                ));
+            }
+        }
 
         // The TPS: where in the frame this symbol is.
         let t3 = Instant::now();
@@ -797,6 +843,50 @@ mod tests {
     /// channel's samples as the new one's: a signal, then another mux at
     /// another carrier offset with its symbols at another phase. The receiver
     /// has to find the second without being restarted.
+    #[test]
+    fn heat_rows_follow_the_channel_at_the_rate_asked() {
+        let opts = SimOptions {
+            mode: Mode::parse("64qam-2/3-8k-1/32").unwrap(),
+            cell_id: None,
+            ts_file: None,
+            seconds: 1.4,
+            out_rate_hz: Some(10e6),
+            level_dbfs: -20.0,
+            channel: Channel {
+                paths: vec![Path::echo(0.0, 0.0), Path::echo(3.0, -10.0)],
+                cn_db: Some(30.0),
+                ..Default::default()
+            },
+        };
+        let mut x = Vec::new();
+        generate(&opts, |b| {
+            x.extend_from_slice(b);
+            Ok(())
+        })
+        .unwrap();
+        let mut rx = Receiver::new(ReceiverConfig::new(10e6, 0.0));
+        rx.set_heat(20.0);
+        let (mut rows, mut at) = (Vec::new(), 0);
+        while at < x.len() {
+            let n = 100_003.min(x.len() - at);
+            rx.push(&x[at..at + n], at as u64);
+            rx.take_heat(&mut rows);
+            at += n;
+        }
+        // About 20 a second from the lock (a little after the first 0.2 s).
+        assert!((15..=30).contains(&rows.len()), "{} rows", rows.len());
+        let last = rows.last().unwrap();
+        assert_eq!(last.gain_db.len(), last.snr_db.len());
+        let e = last.echoes.iter().find(|e| e.db > -14.0).expect("an echo");
+        assert!((e.delay_us.abs() - 3.0).abs() < 0.3, "{e:?}");
+        // Off: nothing more is made.
+        rx.set_heat(0.0);
+        rx.push(&x[..200_000], at as u64);
+        let mut more = Vec::new();
+        rx.take_heat(&mut more);
+        assert!(more.is_empty());
+    }
+
     #[test]
     fn a_lock_with_no_signal_to_noise_is_given_up_after_a_few_looks() {
         let mut q = Quality::default();

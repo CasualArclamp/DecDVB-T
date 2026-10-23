@@ -110,6 +110,22 @@ pub struct HackRfControl {
     dev: Arc<HackRf>,
     settings: Arc<Mutex<HackRfSettings>>,
     overflows: Arc<AtomicU64>,
+    trim: Arc<Mutex<Trim>>,
+}
+
+/// What is set on a running radio beside the centre and the gains.
+#[derive(Debug, Clone, Copy, Default)]
+struct Trim {
+    /// The radio's frequency error, parts per million (positive: it runs high).
+    ppm: f64,
+    /// The baseband filter's bandwidth, Hz; `None`: the driver's own, 0.75 of
+    /// the sample rate.
+    filter_hz: Option<u32>,
+}
+
+/// The frequency to command so that a radio running `ppm` high lands on `hz`.
+fn commanded(hz: u64, ppm: f64) -> u64 {
+    (hz as f64 / (1.0 + ppm * 1e-6)).round() as u64
 }
 
 impl HackRfControl {
@@ -119,8 +135,31 @@ impl HackRfControl {
 
     /// Retune. Takes effect within a USB transfer or two.
     pub fn set_center(&self, hz: u64) -> Result<()> {
-        guarded("set frequency", || self.dev.set_freq(hz))?;
+        let f = commanded(hz, self.trim.lock().unwrap().ppm);
+        guarded("set frequency", || self.dev.set_freq(f))?;
         self.settings.lock().unwrap().center_hz = hz;
+        Ok(())
+    }
+
+    /// Correct for the radio's frequency error: it is retuned now so that the
+    /// centre it reports is where it is, and every retune after allows for it.
+    pub fn set_ppm(&self, ppm: f64) -> Result<()> {
+        self.trim.lock().unwrap().ppm = ppm.clamp(-200.0, 200.0);
+        let hz = self.settings.lock().unwrap().center_hz;
+        self.set_center(hz)
+    }
+
+    /// The baseband filter's bandwidth, Hz, or `None` for the driver's
+    /// automatic one (0.75 of the sample rate: 7.5 MHz at 10 MS/s, which
+    /// leaves the edges of an 8 MHz channel on its slope). The radio takes
+    /// the nearest bandwidth it has.
+    pub fn set_filter_bandwidth(&self, hz: Option<u32>) -> Result<()> {
+        let want =
+            hz.unwrap_or_else(|| (0.75 * self.settings.lock().unwrap().sample_rate as f64) as u32);
+        guarded("set baseband filter", || {
+            self.dev.set_baseband_filter_bandwidth(want)
+        })?;
+        self.trim.lock().unwrap().filter_hz = hz;
         Ok(())
     }
 
@@ -218,6 +257,7 @@ impl HackRfSource {
                 dev,
                 settings: Arc::new(Mutex::new(HackRfSettings { gains, ..settings })),
                 overflows,
+                trim: Arc::new(Mutex::new(Trim::default())),
             },
             stop,
             thread: Some(thread),
@@ -303,6 +343,14 @@ impl Drop for HackRfSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_radio_that_runs_high_is_commanded_lower() {
+        assert_eq!(commanded(546_000_000, 0.0), 546_000_000);
+        // 10 ppm high at 546 MHz is 5.46 kHz: command that much under.
+        assert_eq!(commanded(546_000_000, 10.0), 545_994_540);
+        assert_eq!(commanded(546_000_000, -10.0), 546_005_460);
+    }
 
     #[test]
     fn gains_snap_to_hardware_steps() {

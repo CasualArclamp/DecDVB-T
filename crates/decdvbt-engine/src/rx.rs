@@ -18,12 +18,13 @@ use std::time::{Duration, Instant};
 use decdvbt_core::{Iq, SampleFormat};
 use decdvbt_io::{IqFileWriter, IqSource};
 
-use decdvbt_rx::delay_doppler::DelayDoppler;
+use decdvbt_rx::delay_doppler::{DelayDoppler, FreqDoppler};
 use decdvbt_rx::receiver::{Receiver as OfdmReceiver, ReceiverConfig, ReceiverStatus};
 use decdvbt_rx::scope::{Measurements, Scopes};
 use decdvbt_rx::sounder::{Sounder, SounderConfig, Status as SounderStatus};
 use decdvbt_ts::Epg;
 
+use crate::frontend::{FrontEnd, FrontEndReading, FrontEndSettings};
 use crate::hub::{Feeder, Outputs, TsHub, TsView};
 use crate::meter::{Stage, StageLoad, StageMeter};
 use crate::spectrum::RowBuilder;
@@ -74,6 +75,8 @@ pub struct Stats {
     pub clip_percent: f32,
     /// Buffers the source had to drop because we fell behind.
     pub dropped: u64,
+    /// What the front end's estimates read: the DC offset and the image.
+    pub front_end: FrontEndReading,
     pub load: StageLoad,
     pub recording: Option<Recording>,
     pub error: Option<String>,
@@ -101,6 +104,18 @@ pub enum Command {
     Scopes(bool),
     /// Make the channel measurements (four times a second) while on.
     Measure(bool),
+    /// Make a row of the channel (its gain and signal-to-noise ratio across
+    /// the band, its impulse response) this many times a second while on, for
+    /// the heat maps; `None` stops. A row costs a transform.
+    Heat(Option<f64>),
+    /// The smooth display, for 60 frames a second: the waterfall's rows 60 a
+    /// second (the same number of transforms in all, a smaller share of them to
+    /// each row), the scopes' cells 30 times a second and the measurements 12,
+    /// and what the receiver has made handed over every 33 ms, not 100.
+    Smooth(bool),
+    /// Which corrections are made to the radio's samples (the DC offset, the
+    /// I/Q imbalance) before the spectrum, the receiver and the sounder see them.
+    FrontEnd(FrontEndSettings),
     /// Start recording to this file (cs8), or stop with `None`.
     Record(Option<PathBuf>),
 }
@@ -112,6 +127,8 @@ struct SounderOut {
     fading: Vec<Vec<f32>>,
     map: Option<Arc<DelayDoppler>>,
     map_new: bool,
+    freq_map: Option<Arc<FreqDoppler>>,
+    freq_new: bool,
 }
 
 /// What [`Rx::take_sounder`] hands over.
@@ -122,6 +139,8 @@ pub struct SounderUpdate {
     pub fading: Vec<Vec<f32>>,
     /// The delay–Doppler map, if a new one has been made.
     pub map: Option<Arc<DelayDoppler>>,
+    /// The Doppler spectrum at each carrier, likewise.
+    pub freq_map: Option<Arc<FreqDoppler>>,
 }
 
 /// What the receiver has made, waiting for the GUI.
@@ -132,6 +151,47 @@ struct DecoderOut {
     packets: u64,
     scopes: Option<Arc<Scopes>>,
     measurements: Option<Arc<Measurements>>,
+    /// Heat rows not yet taken (the oldest go past [`MAX_HEAT`]).
+    heat: Vec<Arc<Measurements>>,
+}
+
+/// Heat rows kept for a GUI that is slow to collect them.
+const MAX_HEAT: usize = 400;
+
+/// How often the thread hands things over, as the display is paced.
+#[derive(Clone, Copy)]
+struct Pace {
+    /// The receiver's and the sounder's results to the GUI.
+    publish: Duration,
+    scopes: Duration,
+    measure: Duration,
+    /// The waterfall's rows a second, and the transforms in each.
+    rows_per_s: f64,
+    segments: u32,
+}
+
+impl Pace {
+    fn normal(opts: &RxOptions) -> Pace {
+        Pace {
+            publish: Duration::from_millis(100),
+            scopes: Duration::from_millis(100),
+            measure: Duration::from_millis(250),
+            rows_per_s: opts.rows_per_s,
+            segments: opts.segments_per_row,
+        }
+    }
+
+    /// For 60 frames a second: the rows come three times as often with a
+    /// third of the transforms, so the waterfall costs the same.
+    fn smooth(opts: &RxOptions) -> Pace {
+        Pace {
+            publish: Duration::from_millis(33),
+            scopes: Duration::from_millis(33),
+            measure: Duration::from_millis(80),
+            rows_per_s: opts.rows_per_s * 3.0,
+            segments: (opts.segments_per_row / 3).max(1),
+        }
+    }
 }
 
 /// What [`Rx::take_decoder`] hands over.
@@ -144,6 +204,8 @@ pub struct DecoderUpdate {
     /// since the last call.
     pub scopes: Option<Arc<Scopes>>,
     pub measurements: Option<Arc<Measurements>>,
+    /// Rows of the channel made since the last call, oldest first.
+    pub heat: Vec<Arc<Measurements>>,
 }
 
 struct Shared {
@@ -265,6 +327,11 @@ impl Rx {
             } else {
                 None
             },
+            freq_map: if std::mem::take(&mut o.freq_new) {
+                o.freq_map.clone()
+            } else {
+                None
+            },
         }
     }
 
@@ -276,6 +343,7 @@ impl Rx {
             packets: o.packets,
             scopes: o.scopes.take(),
             measurements: o.measurements.take(),
+            heat: std::mem::take(&mut o.heat),
         }
     }
 
@@ -330,7 +398,8 @@ fn run(
 ) {
     let rate = source.sample_rate();
     let live = source.is_live();
-    let mut builder = RowBuilder::new(opts.fft, rate, opts.rows_per_s, opts.segments_per_row);
+    let mut pace = Pace::normal(&opts);
+    let mut builder = RowBuilder::new(opts.fft, rate, pace.rows_per_s, pace.segments);
     let mut meter = StageMeter::default();
     let mut block: Vec<Iq> = Vec::new();
     let mut level = Level::default();
@@ -344,9 +413,12 @@ fn run(
     let mut decoder: Option<(OfdmReceiver, f64)> = None;
     let mut decoder_pub = Instant::now();
     let mut settle = Settle::default();
+    let mut front = FrontEnd::new(FrontEndSettings::default());
+    let mut heat_scratch: Vec<Measurements> = Vec::new();
     let mut ts_scratch: Vec<u8> = Vec::new();
     // The display's scopes and measurements, and when each was last made.
     let (mut scopes_on, mut measure_on) = (false, false);
+    let mut heat_rate: Option<f64> = None;
     let (mut scopes_at, mut measure_at) = (Instant::now(), Instant::now());
     let mut map_at = Instant::now();
     let started = Instant::now();
@@ -357,9 +429,11 @@ fn run(
         let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
         Sounder::new(SounderConfig::new(rate, offset))
     };
-    let new_decoder = |vfo_hz: f64, centre: f64, rate: f64| {
+    let new_decoder = |vfo_hz: f64, centre: f64, rate: f64, heat: Option<f64>| {
         let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
-        OfdmReceiver::new(ReceiverConfig::new(rate, offset))
+        let mut d = OfdmReceiver::new(ReceiverConfig::new(rate, offset));
+        d.set_heat(heat.unwrap_or(0.0));
+        d
     };
 
     while !sh.stop.load(Ordering::Relaxed) {
@@ -370,13 +444,29 @@ fn run(
                     *sh.sounder.lock().unwrap() = SounderOut::default();
                 }
                 Ok(Command::Decode(vfo)) => {
-                    decoder = vfo.map(|v| (new_decoder(v, source.center_freq(), rate), v));
+                    decoder =
+                        vfo.map(|v| (new_decoder(v, source.center_freq(), rate, heat_rate), v));
                     *sh.decoder.lock().unwrap() = DecoderOut::default();
                     ts_scratch.clear();
                     feeder.reset();
                 }
                 Ok(Command::Scopes(on)) => scopes_on = on,
                 Ok(Command::Measure(on)) => measure_on = on,
+                Ok(Command::Heat(rows)) => {
+                    heat_rate = rows;
+                    if let Some((d, _)) = &mut decoder {
+                        d.set_heat(rows.unwrap_or(0.0));
+                    }
+                }
+                Ok(Command::FrontEnd(f)) => front.settings = f,
+                Ok(Command::Smooth(on)) => {
+                    pace = if on {
+                        Pace::smooth(&opts)
+                    } else {
+                        Pace::normal(&opts)
+                    };
+                    builder = RowBuilder::new(opts.fft, rate, pace.rows_per_s, pace.segments);
+                }
                 Ok(Command::Retune(hz)) => match source.retune(hz) {
                     Ok(true) => {
                         tuning += 1;
@@ -386,7 +476,7 @@ fn run(
                             *s = new_sounder(*v, source.center_freq(), rate);
                         }
                         if let Some((d, v)) = &mut decoder {
-                            *d = new_decoder(*v, source.center_freq(), rate);
+                            *d = new_decoder(*v, source.center_freq(), rate, heat_rate);
                             ts_scratch.clear();
                             feeder.reset();
                         }
@@ -448,14 +538,29 @@ fn run(
         let at = total;
         total += n as u64;
 
+        // What the radio gave, as it gave it: its level and clipping, and
+        // the recording.
+        level.add(&block);
+        if let Some((w, path, bytes)) = &mut writer {
+            let r = meter.time(Stage::Record, || w.write(&block));
+            *bytes += (n * SampleFormat::Cs8.bytes_per_sample()) as u64;
+            if let Err(e) = r {
+                set_error(format!("recording to {}: {e}", path.display()));
+                writer = None;
+            }
+        }
+        meter.time(Stage::FrontEnd, || front.apply(&mut block));
+
         if let Some((s, _)) = &mut sounder {
             meter.time(Stage::Sounder, || s.push(&block, at));
-            if sounder_pub.elapsed() >= Duration::from_millis(100) {
+            if sounder_pub.elapsed() >= pace.publish {
                 sounder_pub = Instant::now();
                 // The map is made once a second, and only while locked.
                 let map = (map_at.elapsed() >= Duration::from_secs(1)).then(|| {
                     map_at = Instant::now();
-                    meter.time(Stage::Sounder, || s.delay_doppler().cloned())
+                    meter.time(Stage::Sounder, || {
+                        (s.delay_doppler().cloned(), s.freq_doppler().cloned())
+                    })
                 });
                 let mut o = sh.sounder.lock().unwrap();
                 o.status = s.status();
@@ -463,31 +568,36 @@ fn run(
                 // A GUI that stops collecting does not make this grow.
                 let extra = o.fading.len().saturating_sub(600);
                 o.fading.drain(..extra);
-                if let Some(Some(m)) = map {
-                    o.map = Some(Arc::new(m));
-                    o.map_new = true;
+                if let Some((dd, fd)) = map {
+                    if let Some(m) = dd {
+                        o.map = Some(Arc::new(m));
+                        o.map_new = true;
+                    }
+                    if let Some(m) = fd {
+                        o.freq_map = Some(Arc::new(m));
+                        o.freq_new = true;
+                    }
                 }
             }
         }
 
         if let Some((d, _)) = &mut decoder {
             meter.time(Stage::Decoder, || {
-                if scopes_on && scopes_at.elapsed() >= Duration::from_millis(100) {
+                if scopes_on && scopes_at.elapsed() >= pace.scopes {
                     scopes_at = Instant::now();
                     d.request_scopes();
                 }
                 d.push(&block, at);
                 d.take_ts(&mut ts_scratch);
             });
-            if decoder_pub.elapsed() >= Duration::from_millis(100) {
+            if decoder_pub.elapsed() >= pace.publish {
                 decoder_pub = Instant::now();
                 let packets = (ts_scratch.len() / 188) as u64;
                 feeder.feed(std::mem::take(&mut ts_scratch));
-                let measured = (measure_on && measure_at.elapsed() >= Duration::from_millis(250))
-                    .then(|| {
-                        measure_at = Instant::now();
-                        meter.time(Stage::Decoder, || d.measure())
-                    });
+                let measured = (measure_on && measure_at.elapsed() >= pace.measure).then(|| {
+                    measure_at = Instant::now();
+                    meter.time(Stage::Decoder, || d.measure())
+                });
                 let mut o = sh.decoder.lock().unwrap();
                 o.status = d.status().clone();
                 o.packets += packets;
@@ -497,20 +607,14 @@ fn run(
                 if let Some(Some(m)) = measured {
                     o.measurements = Some(Arc::new(m));
                 }
-            }
-        }
-
-        if let Some((w, path, bytes)) = &mut writer {
-            let r = meter.time(Stage::Record, || w.write(&block));
-            *bytes += (n * SampleFormat::Cs8.bytes_per_sample()) as u64;
-            if let Err(e) = r {
-                set_error(format!("recording to {}: {e}", path.display()));
-                writer = None;
+                d.take_heat(&mut heat_scratch);
+                o.heat.extend(heat_scratch.drain(..).map(Arc::new));
+                let extra = o.heat.len().saturating_sub(MAX_HEAT);
+                o.heat.drain(..extra);
             }
         }
 
         let row = meter.time(Stage::Spectrum, || {
-            level.add(&block);
             if builder.push(&block) {
                 let mut db = Vec::with_capacity(builder.fft_size());
                 builder.take_row(&mut db).map(|_| Row {
@@ -544,6 +648,7 @@ fn run(
             }
             level = Level::default();
             s.dropped = drops.as_ref().map_or(0, |d| d());
+            s.front_end = front.reading();
             s.load = meter.last;
             s.recording = writer.as_ref().map(|(_, p, b)| Recording {
                 path: p.clone(),
@@ -644,6 +749,35 @@ mod tests {
         assert!(rx.stats().ended);
     }
 
+    /// The smooth display makes the waterfall's rows three times as often.
+    #[test]
+    fn smooth_mode_triples_the_waterfalls_rows() {
+        let rows_in_a_while = |smooth: bool| {
+            let rx = Rx::start(
+                Box::new(ToneSource {
+                    k: 0,
+                    left: 600_000,
+                }),
+                RxOptions::default(),
+                None,
+            );
+            if smooth {
+                rx.send(Command::Smooth(true));
+            }
+            let t0 = Instant::now();
+            let mut n = 0;
+            while rx.running() && t0.elapsed() < Duration::from_secs(5) {
+                n += rx.take_rows().len();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            n + rx.take_rows().len()
+        };
+        let (normal, smooth) = (rows_in_a_while(false), rows_in_a_while(true));
+        // 0.6 s at 20 and at 60 rows a second.
+        assert!((8..=16).contains(&normal), "{normal} rows");
+        assert!(smooth > 2 * normal, "{smooth} rows against {normal}");
+    }
+
     #[test]
     fn recording_writes_the_samples_as_cs8() {
         let path = std::env::temp_dir().join("decdvbt-engine-rec.cs8");
@@ -703,12 +837,14 @@ mod tests {
         rx.send(Command::Sounder(Some(546e6)));
         let t0 = Instant::now();
         let (mut rows, mut map, mut status) = (0usize, None, SounderStatus::default());
+        let mut fmap = None;
         while t0.elapsed() < Duration::from_secs(7) && map.is_none() {
             std::thread::sleep(Duration::from_millis(100));
             let u = rx.take_sounder();
             status = u.status;
             rows += u.fading.len();
             map = u.map;
+            fmap = u.freq_map.or(fmap);
         }
         drop(rx);
         let _ = std::fs::remove_file(&path);
@@ -719,6 +855,9 @@ mod tests {
             status.cfo_hz
         );
         assert!(rows > 20, "{rows} fading rows");
+        // The Doppler spectrum at each carrier came with it.
+        let f = fmap.expect("a frequency-Doppler map");
+        assert!(f.cols > 100 && f.dopplers > 10);
         let m = map.expect("a map");
         // The strongest path near 0 us and its echo 3 us later.
         let c0 = ((0.0 - m.delay_start_us) / m.delay_step_us).round() as usize;
@@ -778,9 +917,11 @@ mod tests {
         rx.send(Command::Decode(Some(546e6)));
         rx.send(Command::Scopes(true));
         rx.send(Command::Measure(true));
+        rx.send(Command::Heat(Some(20.0)));
         let t0 = Instant::now();
         let (mut ts, mut status) = (Vec::new(), None);
         let (mut scopes, mut measurements) = (None, None);
+        let mut heat = Vec::new();
         // Until a few thousand packets are in, before the file ends and the
         // engine plays it again from the start (the counters would restart).
         while t0.elapsed() < Duration::from_secs(5) && ts.len() < 188 * 3000 {
@@ -794,6 +935,7 @@ mod tests {
             status = Some(u.status);
             scopes = u.scopes.or(scopes);
             measurements = u.measurements.or(measurements);
+            heat.extend(u.heat);
         }
         let packets = rx.take_decoder().packets;
         let view = rx.ts_view();
@@ -826,5 +968,13 @@ mod tests {
         let e = m.echoes.iter().find(|e| e.db > -12.0).expect("an echo");
         assert!((e.delay_us.abs() - 3.0).abs() < 0.5, "{e:?}");
         assert!(view.packets > 0 && view.dropped == 0, "{view:?}");
+        // Rows of the channel came too, with the echo in them.
+        assert!(heat.len() >= 4, "{} heat rows", heat.len());
+        let row = heat.last().unwrap();
+        assert!(
+            row.echoes
+                .iter()
+                .any(|e| (e.delay_us.abs() - 3.0).abs() < 0.5 && e.db > -13.0)
+        );
     }
 }
