@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use decdvbt_core::Iq;
 use decdvbt_core::dvbt::{FftSize, Guard};
-use decdvbt_ofdm::pilots::{pilot_value, prbs};
+use decdvbt_ofdm::pilots::{continual_pilots, pilot_value, prbs};
 use rustfft::{Fft, FftPlanner};
 
 /// The least contrast of the cyclic-prefix fold over its median that counts:
@@ -34,6 +34,18 @@ pub const MIN_CONTRAST: f32 = 5.0;
 /// The least concentration of the impulse response (see [`concentration`])
 /// that counts as a DVB-T signal.
 pub const MIN_CONCENTRATION: f32 = 0.35;
+/// How many whole carriers either side of the coarse guess the pilots are
+/// tried over. The spectral guess (power inside the block against outside)
+/// is no better than a few carriers on a real band, where the receiver's
+/// filter blurs the block's edges: on a live capture it was nine carriers out
+/// at a third of the positions the capture could be started from, and a
+/// search of ±3 never reached the true offset, so a clean signal was not
+/// found, and again 0.4 s later at another position. The continual pilots
+/// (see [`pilot_offset`]) give a better guess; this is the margin round it.
+const OFFSET_SEARCH: isize = 8;
+/// The least coherence of the continual pilots between symbols that counts as
+/// finding them (noise gives about 0.04).
+const MIN_PILOT_OFFSET: f32 = 0.25;
 /// Guard interval kinds, and FFT sizes, tried.
 const FFTS: [FftSize; 2] = [FftSize::K8, FftSize::K2];
 
@@ -179,6 +191,38 @@ pub fn concentration(h: &[Iq], nd: usize, window: usize, ifft: &mut Fft1) -> f32
     best / total
 }
 
+/// The carrier offset in whole carriers, from the continual pilots: they
+/// carry the same value in every symbol (each symbol's carriers start their
+/// phase afresh at its own start), so with the windows the same distance into
+/// each symbol a bin holding one has the same content in each symbol's
+/// spectrum but for one turn common to all the carriers (what a frequency
+/// offset of `d` carriers does over a symbol), and the products of consecutive
+/// symbols' bins add up in step for the right shift `d` and not for any other.
+/// Returns the shift and how coherent the sum is (about 1 for the right one,
+/// 0.04 for any other).
+fn pilot_offset(spectra: &[Vec<Iq>], fft: FftSize, dmax: isize) -> (isize, f32) {
+    let n = fft.n();
+    let kmid = (fft.active_carriers() - 1) / 2;
+    let cps = continual_pilots(fft);
+    let mut best = (0isize, 0.0f32);
+    for d in -dmax..=dmax {
+        let (mut sum, mut mag) = (Iq::new(0.0, 0.0), 0.0f32);
+        for &k in cps {
+            let b = bin_of(k as usize, kmid, d, n);
+            for pair in spectra.windows(2) {
+                let p = pair[1][b] * pair[0][b].conj();
+                sum += p;
+                mag += p.norm();
+            }
+        }
+        let score = if mag > 0.0 { sum.norm() / mag } else { 0.0 };
+        if score > best.1 {
+            best = (d, score);
+        }
+    }
+    best
+}
+
 /// What acquisition found.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Acquisition {
@@ -192,6 +236,34 @@ pub struct Acquisition {
     pub phase: usize,
     pub contrast: f32,
     pub concentration: f32,
+}
+
+/// The spectra of `symbols` consecutive symbols from the guard interval `cp`
+/// found (each window a quarter guard before the useful part, as the tracker's
+/// are), the fractional offset taken out. The rotation's phase origin is the
+/// array's start: all the symbols share it.
+fn symbol_spectra(x: &[Iq], cp: &CpFind, symbols: usize) -> Vec<Vec<Iq>> {
+    let n = cp.fft.n();
+    let g = n / cp.guard.divisor();
+    let per = n + g;
+    let delta = (g / 4).clamp(8, 128);
+    let first = cp.apex.round() as usize;
+    let mut plan = Fft1::new(n);
+    let mut spectra = Vec::with_capacity(symbols);
+    for i in 0..symbols {
+        let start = first + i * per + g - delta;
+        let mut buf: Vec<Iq> = x[start..start + n]
+            .iter()
+            .enumerate()
+            .map(|(j, &s)| {
+                let ph = -std::f64::consts::TAU * cp.eps * (start + j) as f64 / n as f64;
+                s * Iq::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+        plan.forward(&mut buf);
+        spectra.push(buf);
+    }
+    spectra
 }
 
 /// Find the carrier offset in whole carriers (by the block's spectral edges),
@@ -211,24 +283,7 @@ pub fn acquire(x: &[Iq], cp: &CpFind) -> Option<Acquisition> {
     if first + (symbols - 1) * per + g + n > x.len() || g < delta {
         return None;
     }
-    let mut plan = Fft1::new(n);
-
-    // The four symbols' spectra, the fractional offset taken out. The
-    // rotation's phase origin is the array's start: all the symbols share it.
-    let mut spectra: Vec<Vec<Iq>> = Vec::new();
-    for i in 0..symbols {
-        let start = first + i * per + g - delta;
-        let mut buf: Vec<Iq> = x[start..start + n]
-            .iter()
-            .enumerate()
-            .map(|(j, &s)| {
-                let ph = -std::f64::consts::TAU * cp.eps * (start + j) as f64 / n as f64;
-                s * Iq::new(ph.cos() as f32, ph.sin() as f32)
-            })
-            .collect();
-        plan.forward(&mut buf);
-        spectra.push(buf);
-    }
+    let spectra = symbol_spectra(x, cp, symbols);
 
     // Whole carriers: the shift d that puts the most power inside the block
     // and the least outside, by prefix sums over the circular power array.
@@ -254,7 +309,13 @@ pub fn acquire(x: &[Iq], cp: &CpFind) -> Option<Acquisition> {
         coarse.push((ratio, d));
     }
     coarse.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let d0 = coarse.first()?.1;
+    // The pilots' own answer if they give a clear one, else the spectrum's.
+    let (d_pilots, coherence) = pilot_offset(&spectra, fft, dmax);
+    let d0 = if coherence >= MIN_PILOT_OFFSET {
+        d_pilots
+    } else {
+        coarse.first()?.1
+    };
 
     // The pilots: for each scattered phase and offsets about d0, how
     // concentrated is the channel they give, summed over the four symbols?
@@ -269,7 +330,7 @@ pub fn acquire(x: &[Iq], cp: &CpFind) -> Option<Acquisition> {
     let window = ((12e-6 / tap_s).round() as usize).clamp(4, nd / 2);
     let mut ifft = Fft1::new(nd);
     let mut results = Vec::new();
-    for d in d0 - 3..=d0 + 3 {
+    for d in d0 - OFFSET_SEARCH..=d0 + OFFSET_SEARCH {
         for phase in 0..4usize {
             let mut sum = 0.0f32;
             for (i, s) in spectra.iter().enumerate() {
@@ -416,6 +477,30 @@ mod tests {
                 a.apex
             );
             assert!(a.concentration > 0.5, "{}", a.concentration);
+        }
+    }
+
+    /// The continual pilots alone give the offset in whole carriers, sharply
+    /// (about 1 at the right shift, a few hundredths elsewhere), where the
+    /// spectral edges are only good to a few.
+    #[test]
+    fn the_continual_pilots_give_the_offset_in_whole_carriers() {
+        let mode = Mode::parse("64qam-2/3-8k-1/32").unwrap();
+        let df = mode.bandwidth.sample_rate_hz() / 8192.0;
+        for cfo in [0.0, 337_000.0, -251_000.0] {
+            let ch = Channel {
+                paths: vec![Path::echo(0.0, 0.0), Path::echo(2.0, -6.0)],
+                ..Default::default()
+            };
+            let x = radio(&signal(mode, &ch, 20, 8), cfo, 20.0);
+            let x = &x[..58_000.min(x.len())];
+            let cp = search_mode(x).expect("mode");
+            let sp = symbol_spectra(x, &cp, 4);
+            let (d, coherence) = pilot_offset(&sp, FftSize::K8, 700);
+            // The whole carriers of the offset (cp.eps has the fraction).
+            let whole = ((cfo / df) - cp.eps).round() as isize;
+            assert_eq!(d, whole, "cfo {cfo}: {d} against {whole}");
+            assert!(coherence > 0.5, "cfo {cfo}: coherence {coherence}");
         }
     }
 

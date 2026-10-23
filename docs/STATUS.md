@@ -568,3 +568,64 @@ handing the pixels to egui without the copy; perhaps 3–4 % of a core.
   through a pipe). ffmpeg already ran with no window. The CLI (`decdvbt.exe`)
   stays a console program.
 
+## Services by type, click to play, and tuning that did not lock (2026-10-23)
+
+**Services.** A television service with no picture or sound in its PMT (BBC
+THREE and BBC FOUR share their capacity with CBBC and CBeebies and are off air
+by day; BBC Red Button is data only) was listed as "data", because the list
+went by the streams. It now goes by the SDT's service type first (EN 300 468
+table 87; the C23 capture says 0x01, digital television, for all three) and
+shows "off air" where the rate was. **Click a service and it plays** (an off-air
+one says why in the control bar); in the guide a click on a programme that is
+on now, on a service with something to show, plays that service (marked ▶), and
+so does a click on the service's name. Tried with real clicks on a running
+HackRF: BBC ONE from the guide, BBC TWO from the list, BBC FOUR's note.
+
+**Tuning that did not lock.** Reported: sometimes after tuning the receiver
+does not lock, and decode has to be turned off and on. There were four causes,
+found with two new tools (`retune_soak`: the GUI's retune-then-decode sequence
+against the HackRF, timed; `splice`: real captures fed to the receiver as a
+retune feeds it, offline), and all four are fixed.
+
+1. **Acquisition failed on a clean signal at a third of the positions.** The
+   whole-carrier offset was guessed from the spectrum (power inside the block
+   against outside), which on a real band, with the HackRF's filter blurring
+   the block's edges, is good to a dozen carriers, and the pilot test looked
+   ±3 round it. On the C26 capture 11 of 36 first attempts (the stretch started
+   at 36 positions across a symbol) found a cyclic prefix of contrast 23 and then
+   said "not DVB-T"; the retry came 0.4 s later at another position, and
+   several in a row could fail. The offset now comes from the **continual
+   pilots** (`acquire::pilot_offset`): they carry the same value in every
+   symbol, so products of consecutive symbols' bins at their positions add up
+   coherently (about 1) for the right shift of the block and not for any other
+   (0.04); the spectrum's guess is the fallback. 0 of 36 failed on all five
+   captures. Retries come after 0.2 s, not 0.4.
+2. **A retune handed the old channel's samples to the new receiver.** The
+   HackRF has up to 64 buffers queued and three transfers in flight when the
+   centre moves, and both capture and receiver were centred on the new channel
+   the moment the command went: the receiver locked onto the old mux. The source
+   now flushes its queue and discards the transfers in flight on a retune
+   (`HackRfSource::retune`), and the engine throws away 50 ms more
+   (`Settle`).
+3. **A lock on the wrong samples stayed locked.** Fed C23 then C26 as a retune
+   does, 9 of 24 splice points left the receiver locked for good (1 lock,
+   about 22 packets): the receiver's coherence test (neighbouring pilots) still
+   read 0.5, the TPS flickered, and the MER wandered between −4 and 6 dB. Three
+   guards now: the **equaliser starts over** after 24 symbols whose continual
+   pilots match its reference (before, a reference made from the wrong channel
+   froze the channel estimate for good, tested synthetically); a lock whose
+   signal-to-noise ratio is more than 8 dB under what the mode needs for QEF
+   (never under 2 dB) for four looks of 128 symbols is dropped; and a lock
+   that has had TPS sync but not one clean Reed–Solomon block for four looks of
+   512 symbols is dropped. Now 0 of 24 splice points fail, the worst recovering
+   in under a second.
+4. (The soak tool's own fault, found on the way: it left the HackRF receiving
+   when it exited, and the next run sometimes got no samples at all. It stops
+   the radio now.)
+
+Live, 200 tunings between C22, C23, C25, C26 and C28 through the engine as the
+GUI drives it: all decode, in 0.25–0.29 s on average, 0.3 s at the worst. The
+five captures decode as before (one lock each, same Reed–Solomon counts, CPU
+unchanged at 30 %). The receiver status counts the acquisitions that failed
+and the locks given up (`acq_no_prefix`, `acq_not_dvbt`, `stalled_locks`).
+

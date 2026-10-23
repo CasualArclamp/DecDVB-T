@@ -35,6 +35,8 @@ const TRANSFER: usize = 1 << 18;
 /// Buffers the reader may queue for the consumer before dropping: ~0.4 s at
 /// 20 MS/s, enough to ride out a GUI hiccup.
 const QUEUE: usize = 64;
+/// USB transfers the reader keeps in flight.
+const IN_FLIGHT: u32 = 3;
 
 /// Gain settings for the HackRF's three receive stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +146,8 @@ pub struct HackRfSource {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     sample_rate: f64,
+    /// Buffers still to be thrown away after a retune (see `retune`).
+    skip: u32,
 }
 
 impl HackRfSource {
@@ -218,6 +222,7 @@ impl HackRfSource {
             stop,
             thread: Some(thread),
             sample_rate: settings.sample_rate as f64,
+            skip: 0,
         })
     }
 
@@ -229,16 +234,19 @@ impl HackRfSource {
 
 impl IqSource for HackRfSource {
     fn read(&mut self, out: &mut Vec<Iq>) -> Result<usize> {
-        match self.rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(bytes) => {
-                bytes_to_iq(&bytes, SampleFormat::Cs8, out);
-                Ok(out.len())
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                Err(Error::Other("HackRF stopped delivering samples".into()))
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                Err(Error::Other("HackRF reader stopped (unplugged?)".into()))
+        loop {
+            match self.rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(_) if self.skip > 0 => self.skip -= 1,
+                Ok(bytes) => {
+                    bytes_to_iq(&bytes, SampleFormat::Cs8, out);
+                    return Ok(out.len());
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(Error::Other("HackRF stopped delivering samples".into()));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Error::Other("HackRF reader stopped (unplugged?)".into()));
+                }
             }
         }
     }
@@ -263,8 +271,16 @@ impl IqSource for HackRfSource {
         )
     }
 
+    /// Moves the centre and throws away what was captured before it took
+    /// effect: the buffers waiting (up to 64, most of a second if the
+    /// consumer was behind) and the transfers the radio was filling as it
+    /// retuned (three in flight; one more for the loop's own settling). A
+    /// receiver handed the old channel's samples as the new one's can lock
+    /// on them, and stay locked on a signal that has gone.
     fn retune(&mut self, hz: f64) -> Result<bool> {
         self.control.set_center(hz.round() as u64)?;
+        while self.rx.try_recv().is_ok() {}
+        self.skip = IN_FLIGHT + 1;
         Ok(true)
     }
 

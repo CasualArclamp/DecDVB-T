@@ -23,7 +23,7 @@
 use std::time::{Duration, Instant};
 
 use decdvbt_core::Iq;
-use decdvbt_core::dvbt::{Alpha, Bandwidth, FftSize, Guard, Modulation, Rate};
+use decdvbt_core::dvbt::{Alpha, Bandwidth, FftSize, Guard, Modulation, Rate, qef_cn_db};
 use decdvbt_fec::viterbi::Viterbi;
 use decdvbt_ofdm::pilots::{SymbolPlan, prbs};
 use decdvbt_ofdm::tps::TpsFrame;
@@ -39,10 +39,74 @@ use crate::tps_rx::TpsReceiver;
 use crate::window::Window;
 
 /// The wait between attempts to acquire, seconds.
-const RETRY_S: f64 = 0.4;
+const RETRY_S: f64 = 0.2;
 /// Symbols with no coherence in a row that end the lock.
 const LOST_AFTER: u32 = 24;
 const MIN_COHERENCE: f32 = 0.2;
+/// The lock's health is looked at every this many symbols (half a second),
+/// and a lock that has done no good for this many looks in a row is dropped
+/// to be found again.
+const HEALTH_SYMBOLS: u64 = 512;
+const STALLED_LOOKS: u32 = 4;
+/// The signal-to-noise ratio is looked at every this many symbols (an eighth
+/// of a second). A lock whose ratio has been under its floor for
+/// [`POOR_LOOKS`] looks in a row is dropped. The floor is [`UNDECODABLE_DB`]
+/// under what the mode needs for quasi error free reception (and never under
+/// [`MIN_SNR_DB`]): nothing comes out that far below it, and a lock that has
+/// gone onto samples that are not the signal (the old channel's, as a retune
+/// leaves them ahead of the new one's) wanders between about −4 and 6 dB while
+/// the pilots still seem to line up, which is why this is not left to
+/// coherence.
+const QUALITY_SYMBOLS: u64 = 128;
+const MIN_SNR_DB: f32 = 2.0;
+const UNDECODABLE_DB: f32 = 8.0;
+const POOR_LOOKS: u32 = 4;
+
+/// Is the signal there? Counts looks at the signal-to-noise ratio under the
+/// floor in a row.
+#[derive(Debug, Default)]
+struct Quality {
+    poor: u32,
+}
+
+impl Quality {
+    /// One look at `snr_db` against `floor_db`: true when it has been under
+    /// for [`POOR_LOOKS`] looks in a row.
+    fn look(&mut self, snr_db: f32, floor_db: f32) -> bool {
+        self.poor = if snr_db < floor_db { self.poor + 1 } else { 0 };
+        self.poor >= POOR_LOOKS
+    }
+
+    /// The floor for a lock whose TPS says `tps` (none yet: the least).
+    fn floor(tps: Option<&TpsFrame>) -> f32 {
+        tps.map_or(MIN_SNR_DB, |i| {
+            (qef_cn_db(i.modulation, i.rate_hp) - UNDECODABLE_DB).max(MIN_SNR_DB)
+        })
+    }
+}
+
+/// Is the lock doing any good? A lock that is coherent (the pilots are
+/// there) can still be useless: wrong parameters, a channel estimate that went
+/// bad. The signs are the TPS not syncing, or syncing and decoding, but not
+/// one Reed–Solomon block coming out clean or mended.
+#[derive(Debug, Default)]
+struct Health {
+    good: u64,
+    stalled: u32,
+}
+
+impl Health {
+    /// One look: whether the TPS is `synced`, whether the chain is `decoding`
+    /// and how many blocks have come out right (`good`, counted since the
+    /// chain began). True when the lock has been no use for [`STALLED_LOOKS`]
+    /// looks.
+    fn look(&mut self, synced: bool, decoding: bool, good: u64) -> bool {
+        let working = synced && (!decoding || good > self.good);
+        self.good = good;
+        self.stalled = if working { 0 } else { self.stalled + 1 };
+        self.stalled >= STALLED_LOOKS
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ReceiverConfig {
@@ -114,6 +178,13 @@ pub struct ReceiverStatus {
     pub contrast: f32,
     pub tps_frames_ok: u64,
     pub tps_frames_bad: u64,
+    /// Acquisition attempts that found no cyclic prefix, and ones that found
+    /// one but not DVB-T's pilots, since the receiver began.
+    pub acq_no_prefix: u32,
+    pub acq_not_dvbt: u32,
+    /// Locks given up as no use (no data coming out, see [`Health`], or no
+    /// signal-to-noise ratio, see [`Quality`]), since the receiver began.
+    pub stalled_locks: u32,
     pub outer: OuterStats,
     pub profile: Profile,
 }
@@ -156,6 +227,8 @@ struct Track {
     chain: Option<Chain>,
     bad: u32,
     symbols: u64,
+    health: Health,
+    quality: Quality,
 }
 
 pub struct Receiver {
@@ -316,7 +389,17 @@ impl Receiver {
             min_apex,
         ) {
             Ok(l) => l,
-            Err(Failure::NoPrefix(c)) | Err(Failure::NotDvbt(c)) => {
+            Err(f) => {
+                let c = match f {
+                    Failure::NoPrefix(c) => {
+                        self.status.acq_no_prefix += 1;
+                        c
+                    }
+                    Failure::NotDvbt(c) => {
+                        self.status.acq_not_dvbt += 1;
+                        c
+                    }
+                };
                 self.status.contrast = self.status.contrast.max(c);
                 self.win.cancel();
                 return;
@@ -351,6 +434,8 @@ impl Receiver {
             chain: None,
             bad: 0,
             symbols: 0,
+            health: Health::default(),
+            quality: Quality::default(),
         });
         self.status.locks += 1;
         self.status.attempts = 0;
@@ -509,6 +594,25 @@ impl Receiver {
         if t.bad >= LOST_AFTER {
             self.drop_lock();
             return;
+        }
+        if t.symbols % QUALITY_SYMBOLS == 0
+            && t.eq.ready()
+            && t.quality
+                .look(t.eq.snr_db(), Quality::floor(self.status.tps.as_ref()))
+        {
+            self.status.stalled_locks += 1;
+            self.drop_lock();
+            return;
+        }
+        if t.symbols % HEALTH_SYMBOLS == 0 {
+            let o = &self.status.outer;
+            if t.health
+                .look(synced, t.chain.is_some(), o.clean + o.corrected)
+            {
+                self.status.stalled_locks += 1;
+                self.drop_lock();
+                return;
+            }
         }
         self.track = Some(t);
         self.want_symbol();
@@ -687,6 +791,183 @@ mod tests {
         let e = m.echoes.iter().find(|e| e.db > -14.0).expect("an echo");
         assert!((e.delay_us.abs() - 3.0).abs() < 0.3, "{e:?}");
         assert!((e.db + 10.0).abs() < 2.0, "{e:?}");
+    }
+
+    /// What a retune looks like to a receiver that is handed the old
+    /// channel's samples as the new one's: a signal, then another mux at
+    /// another carrier offset with its symbols at another phase. The receiver
+    /// has to find the second without being restarted.
+    #[test]
+    fn a_lock_with_no_signal_to_noise_is_given_up_after_a_few_looks() {
+        let mut q = Quality::default();
+        for _ in 0..POOR_LOOKS - 1 {
+            assert!(!q.look(-1.8, MIN_SNR_DB));
+        }
+        assert!(q.look(-1.8, MIN_SNR_DB));
+        // One look over the floor starts the count again.
+        let mut q = Quality::default();
+        for _ in 0..POOR_LOOKS - 1 {
+            q.look(0.0, MIN_SNR_DB);
+        }
+        assert!(!q.look(4.0, MIN_SNR_DB));
+        for _ in 0..POOR_LOOKS - 1 {
+            assert!(!q.look(0.0, MIN_SNR_DB));
+        }
+        // The floor follows the mode: 8 dB under what 64-QAM 2/3 needs (16.5)
+        // is 8.5, QPSK 1/2's would be under the least, 2.
+        let tps = |modulation, rate_hp| TpsFrame {
+            frame: 0,
+            modulation,
+            alpha: Alpha::NonHierarchical,
+            rate_hp,
+            rate_lp: rate_hp,
+            guard: Guard::G1_32,
+            fft: FftSize::K8,
+            length: 23,
+            cell_id_byte: 0,
+        };
+        assert_eq!(Quality::floor(None), MIN_SNR_DB);
+        let f = Quality::floor(Some(&tps(Modulation::Qam64, Rate::R2_3)));
+        assert!((f - 8.5).abs() < 1e-3, "{f}");
+        let f = Quality::floor(Some(&tps(Modulation::Qpsk, Rate::R1_2)));
+        assert_eq!(f, MIN_SNR_DB);
+    }
+
+    #[test]
+    fn a_lock_that_does_no_good_is_given_up_after_a_few_looks() {
+        // Not synced: four looks.
+        let mut h = Health::default();
+        assert!(!h.look(false, false, 0));
+        assert!(!h.look(false, false, 0));
+        assert!(!h.look(false, false, 0));
+        assert!(h.look(false, false, 0));
+        // Synced and decoding, blocks coming out: never.
+        let mut h = Health::default();
+        for k in 1..=20 {
+            assert!(!h.look(true, true, k * 100));
+        }
+        // Synced and decoding, but not a block right: four looks.
+        let mut h = Health::default();
+        assert!(!h.look(true, true, 500));
+        assert!(!h.look(true, true, 500));
+        assert!(!h.look(true, true, 500));
+        assert!(!h.look(true, true, 500));
+        assert!(h.look(true, true, 500));
+        // One good block in between starts the count again.
+        let mut h = Health::default();
+        for _ in 0..3 {
+            h.look(true, true, 0);
+        }
+        assert!(!h.look(true, true, 1));
+        assert!(!h.look(true, true, 1));
+        // Synced and not decoding (hierarchical): fine.
+        let mut h = Health::default();
+        for _ in 0..10 {
+            assert!(!h.look(true, false, 0));
+        }
+    }
+
+    #[test]
+    fn it_finds_a_new_signal_spliced_on_after_the_old_one() {
+        let make = |cfo_hz: f64, shift_us: f64, seconds: f64| {
+            let opts = SimOptions {
+                mode: Mode::parse("64qam-2/3-8k-1/32").unwrap(),
+                cell_id: None,
+                ts_file: None,
+                seconds,
+                out_rate_hz: Some(10e6),
+                level_dbfs: -20.0,
+                channel: Channel {
+                    paths: vec![Path::echo(shift_us, 0.0)],
+                    cfo_hz,
+                    cn_db: Some(28.0),
+                    ..Default::default()
+                },
+            };
+            let mut x = Vec::new();
+            generate(&opts, |b| {
+                x.extend_from_slice(b);
+                Ok(())
+            })
+            .unwrap();
+            x
+        };
+        let mut x = make(20_000.0, 0.0, 1.3);
+        let splice = x.len();
+        // The second signal: another carrier offset, and a start that falls
+        // mid-symbol (the first 0.4 ms of it are cut).
+        x.extend_from_slice(&make(-170_000.0, 0.0, 3.4)[4000..]);
+        let mut rx = Receiver::new(ReceiverConfig::new(10e6, 0.0));
+        let (mut ts, mut at, mut ts_at_splice) = (Vec::new(), 0, 0);
+        while at < x.len() {
+            let n = 100_003.min(x.len() - at);
+            rx.push(&x[at..at + n], at as u64);
+            rx.take_ts(&mut ts);
+            at += n;
+            if at <= splice {
+                ts_at_splice = ts.len();
+            }
+        }
+        let (n, consecutive) = data_packets(&ts[ts_at_splice..]);
+        assert!(
+            n > 1500 && consecutive + 20 >= n,
+            "{n} packets of the second signal, {consecutive} in a row; {:?}",
+            rx.status()
+        );
+    }
+
+    /// The nastier splice: the second signal's symbols fall where the
+    /// first's did and its carrier offset is the same, so the receiver sees
+    /// nothing wrong with the lock, but its channel (the echoes) is another's,
+    /// and an estimate held from the first one is wrong for every carrier.
+    /// (Two muxes from the same site, a retune that leaves the old channel's
+    /// last samples ahead of the new one's.)
+    #[test]
+    fn it_follows_a_channel_that_changes_under_a_good_lock() {
+        let make = |echoes: &[(f64, f64)], seconds: f64| {
+            let opts = SimOptions {
+                mode: Mode::parse("64qam-2/3-8k-1/32").unwrap(),
+                cell_id: None,
+                ts_file: None,
+                seconds,
+                out_rate_hz: Some(10e6),
+                level_dbfs: -20.0,
+                channel: Channel {
+                    paths: echoes.iter().map(|&(us, db)| Path::echo(us, db)).collect(),
+                    cn_db: Some(28.0),
+                    ..Default::default()
+                },
+            };
+            let mut x = Vec::new();
+            generate(&opts, |b| {
+                x.extend_from_slice(b);
+                Ok(())
+            })
+            .unwrap();
+            x
+        };
+        // A whole number of 8960-sample symbols of the first, then the second.
+        let mut x = make(&[(0.0, 0.0), (2.0, -6.0)], 1.3);
+        x.truncate(1400 * 8960);
+        let splice = x.len();
+        x.extend(make(&[(0.0, 0.0), (5.5, -4.0), (-1.5, -9.0)], 3.0));
+        let mut rx = Receiver::new(ReceiverConfig::new(10e6, 0.0));
+        let (mut ts, mut at, mut ts_at_splice) = (Vec::new(), 0, 0);
+        while at < x.len() {
+            let n = 100_003.min(x.len() - at);
+            rx.push(&x[at..at + n], at as u64);
+            rx.take_ts(&mut ts);
+            at += n;
+            if at <= splice {
+                ts_at_splice = ts.len();
+            }
+        }
+        let (n, consecutive) = data_packets(&ts[ts_at_splice..]);
+        assert!(
+            n > 1500 && consecutive + 20 >= n,
+            "{n} packets of the second signal, {consecutive} in a row; {:?}",
+            rx.status()
+        );
     }
 
     #[test]

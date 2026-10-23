@@ -213,9 +213,13 @@ fn summarise(an: &TsAnalyser) {
     for p in &r.programmes {
         let streams: Vec<String> = p.streams.iter().map(|s| s.describe()).collect();
         println!(
-            "  {:5} {:<24} {}{}",
+            "  {:5} {:<24} {:<12} {}{}",
             p.number,
             p.name.as_deref().unwrap_or("?"),
+            p.service_type.map_or(String::new(), |t| format!(
+                "{t:#04x} {}",
+                decdvbt_ts::service_type_name(t)
+            )),
             streams.join(", "),
             if p.free_ca { "  [scrambled]" } else { "" }
         );

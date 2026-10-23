@@ -75,21 +75,26 @@ impl EpgView {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, epg: &Epg, report: &TsReport) {
+    /// Draw the window; the service to play, if a programme on now was
+    /// clicked.
+    pub fn show(&mut self, ctx: &egui::Context, epg: &Epg, report: &TsReport) -> Option<u16> {
         let mut open = self.open;
+        let mut play = None;
         egui::Window::new("Programme guide")
             .id(egui::Id::new("epg_view"))
             .open(&mut open)
             .default_size([980.0, 560.0])
             .resizable(true)
-            .show(ctx, |ui| self.body(ui, epg, report));
+            .show(ctx, |ui| play = self.body(ui, epg, report));
         if open && !self.open {
             self.jump = true;
         }
         self.open = open;
+        play
     }
 
-    fn body(&mut self, ui: &mut Ui, epg: &Epg, report: &TsReport) {
+    fn body(&mut self, ui: &mut Ui, epg: &Epg, report: &TsReport) -> Option<u16> {
+        let mut play: Option<u16> = None;
         let lt = report.local_time;
         let now = report.utc_unix.unwrap_or_else(now_unix);
         let services = services::ordered(report);
@@ -101,7 +106,7 @@ impl EpgView {
             ui.add(egui::Slider::new(&mut self.px_per_min, 1.5..=10.0).show_value(false));
             ui.label(
                 RichText::new(format!(
-                    "{} events · {}",
+                    "{} events · {} · click a programme that is on now to watch it",
                     epg.events(),
                     local_stamp(now, lt)
                 ))
@@ -116,7 +121,7 @@ impl EpgView {
                 )
                 .weak(),
             );
-            return;
+            return None;
         }
         // The time range: an hour back to the last event heard.
         let t_min = (now - 3600) / 1800 * 1800;
@@ -141,7 +146,20 @@ impl EpgView {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     // The names, fixed at the left.
-                    let (names, p) = ui.allocate_painter(vec2(NAME_W, height), Sense::hover());
+                    let (names, p) = ui.allocate_painter(vec2(NAME_W, height), Sense::click());
+                    // A click on a service's name plays it, if it has a
+                    // picture or sound.
+                    if names.clicked()
+                        && let Some(pt) = names.interact_pointer_pos()
+                    {
+                        let row = ((pt.y - names.rect.top() - HEADER_H) / ROW_H).floor();
+                        if row >= 0.0
+                            && let Some(s) = services.get(row as usize)
+                            && services::on_air(s)
+                        {
+                            play = Some(s.number);
+                        }
+                    }
                     p.rect_filled(names.rect, CornerRadius::ZERO, PANEL_BG);
                     for (i, s) in services.iter().enumerate() {
                         let y = names.rect.top() + HEADER_H + ROW_H * i as f32;
@@ -209,10 +227,19 @@ impl EpgView {
                                 );
                                 let id = ui.id().with(("ev", s.number, e.event_id));
                                 let hit = ui.interact(r.intersect(clip), id, Sense::click());
+                                let on_now = e.start <= now && now < e.end();
+                                // What is on now, on a service with something to
+                                // show, plays when clicked (marked ▶).
+                                let playable = on_now && services::on_air(s);
                                 if hit.clicked() {
                                     self.selected = Some((s.number, e.event_id));
+                                    if playable {
+                                        play = Some(s.number);
+                                    }
                                 }
-                                let on_now = e.start <= now && now < e.end();
+                                if playable && hit.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
                                 let sel = self.selected == Some((s.number, e.event_id));
                                 let mut fill = genre_colour(e.genre);
                                 if on_now {
@@ -232,9 +259,13 @@ impl EpgView {
                                 }
                                 p.with_clip_rect(r.shrink2(vec2(3.0, 0.0)).intersect(clip))
                                     .text(
-                                        pos2(r.left() + 4.0, r.center().y),
+                                        pos2(r.left().max(clip.left()) + 4.0, r.center().y),
                                         Align2::LEFT_CENTER,
-                                        &e.name,
+                                        if playable {
+                                            format!("▶ {}", e.name)
+                                        } else {
+                                            e.name.clone()
+                                        },
                                         FontId::proportional(12.0),
                                         Color32::WHITE,
                                     );
@@ -250,6 +281,7 @@ impl EpgView {
             });
         ui.separator();
         self.detail(ui, epg, report);
+        play
     }
 
     fn detail(&self, ui: &mut Ui, epg: &Epg, report: &TsReport) {

@@ -655,11 +655,31 @@ impl App {
         let Some(p) = report.programmes.iter().find(|p| p.number == sid) else {
             return;
         };
+        let sel = player::selection(p, audio, subs);
+        if sel.video.is_none() && sel.audio.is_none() {
+            self.note = format!(
+                "{} has no picture or sound on air right now",
+                p.name.as_deref().unwrap_or("that service")
+            );
+            return;
+        }
+        self.note.clear();
         let (tap, rx) = TsTap::new(2048);
         self.tap = Some(tap.for_video(player::video_pid(p)));
         self.selected = Some(sid);
         self.tv.start(p, audio, subs, rx);
         self.sync_outputs();
+    }
+
+    /// A service picked in the list or the guide: play it, unless it is
+    /// already playing (the window is brought up instead).
+    fn watch(&mut self, sid: u16) {
+        self.selected = Some(sid);
+        if self.tv.is_playing(sid) {
+            self.tv.open = true;
+        } else {
+            self.play(sid, None, None);
+        }
     }
 
     fn open_vlc(&mut self, sid: u16) {
@@ -677,7 +697,7 @@ impl App {
 
     fn do_action(&mut self, a: services::Action) {
         match a {
-            services::Action::Play(sid) => self.play(sid, None, None),
+            services::Action::Play(sid) => self.watch(sid),
             services::Action::Vlc(sid) => self.open_vlc(sid),
             services::Action::OpenTs => self.ts_window.open = true,
             services::Action::OpenEpg => {
@@ -1360,7 +1380,10 @@ impl eframe::App for App {
             });
         let ctx = ui.ctx().clone();
         self.ts_window.show(&ctx, &self.ts);
-        self.epg_window.show(&ctx, &self.epg, &self.ts.report);
+        let report = Arc::clone(&self.ts.report);
+        if let Some(sid) = self.epg_window.show(&ctx, &self.epg, &report) {
+            self.watch(sid);
+        }
         let report = Arc::clone(&self.ts.report);
         let list = services::ordered(&report);
         match self.tv.show(&ctx, &list, self.ts.tap_dropped) {

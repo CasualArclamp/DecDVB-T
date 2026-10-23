@@ -154,6 +154,32 @@ struct Shared {
     stop: AtomicBool,
 }
 
+/// Signal thrown away after a retune, seconds: a live source has already
+/// flushed what it had of the old channel, and this covers what is left of
+/// the old samples and the radio's own settling. The receiver and the
+/// sounder begin on the new channel's own signal.
+const SETTLE_S: f64 = 0.05;
+
+/// The samples still to throw away after a retune.
+#[derive(Default)]
+struct Settle {
+    left: u64,
+}
+
+impl Settle {
+    fn start(&mut self, rate: f64) {
+        self.left = (SETTLE_S * rate) as u64;
+    }
+
+    /// Cut the stale samples off the front of `block`; how many went.
+    fn trim(&mut self, block: &mut Vec<Iq>) -> usize {
+        let cut = (self.left as usize).min(block.len());
+        self.left -= cut as u64;
+        block.drain(..cut);
+        cut
+    }
+}
+
 /// Rows kept for a GUI that is slow to collect them.
 const MAX_QUEUED_ROWS: usize = 100;
 
@@ -317,6 +343,7 @@ fn run(
     // The receiver, with the RF frequency of the signal it was asked for.
     let mut decoder: Option<(OfdmReceiver, f64)> = None;
     let mut decoder_pub = Instant::now();
+    let mut settle = Settle::default();
     let mut ts_scratch: Vec<u8> = Vec::new();
     // The display's scopes and measurements, and when each was last made.
     let (mut scopes_on, mut measure_on) = (false, false);
@@ -353,6 +380,7 @@ fn run(
                 Ok(Command::Retune(hz)) => match source.retune(hz) {
                     Ok(true) => {
                         tuning += 1;
+                        settle.start(rate);
                         sh.rows.lock().unwrap().clear();
                         if let Some((s, v)) = &mut sounder {
                             *s = new_sounder(*v, source.center_freq(), rate);
@@ -410,6 +438,13 @@ fn run(
                 }
             }
         }
+        // Samples from before a retune took effect are not the new
+        // channel's: leave them out (but keep counting them).
+        total += settle.trim(&mut block) as u64;
+        if block.is_empty() {
+            continue;
+        }
+        let n = block.len();
         let at = total;
         total += n as u64;
 
@@ -558,6 +593,22 @@ mod tests {
         fn describe(&self) -> String {
             "tone".into()
         }
+    }
+
+    #[test]
+    fn samples_after_a_retune_are_cut_off_the_front_until_the_settling_is_over() {
+        let mut s = Settle::default();
+        s.start(1000.0); // 0.05 s: 50 samples
+        let block = |n| vec![Iq::new(1.0, 0.0); n];
+        let mut b = block(30);
+        assert_eq!(s.trim(&mut b), 30);
+        assert!(b.is_empty());
+        let mut b = block(30);
+        assert_eq!(s.trim(&mut b), 20);
+        assert_eq!(b.len(), 10);
+        let mut b = block(30);
+        assert_eq!(s.trim(&mut b), 0);
+        assert_eq!(b.len(), 30);
     }
 
     #[test]

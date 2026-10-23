@@ -153,6 +153,11 @@ impl TvWindow {
         self.error = None;
     }
 
+    /// Whether service `sid` is playing now.
+    pub fn is_playing(&self, sid: u16) -> bool {
+        self.player.is_some() && self.service == Some(sid)
+    }
+
     pub fn close(&mut self) {
         self.stop();
         self.open = false;

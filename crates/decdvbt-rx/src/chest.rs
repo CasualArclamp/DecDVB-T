@@ -57,6 +57,9 @@ const SLOPE_MAX: f32 = 6.0;
 const SLOPE_STEP: f32 = 0.5;
 /// Pilot coherence below which a symbol is not used to update the estimate.
 const MIN_COHERENCE: f32 = 0.35;
+/// Symbols in a row below it that mean the reference is not this channel's:
+/// start over from the symbol in hand (see `process_inner`).
+const RESYNC_AFTER: u32 = 24;
 /// How fast a grid point's noise estimate follows its innovations (one a
 /// pilot, every fourth symbol), and how many grid points either side are
 /// averaged into a carrier's.
@@ -83,6 +86,8 @@ pub struct Equalizer {
     seen: Vec<bool>,
     cp_ref: Vec<Iq>,
     ref_ok: bool,
+    /// Symbols in a row whose continual pilots did not match the reference.
+    untrusted: u32,
     symbols: u64,
     /// Per carrier, for the last symbol: the channel estimate, the equalised
     /// value and |H|².
@@ -199,6 +204,7 @@ impl Equalizer {
             grid: vec![Iq::new(0.0, 0.0); g],
             seen: vec![false; g],
             ref_ok: false,
+            untrusted: 0,
             symbols: 0,
             h: vec![Iq::new(0.0, 0.0); k_total],
             z: vec![Iq::new(0.0, 0.0); k_total],
@@ -262,6 +268,13 @@ impl Equalizer {
         self.cpe.1 * self.fft.n() as f32 / (std::f32::consts::TAU * self.kmid as f32)
     }
 
+    /// The signal-to-noise ratio the last symbol's channel estimate gives, dB:
+    /// the mean power gain over the mean noise power, across the carriers.
+    pub fn snr_db(&self) -> f32 {
+        let (gain, noise): (f32, f32) = (self.w.iter().sum(), self.noise.iter().sum());
+        10.0 * (gain / noise.max(1e-20)).max(1e-9).log10()
+    }
+
     /// Four symbols in, every third carrier has been seen: the estimate is
     /// whole.
     pub fn ready(&self) -> bool {
@@ -271,6 +284,7 @@ impl Equalizer {
     pub fn reset(&mut self) {
         self.seen.fill(false);
         self.ref_ok = false;
+        self.untrusted = 0;
         self.symbols = 0;
     }
 
@@ -397,6 +411,26 @@ impl Equalizer {
             }
         } else {
             self.cpe = (0.0, 0.0);
+        }
+        // A symbol that does not match the reference is not believed, and
+        // neither the reference nor the channel estimate moves for it: right
+        // for a fade, a burst of noise. But if the reference was made from
+        // something that was not this channel (samples of the channel tuned
+        // from, the transient of a retune, a channel that has changed), no
+        // symbol will ever match it, the estimate stays frozen on the wrong
+        // channel and everything equalised comes out as noise, for as long as
+        // the signal lasts. So after a run of them, start over from this one.
+        if trusted {
+            self.untrusted = 0;
+        } else {
+            self.untrusted += 1;
+            if self.untrusted >= RESYNC_AFTER {
+                self.untrusted = 0;
+                self.ref_ok = false;
+                self.seen.fill(false);
+                self.symbols = 0;
+                trusted = true;
+            }
         }
         // The reference follows the corrected pilots.
         let (mut err, mut pow) = (0.0f32, 0.0f32);
@@ -583,7 +617,7 @@ pub(crate) mod tests {
     use decdvbt_mod::channel::{Channel, ChannelSim, Path, RadioSim};
     use decdvbt_mod::sim::{SimOptions, generate};
     use decdvbt_ofdm::mapping::Constellation;
-    use decdvbt_ofdm::pilots::SymbolPlan;
+    use decdvbt_ofdm::pilots::{Role, SymbolPlan, pilot_value};
 
     /// A signal at 10 MS/s: `seconds` of `mode` through `ch`.
     pub fn make(mode: &str, ch: Channel, seconds: f64) -> Vec<Iq> {
@@ -660,6 +694,53 @@ pub(crate) mod tests {
         }
         assert!(n > 100, "only {n} symbols");
         10.0 * (count as f64 / errors).log10()
+    }
+
+    /// A channel that changes under the equaliser (as when the radio is
+    /// retuned and the first symbols were the old channel's): its reference
+    /// no longer matches, and it must take the new one up rather than
+    /// freeze. The new channel here has a different, scrambled phase on every
+    /// carrier, so nothing the old reference holds can be matched to it.
+    #[test]
+    fn a_changed_channel_is_taken_up_not_frozen_out() {
+        let fft = FftSize::K2;
+        let plan = SymbolPlan::new(fft);
+        let k_total = fft.active_carriers();
+        let w = prbs(k_total);
+        let channel = |k: usize, which: u32| -> Iq {
+            if which == 0 {
+                Iq::new(1.0, 0.0)
+            } else {
+                let ph = ((k as u32).wrapping_mul(2_654_435_761) >> 8) as f32 * 1e-3;
+                Iq::from_polar(1.0, ph)
+            }
+        };
+        let symbol = |l: usize, which: u32| -> Vec<Iq> {
+            (0..k_total)
+                .map(|k| {
+                    let x = match plan.roles(l)[k] {
+                        Role::Pilot => Iq::new(pilot_value(w[k]), 0.0),
+                        _ => Iq::new(0.5, -0.5),
+                    };
+                    x * channel(k, which)
+                })
+                .collect()
+        };
+        let mut eq = Equalizer::new(fft);
+        for l in 0..40 {
+            eq.process(&mut symbol(l, 0), l % 4);
+        }
+        assert!(eq.coherence > 0.95, "before: {}", eq.coherence);
+        // The channel changes: the continual pilots match nothing for 24
+        // symbols, then the equaliser starts over and finds them again.
+        for l in 40..60 {
+            eq.process(&mut symbol(l, 1), l % 4);
+        }
+        assert!(eq.coherence < MIN_COHERENCE, "{}", eq.coherence);
+        for l in 60..100 {
+            eq.process(&mut symbol(l, 1), l % 4);
+        }
+        assert!(eq.coherence > 0.95, "after: {}", eq.coherence);
     }
 
     #[test]

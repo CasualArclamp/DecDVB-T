@@ -34,17 +34,24 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// What the SDT says the service is (EN 300 468 table 87) wins; the
+    /// streams in its PMT decide only when it says nothing. A television
+    /// service with no picture or sound in its PMT at the moment (BBC THREE
+    /// and BBC FOUR share their capacity with the children's channels and are
+    /// off air by day) is still a television service.
     pub fn of(p: &Programme) -> Kind {
+        match p.service_type {
+            Some(0x11 | 0x19..=0x1F) => return Kind::Hd,
+            Some(0x01 | 0x16..=0x18) => return Kind::Tv,
+            Some(0x02 | 0x0A) => return Kind::Radio,
+            Some(0x03 | 0x0C..=0x10) => return Kind::Data,
+            _ => {}
+        }
         let video = p.streams.iter().any(|e| e.is_video());
         let audio = p.streams.iter().any(|e| e.is_audio());
-        let hd = matches!(
-            p.service_type,
-            Some(0x11 | 0x19 | 0x1F | 0x20 | 0x21 | 0x22 | 0x23)
-        );
-        match (video, audio, p.service_type) {
-            (true, ..) if hd => Kind::Hd,
-            (true, ..) => Kind::Tv,
-            (false, true, _) | (_, _, Some(0x02 | 0x0A)) if !video => Kind::Radio,
+        match (video, audio) {
+            (true, _) => Kind::Tv,
+            (false, true) => Kind::Radio,
             _ => Kind::Data,
         }
     }
@@ -57,6 +64,12 @@ impl Kind {
             Kind::Data => "data",
         }
     }
+}
+
+/// Whether the service has a picture or sound to play now: its PMT lists a
+/// video or an audio stream.
+pub fn on_air(p: &Programme) -> bool {
+    p.streams.iter().any(|e| e.is_video() || e.is_audio())
 }
 
 /// A service's bitrate, bit/s, from its streams' PIDs.
@@ -117,23 +130,27 @@ pub fn list(ui: &mut Ui, view: &TsView, selected: &mut Option<u16>) -> Option<Ac
                     .unwrap_or_else(|| format!("service {}", p.number));
                 let name: String = name.chars().take(17).collect();
                 let lcn = p.lcn.map_or("   ".into(), |n| format!("{n:>3}"));
+                let on_air = on_air(p);
                 let kbps = service_rate(p, &rates) / 1e3;
+                // Off air: what is flowing is its data carousel, not a picture.
+                let rate = if !on_air {
+                    "off air".to_string()
+                } else if kbps > 0.5 {
+                    format!("{kbps:.0}k")
+                } else {
+                    String::new()
+                };
                 let line = format!(
-                    "{lcn} {name:<17} {:<5} {}{}",
+                    "{lcn} {name:<17} {:<5} {rate:>7}{}",
                     kind.tag(),
-                    if kbps > 0.5 {
-                        format!("{kbps:>5.0}k")
-                    } else {
-                        "      ".into()
-                    },
                     if scrambled { " 🔒" } else { "" },
                 );
                 let is_sel = *selected == Some(p.number);
                 let resp = ui.selectable_label(is_sel, line).on_hover_text(describe(p));
+                // Click a service and it plays, as on a television (one with
+                // nothing on air says so instead).
                 if resp.clicked() {
                     *selected = Some(p.number);
-                }
-                if resp.double_clicked() {
                     action = Some(Action::Play(p.number));
                 }
                 resp.context_menu(|ui| {
@@ -335,6 +352,13 @@ mod tests {
     fn a_service_is_what_its_streams_are() {
         let tv = service(1, None, &[(0x21, 0x02), (0x22, 0x03)], Some(0x01));
         let hd = service(2, None, &[(0x31, 0x1B), (0x32, 0x0F)], Some(0x19));
+        // A television service with nothing but a data carousel in its PMT
+        // (BBC FOUR by day) is television, and off air.
+        let off = service(5, None, &[(0x61, 0x0B)], Some(0x01));
+        assert_eq!(Kind::of(&off), Kind::Tv);
+        assert!(!on_air(&off) && on_air(&hd));
+        // The SDT says radio: radio, even before its sound is in the PMT.
+        assert_eq!(Kind::of(&service(6, None, &[], Some(0x02))), Kind::Radio);
         let radio = service(3, None, &[(0x41, 0x03)], Some(0x02));
         let data = service(4, None, &[(0x51, 0x0B)], None);
         let kinds: Vec<Kind> = [&tv, &hd, &radio, &data]
