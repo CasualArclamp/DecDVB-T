@@ -1,0 +1,14 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-fec"
+description = "FEC: K = 7 Viterbi + RS(204,188) (DVB-T), LDPC + BCH (DVB-T2, shared with DVB-S2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvbt-core = { path = "../decdvbt-core" }
+num-complex.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,13 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-video"
+description = "DecDVB-T in-app TV player: a programme of the multiplex decoded by ffmpeg, shown in sync with its sound"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvbt-ts = { path = "../decdvbt-ts" }
+decdvbt-audio = { path = "../decdvbt-audio" }

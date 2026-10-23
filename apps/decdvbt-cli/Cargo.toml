@@ -1,0 +1,23 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-cli"
+description = "DecDVB-T command line"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "decdvbt"
+path = "src/main.rs"
+
+[features]
+default = ["hackrf"]
+hackrf = ["decdvbt-io/hackrf"]
+
+[dependencies]
+decdvbt-core = { path = "../../crates/decdvbt-core" }
+decdvbt-io = { path = "../../crates/decdvbt-io" }
+anyhow.workspace = true
+clap = { version = "4.6", features = ["derive"] }

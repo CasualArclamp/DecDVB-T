@@ -1,0 +1,10 @@
+# made by CasualArclamp
+/target
+/reference
+/exe
+/out
+*.cs8
+*.cs16
+*.cf32
+*.iq
+*.ts

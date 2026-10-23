@@ -1,0 +1,13 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-audio"
+description = "DecDVB-T in-app sound: decoded PCM, resampled, to the sound card"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Sound output: WASAPI on Windows, ALSA on Linux (needs libasound2-dev to build).
+cpal = "0.18.2"

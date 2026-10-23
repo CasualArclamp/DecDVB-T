@@ -1,0 +1,37 @@
+# made by CasualArclamp
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/CasualArclamp/DecDVB-T"
+rust-version = "1.89"
+
+[workspace.dependencies]
+num-complex = "0.4.6"
+rustfft = "6.4"
+rayon = "1.10"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+
+# DSP is unusably slow unoptimised; keep dev builds fast enough to decode real
+# captures in tests while still compiling quickly (as in DecSAT).
+[profile.dev]
+opt-level = 1
+incremental = false
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# The FEC inner loops (Viterbi, LDPC) only vectorise when optimised.
+[profile.dev.package.decdvbt-fec]
+opt-level = 3
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
