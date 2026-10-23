@@ -114,14 +114,21 @@ impl PlpDecoder {
         self.unpacker.reset();
     }
 
+    /// Threads (and so coders) this decoder has: the most it can use.
+    pub fn max_threads(&self) -> usize {
+        self.workers.len()
+    }
+
     /// Decode `blocks` FEC blocks whose cells (and noise variances) start at
-    /// `start` in the frame's cells; transport packets go to `out`.
+    /// `start` in the frame's cells, on `threads` threads (at most
+    /// [`max_threads`](Self::max_threads)); transport packets go to `out`.
     pub fn decode_frame(
         &mut self,
         cells: &[Iq],
         var: &[f32],
         start: usize,
         blocks: usize,
+        threads: usize,
         out: &mut Vec<[u8; TS_LEN]>,
     ) -> Option<FrameStats> {
         let cs = self.params.cells_per_block();
@@ -138,7 +145,7 @@ impl PlpDecoder {
 
         let bb_len = self.workers[0].bbframe_bytes();
         let mut frames: Vec<Option<(Vec<u8>, BlockStats)>> = vec![None; blocks];
-        let n_workers = self.workers.len().min(blocks);
+        let n_workers = threads.clamp(1, self.workers.len()).min(blocks);
         let per = blocks.div_ceil(n_workers);
         std::thread::scope(|scope| {
             for (w, (coder, chunk)) in self

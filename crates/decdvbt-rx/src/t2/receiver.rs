@@ -50,8 +50,9 @@ pub struct T2Config {
     pub fs_in: f64,
     /// How far above the radio's centre the signal's centre is.
     pub vfo_offset_hz: f64,
-    /// Threads the FEC blocks are spread over (on top of the FEC stage's own
-    /// thread, which hands them out).
+    /// The most threads the FEC blocks are spread over (on top of the FEC
+    /// stage's own thread, which hands them out); the stage uses as few as
+    /// keep it to about half of real time.
     pub fec_threads: usize,
 }
 
@@ -133,6 +134,10 @@ pub struct T2Status {
     pub acq_no_p1: u32,
     pub acq_no_l1: u32,
     pub profile: T2Profile,
+    /// The FEC stage's threads at work and the share of a frame's period the
+    /// last frame took on them.
+    pub fec_threads: usize,
+    pub fec_load: f32,
     /// What the last frame looked like, for a developer.
     pub debug: String,
 }
@@ -319,6 +324,8 @@ impl T2Receiver {
     }
 
     fn absorb(&mut self, d: Done) {
+        self.status.fec_threads = d.threads;
+        self.status.fec_load = d.load;
         self.ts.extend_from_slice(&d.ts);
         self.account(d.stats, d.resyncs);
     }
@@ -793,6 +800,7 @@ impl T2Receiver {
                     var,
                     start: PRE_CELLS + t.l1pre.l1_post_size as usize + dynamic.plp_start as usize,
                     blocks: dynamic.plp_num_blocks as usize,
+                    period: Duration::from_secs_f64(t.geo.frame_samples() as f64 / FS_NATIVE),
                 };
                 let threads = self.cfg.fec_threads;
                 let done = self

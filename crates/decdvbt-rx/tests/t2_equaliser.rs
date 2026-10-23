@@ -159,6 +159,7 @@ fn decode_blocks(cfg: T2Config, channel: Channel, sigma2: f32, seed: u32) -> (us
             &var,
             1840 + pre.l1_post_size as usize,
             cfg.fec_blocks,
+            1,
             &mut out,
         )
         .unwrap();

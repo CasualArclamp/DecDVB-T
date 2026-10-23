@@ -14,12 +14,12 @@ use decdvbt_dsp::resample::bessel_i0;
 /// Taps of the interpolator. The signal fills 0.38 of the radio's rate (7.61
 /// MHz of 20 MS/s' worth... of a 10 MS/s one), so the kernel must be flat out
 /// to there: 32 taps with ~50 dB of rejection are.
-pub const TAPS: usize = 32;
+pub const TAPS: usize = 16;
 /// Samples read before and after the one at floor(pos).
 pub const BEFORE: usize = TAPS / 2 - 1;
 pub const AFTER: usize = TAPS / 2;
 const PHASES: usize = 512;
-const BETA: f64 = 5.0;
+const BETA: f64 = 6.0;
 
 pub struct Interpolator {
     table: Vec<[f32; TAPS]>,

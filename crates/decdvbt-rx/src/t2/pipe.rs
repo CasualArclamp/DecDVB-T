@@ -8,6 +8,7 @@
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use decdvbt_core::Iq;
 
@@ -24,6 +25,8 @@ pub struct Job {
     /// Where the PLP's first block starts in `cells`, and how many blocks.
     pub start: usize,
     pub blocks: usize,
+    /// How long a frame lasts: the time the stage has for one.
+    pub period: Duration,
 }
 
 /// What a frame made.
@@ -32,6 +35,10 @@ pub struct Done {
     pub ts: Vec<u8>,
     pub stats: Option<FrameStats>,
     pub resyncs: u64,
+    /// Threads the blocks were decoded on, and the wall time the frame took
+    /// as a share of its period.
+    pub threads: usize,
+    pub load: f32,
 }
 
 enum Msg {
@@ -130,9 +137,24 @@ impl Drop for FecPipe {
     }
 }
 
-fn worker(threads: usize, jobs: Receiver<Msg>, out: Sender<Done>) {
+/// The worker threads in use: as few as keep a frame's work to about half its
+/// period, for threads running side by side slow each other (shared cache,
+/// lower clocks), so that the same frames cost more CPU on four than on two.
+fn adapt(threads: usize, max: usize, load: f32) -> usize {
+    if load > 0.6 && threads < max {
+        threads + 1
+    } else if threads > 1 && load * (threads as f32 / (threads - 1) as f32) < 0.45 {
+        threads - 1
+    } else {
+        threads
+    }
+}
+
+fn worker(max_threads: usize, jobs: Receiver<Msg>, out: Sender<Done>) {
     let mut decoder: Option<PlpDecoder> = None;
     let mut packets = Vec::new();
+    // Two to start with.
+    let mut threads = 2.min(max_threads).max(1);
     for msg in jobs {
         let job = match msg {
             Msg::Reset => {
@@ -144,13 +166,23 @@ fn worker(threads: usize, jobs: Receiver<Msg>, out: Sender<Done>) {
             Msg::Frame(job) => job,
         };
         if decoder.as_ref().map(|d| d.params) != Some(job.params) {
-            decoder = PlpDecoder::new(job.params, threads);
+            decoder = PlpDecoder::new(job.params, max_threads);
         }
         let done = match &mut decoder {
             Some(d) => {
                 packets.clear();
-                let stats =
-                    d.decode_frame(&job.cells, &job.var, job.start, job.blocks, &mut packets);
+                let t0 = Instant::now();
+                let stats = d.decode_frame(
+                    &job.cells,
+                    &job.var,
+                    job.start,
+                    job.blocks,
+                    threads,
+                    &mut packets,
+                );
+                let load = (t0.elapsed().as_secs_f64() / job.period.as_secs_f64().max(1e-3)) as f32;
+                let used = threads;
+                threads = adapt(threads, d.max_threads(), load);
                 let mut ts = Vec::with_capacity(packets.len() * 188);
                 for p in &packets {
                     ts.extend_from_slice(p);
@@ -159,12 +191,16 @@ fn worker(threads: usize, jobs: Receiver<Msg>, out: Sender<Done>) {
                     ts,
                     stats,
                     resyncs: d.resyncs(),
+                    threads: used,
+                    load,
                 }
             }
             None => Done {
                 ts: Vec::new(),
                 stats: None,
                 resyncs: 0,
+                threads,
+                load: 0.0,
             },
         };
         if out.send(done).is_err() {

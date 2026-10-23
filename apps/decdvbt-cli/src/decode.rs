@@ -306,6 +306,11 @@ fn t2_report(rx: &AutoReceiver, signal_s: f64, packets: u64, output: Option<&std
         pct(p.bch)
     );
     println!(
+        "FEC stage: {} thread(s) of the most it may use, {:.0} % of real time on them",
+        t2.fec_threads,
+        100.0 * t2.fec_load
+    );
+    println!(
         "{packets} transport packets{}",
         output.map_or(String::new(), |p| format!(" written to {}", p.display()))
     );
