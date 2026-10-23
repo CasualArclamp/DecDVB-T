@@ -9,7 +9,7 @@ use decdvbt_core::{CodeRate, FecFrame, Iq};
 use decdvbt_fec::t2::bbframe::{TS_LEN, Unpacker};
 use decdvbt_fec::t2::plp::{BlockStats, DecodeTimes, PlpCoder};
 use decdvbt_fec::t2::qam::Qam;
-use decdvbt_fec::t2::timeint::{CellInterleaver, deinterleave_frame, ti_block_sizes};
+use decdvbt_fec::t2::timeint::{CellInterleaver, ti_block_sizes};
 use decdvbt_ofdm::t2::l1::PlpConfig;
 
 /// The rate of a PLP_COD (EN 302 755 Table 28).
@@ -136,38 +136,62 @@ impl PlpDecoder {
         if blocks == 0 || end > cells.len() {
             return None;
         }
-        let t_di = Instant::now();
+        // Where each block lies in its TI block's cells, and its cell
+        // interleaver's shift: the workers undo both interleavers for the
+        // blocks they decode.
         let sizes = ti_block_sizes(blocks, self.params.ti_blocks, false);
         let columns = self.params.ti_blocks != 0;
-        let rx = deinterleave_frame(&self.ci, &sizes, columns, &cells[start..end]);
-        let rxv = deinterleave_frame(&self.ci, &sizes, columns, &var[start..end]);
-        let deinterleave = t_di.elapsed();
+        let mut plan: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(blocks);
+        let mut at = start;
+        for &f in &sizes {
+            for (r, shift) in self.ci.shifts(f).into_iter().enumerate() {
+                plan.push((at, f, r, shift));
+            }
+            at += f * cs;
+        }
 
         let bb_len = self.workers[0].bbframe_bytes();
         let mut frames: Vec<Option<(Vec<u8>, BlockStats)>> = vec![None; blocks];
         let n_workers = threads.clamp(1, self.workers.len()).min(blocks);
         let per = blocks.div_ceil(n_workers);
+        let (ci, plan) = (&self.ci, &plan);
+        let mut deinterleave = Duration::ZERO;
         std::thread::scope(|scope| {
+            let mut handles = Vec::new();
             for (w, (coder, chunk)) in self
                 .workers
                 .iter_mut()
                 .zip(frames.chunks_mut(per))
                 .enumerate()
             {
-                let (rx, rxv) = (&rx, &rxv);
-                scope.spawn(move || {
+                handles.push(scope.spawn(move || {
+                    let mut time = Duration::ZERO;
+                    let (mut rx, mut rxv) = (vec![Iq::new(0.0, 0.0); cs], vec![0f32; cs]);
                     for (i, slot) in chunk.iter_mut().enumerate() {
                         let b = w * per + i;
+                        let (ti_at, f, r, shift) = plan[b];
+                        let t0 = Instant::now();
+                        ci.deinterleave_block(
+                            &cells[ti_at..ti_at + f * cs],
+                            &var[ti_at..ti_at + f * cs],
+                            f,
+                            r,
+                            shift,
+                            columns,
+                            &mut rx,
+                            &mut rxv,
+                        );
+                        time += t0.elapsed();
                         let mut bb = vec![0u8; bb_len];
-                        if let Some(st) = coder.decode(
-                            &rx[b * cs..(b + 1) * cs],
-                            &rxv[b * cs..(b + 1) * cs],
-                            &mut bb,
-                        ) {
+                        if let Some(st) = coder.decode(&rx, &rxv, &mut bb) {
                             *slot = Some((bb, st));
                         }
                     }
-                });
+                    time
+                }));
+            }
+            for h in handles {
+                deinterleave += h.join().unwrap_or_default();
             }
         });
         let mut stats = FrameStats {
