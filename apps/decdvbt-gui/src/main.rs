@@ -800,8 +800,9 @@ impl App {
     /// CPU only while it runs).
     fn sync_sounder(&mut self) {
         let Some(s) = &self.session else { return };
-        let want = self
-            .show_channel()
+        // The sounder is DVB-T's: a DVB-T2 lock has the scopes' and the
+        // history's channel plots instead, and the sounder's CPU is saved.
+        let want = (self.show_channel() && self.standard != Standard::Dvbt2)
             .then(|| {
                 self.vfo_hz
                     .or((self.centre_hz > 0.0).then_some(self.centre_hz))
@@ -1335,8 +1336,15 @@ impl App {
                 self.heat.update(u.heat);
             }
             let now = Instant::now();
+            // A T2 stream arrives a frame (217 ms) at a time, so a longer
+            // window keeps the figure from jumping about.
+            let window = Duration::from_secs(if self.standard == Standard::Dvbt2 {
+                3
+            } else {
+                1
+            });
             match &mut self.dec_rate {
-                Some((at, t, rate)) if t.elapsed() >= Duration::from_secs(1) => {
+                Some((at, t, rate)) if t.elapsed() >= window => {
                     *rate = (u.packets.saturating_sub(*at)) as f64 * 188.0 * 8.0
                         / t.elapsed().as_secs_f64()
                         / 1e6;
@@ -1943,13 +1951,21 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         // The panel is as tall as its content asks.
                         ui.set_min_height(CHANNEL_PANEL_H);
-                        self.chan_view.show(ui);
+                        if self.standard == Standard::Dvbt2 {
+                            t2_note(ui);
+                        } else {
+                            self.chan_view.show(ui);
+                        }
                     });
             }
             Bottom::Maps => {
                 egui::Panel::bottom("maps").resizable(false).show(ui, |ui| {
                     ui.set_min_height(CHANNEL_PANEL_H);
-                    self.chan_view.show_maps(ui, &mut self.errors);
+                    if self.standard == Standard::Dvbt2 {
+                        t2_note(ui);
+                    } else {
+                        self.chan_view.show_maps(ui, &mut self.errors);
+                    }
                 });
             }
             Bottom::Scopes => {
@@ -1963,7 +1979,14 @@ impl eframe::App for App {
             Bottom::Heat => {
                 egui::Panel::bottom("heat").resizable(false).show(ui, |ui| {
                     ui.set_min_height(CHANNEL_PANEL_H);
-                    let rate = if self.smooth_sent { 60.0 } else { 20.0 };
+                    // Rows a second: one for each frame of a T2 signal.
+                    let t2_rate = self
+                        .dec2
+                        .as_ref()
+                        .filter(|_| self.standard == Standard::Dvbt2)
+                        .and_then(|t| t.frame_period_s())
+                        .map(|p| (1.0 / p) as f32);
+                    let rate = t2_rate.unwrap_or(if self.smooth_sent { 60.0 } else { 20.0 });
                     self.heat.show(ui, rate);
                 });
             }
@@ -2082,6 +2105,19 @@ fn lock_details(g: &Geometry, cfo_hz: f64) -> Vec<(String, String)> {
 }
 
 /// A mode's parameters for the signal card, as label / value pairs.
+/// What the channel and map panels say while a DVB-T2 signal is locked: their
+/// sounder reads DVB-T's pilots only.
+fn t2_note(ui: &mut egui::Ui) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("DVB-T2 locked").strong());
+    ui.label(
+        egui::RichText::new(
+            "The channel sounder and the maps read DVB-T. The scopes tab shows this signal's              channel (its gain and signal-to-noise ratio across the band, its echoes) from              T2's own pilots, and the history tab how it moves.",
+        )
+        .weak(),
+    );
+}
+
 fn mode_details(m: &Mode) -> Vec<(String, String)> {
     let kv = |k: &str, v: String| (k.to_string(), v);
     let mut d = vec![

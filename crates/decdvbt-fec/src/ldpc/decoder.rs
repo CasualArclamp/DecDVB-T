@@ -87,6 +87,8 @@ pub struct LdpcDecoder {
     pub(super) avx2: super::avx2::Scratch,
     /// The min-sum normalization: 1 − 2^−norm_shift.
     pub(super) norm_shift: u32,
+    /// Unsatisfied checks after each iteration of the last decode.
+    history: Vec<u32>,
 }
 
 impl LdpcDecoder {
@@ -107,12 +109,18 @@ impl LdpcDecoder {
             #[cfg(target_arch = "x86_64")]
             avx2: super::avx2::Scratch::new(max_deg),
             norm_shift: NORM_SHIFT,
+            history: Vec::new(),
             code,
         }
     }
 
     pub fn code(&self) -> &LdpcCode {
         &self.code
+    }
+
+    /// The unsatisfied checks the last decode counted after each iteration.
+    pub fn history(&self) -> &[u32] {
+        &self.history
     }
 
     /// Normalize the min-sum by 1 − 2^−`shift` (default 3: 7/8).
@@ -285,6 +293,8 @@ impl LdpcDecoder {
         self.r.fill(0);
 
         let unsatisfied = self.count_unsatisfied::<AVX2>();
+        self.history.clear();
+        self.history.push(unsatisfied as u32);
         let mut outcome = DecodeOutcome {
             iterations: 0,
             converged: unsatisfied == 0,
@@ -299,6 +309,7 @@ impl LdpcDecoder {
             }
             outcome.iterations += 1;
             let now = self.count_unsatisfied::<AVX2>();
+            self.history.push(now as u32);
             stalled = if now == outcome.unsatisfied && now <= STALL_CHECKS {
                 stalled + 1
             } else {

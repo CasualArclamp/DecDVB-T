@@ -102,6 +102,15 @@ pub struct T2Profile {
     pub cells: Duration,
 }
 
+impl T2Status {
+    /// How long a frame lasts, seconds, once the mode and L1-pre are known.
+    pub fn frame_period_s(&self) -> Option<f64> {
+        let (mode, pre) = (self.mode.as_ref()?, self.l1pre.as_ref()?);
+        let geo = Geometry::new(*mode, pre.num_data_symbols as usize);
+        Some(geo.frame_samples() as f64 / FS_NATIVE)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct T2Status {
     pub tracking: bool,

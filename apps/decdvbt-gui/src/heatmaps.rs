@@ -99,7 +99,7 @@ impl HeatView {
                 Some(m) => {
                     ui.label(
                         egui::RichText::new(format!(
-                            "mean SNR {:.1} dB · {} echoes · guard {:.0} µs · {rows_per_s:.0} rows a second",
+                            "mean SNR {:.1} dB · {} echoes · guard {:.0} µs · {rows_per_s:.1} rows a second",
                             m.mean_snr_db,
                             m.echoes.len(),
                             m.guard_us
