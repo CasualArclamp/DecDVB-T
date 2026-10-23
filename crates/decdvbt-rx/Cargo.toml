@@ -1,0 +1,19 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-rx"
+description = "DVB-T receiver front end: acquisition, tracking and the channel estimate (the channel sounder)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvbt-core = { path = "../decdvbt-core" }
+decdvbt-ofdm = { path = "../decdvbt-ofdm" }
+decdvbt-dsp = { path = "../decdvbt-dsp" }
+num-complex.workspace = true
+rustfft.workspace = true
+
+[dev-dependencies]
+decdvbt-mod = { path = "../decdvbt-mod" }

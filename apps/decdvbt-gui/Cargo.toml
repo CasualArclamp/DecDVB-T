@@ -22,6 +22,7 @@ hackrf = ["decdvbt-io/hackrf"]
 decdvbt-core = { path = "../../crates/decdvbt-core" }
 decdvbt-io = { path = "../../crates/decdvbt-io" }
 decdvbt-engine = { path = "../../crates/decdvbt-engine" }
+decdvbt-rx = { path = "../../crates/decdvbt-rx" }
 anyhow.workspace = true
 # The glow (OpenGL) renderer instead of eframe's default wgpu: plenty for 2-D
 # plots and a much smaller build. "x11"/"wayland" only matter on Linux.

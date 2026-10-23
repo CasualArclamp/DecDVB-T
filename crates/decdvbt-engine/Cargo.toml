@@ -11,8 +11,12 @@ rust-version.workspace = true
 [dependencies]
 decdvbt-core = { path = "../decdvbt-core" }
 decdvbt-io = { path = "../decdvbt-io" }
+decdvbt-rx = { path = "../decdvbt-rx" }
 rustfft.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+decdvbt-mod = { path = "../decdvbt-mod" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

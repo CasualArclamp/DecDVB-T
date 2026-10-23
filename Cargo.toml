@@ -32,6 +32,17 @@ opt-level = 3
 [profile.dev.package.decdvbt-fec]
 opt-level = 3
 
+# The OFDM chain, the channel models and the front end are DSP too: tests
+# that make seconds of signal are unusably slow at opt-level 1.
+[profile.dev.package.decdvbt-ofdm]
+opt-level = 3
+[profile.dev.package.decdvbt-mod]
+opt-level = 3
+[profile.dev.package.decdvbt-rx]
+opt-level = 3
+[profile.dev.package.decdvbt-dsp]
+opt-level = 3
+
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"

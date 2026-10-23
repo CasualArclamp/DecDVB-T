@@ -15,6 +15,7 @@ cargo run --release -p decdvbt-cli -- channels
 cargo run --release -p decdvbt-cli -- scan                       # HackRF: which channels carry a mux
 cargo run --release -p decdvbt-cli -- capture C26 --record x.cs8 # level, drops, CPU; optional IQ
 cargo run --release -p decdvbt-cli -- modulate --cn 25 --profile urban  # a DVB-T test signal file
+cargo run --release -p decdvbt-cli -- sound captures/c26_514.000MHz_10Msps.cs8  # lock, offsets, paths
 cargo run --release -p decdvbt-gui                               # the GUI
 cargo run --release -p decdvbt-gui -- captures/c26_514.000MHz_10Msps.cs8 --screenshot out/x.png
 ```

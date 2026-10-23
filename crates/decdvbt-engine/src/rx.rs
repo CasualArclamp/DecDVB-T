@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 use decdvbt_core::{Iq, SampleFormat};
 use decdvbt_io::{IqFileWriter, IqSource};
 
+use decdvbt_rx::delay_doppler::DelayDoppler;
+use decdvbt_rx::sounder::{Sounder, SounderConfig, Status as SounderStatus};
+
 use crate::meter::{Stage, StageLoad, StageMeter};
 use crate::spectrum::RowBuilder;
 
@@ -82,13 +85,37 @@ pub struct Recording {
 
 pub enum Command {
     Retune(f64),
+    /// Run the channel sounder on the signal at this RF frequency, Hz, or
+    /// stop it with `None`. It costs CPU only while it runs, so the GUI
+    /// asks for it only while its panels are open.
+    Sounder(Option<f64>),
     /// Start recording to this file (cs8), or stop with `None`.
     Record(Option<PathBuf>),
+}
+
+/// What the sounder has made, waiting for the GUI.
+#[derive(Default)]
+struct SounderOut {
+    status: SounderStatus,
+    fading: Vec<Vec<f32>>,
+    map: Option<Arc<DelayDoppler>>,
+    map_new: bool,
+}
+
+/// What [`Rx::take_sounder`] hands over.
+#[derive(Default)]
+pub struct SounderUpdate {
+    pub status: SounderStatus,
+    /// Fading rows (|H|² in dB at each pilot) made since the last call.
+    pub fading: Vec<Vec<f32>>,
+    /// The delay–Doppler map, if a new one has been made.
+    pub map: Option<Arc<DelayDoppler>>,
 }
 
 struct Shared {
     rows: Mutex<VecDeque<Row>>,
     stats: Mutex<Stats>,
+    sounder: Mutex<SounderOut>,
     stop: AtomicBool,
 }
 
@@ -115,6 +142,7 @@ impl Rx {
                 center_hz: source.center_freq(),
                 ..Default::default()
             }),
+            sounder: Mutex::new(SounderOut::default()),
             stop: AtomicBool::new(false),
         });
         let (cmd, cmd_rx) = mpsc::channel();
@@ -142,6 +170,20 @@ impl Rx {
 
     pub fn stats(&self) -> Stats {
         self.shared.stats.lock().unwrap().clone()
+    }
+
+    /// What the sounder has made since the last call.
+    pub fn take_sounder(&self) -> SounderUpdate {
+        let mut o = self.shared.sounder.lock().unwrap();
+        SounderUpdate {
+            status: o.status,
+            fading: std::mem::take(&mut o.fading),
+            map: if std::mem::take(&mut o.map_new) {
+                o.map.clone()
+            } else {
+                None
+            },
+        }
     }
 
     /// Whether the thread is still running.
@@ -201,16 +243,33 @@ fn run(
     let mut total = 0u64;
     let mut tuning = 0u32;
     let mut writer: Option<(IqFileWriter, PathBuf, u64)> = None;
+    // The sounder, with the RF frequency of the signal it was asked for.
+    let mut sounder: Option<(Sounder, f64)> = None;
+    let mut sounder_pub = Instant::now();
+    let mut map_at = Instant::now();
     let started = Instant::now();
     let set_error = |e: String| sh.stats.lock().unwrap().error = Some(e);
+    // A sounder for the signal at `vfo_hz`, for a source tuned to `centre`.
+    let new_sounder = |vfo_hz: f64, centre: f64, rate: f64| {
+        // A file without a centre in its name has none to measure from.
+        let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
+        Sounder::new(SounderConfig::new(rate, offset))
+    };
 
     while !sh.stop.load(Ordering::Relaxed) {
         loop {
             match cmds.try_recv() {
+                Ok(Command::Sounder(vfo)) => {
+                    sounder = vfo.map(|v| (new_sounder(v, source.center_freq(), rate), v));
+                    *sh.sounder.lock().unwrap() = SounderOut::default();
+                }
                 Ok(Command::Retune(hz)) => match source.retune(hz) {
                     Ok(true) => {
                         tuning += 1;
                         sh.rows.lock().unwrap().clear();
+                        if let Some((s, v)) = &mut sounder {
+                            *s = new_sounder(*v, source.center_freq(), rate);
+                        }
                     }
                     Ok(false) => {}
                     Err(e) => set_error(e.to_string()),
@@ -244,6 +303,10 @@ fn run(
             // A file at its end starts again; a source that cannot is done.
             match source.rewind() {
                 Ok(true) => {
+                    // The signal starts over: so does the lock.
+                    if let Some((s, _)) = &mut sounder {
+                        s.reset();
+                    }
                     continue;
                 }
                 _ => {
@@ -252,7 +315,30 @@ fn run(
                 }
             }
         }
+        let at = total;
         total += n as u64;
+
+        if let Some((s, _)) = &mut sounder {
+            meter.time(Stage::Sounder, || s.push(&block, at));
+            if sounder_pub.elapsed() >= Duration::from_millis(100) {
+                sounder_pub = Instant::now();
+                // The map is made once a second, and only while locked.
+                let map = (map_at.elapsed() >= Duration::from_secs(1)).then(|| {
+                    map_at = Instant::now();
+                    meter.time(Stage::Sounder, || s.delay_doppler().cloned())
+                });
+                let mut o = sh.sounder.lock().unwrap();
+                o.status = s.status();
+                s.take_fading(&mut o.fading);
+                // A GUI that stops collecting does not make this grow.
+                let extra = o.fading.len().saturating_sub(600);
+                o.fading.drain(..extra);
+                if let Some(Some(m)) = map {
+                    o.map = Some(Arc::new(m));
+                    o.map_new = true;
+                }
+            }
+        }
 
         if let Some((w, path, bytes)) = &mut writer {
             let r = meter.time(Stage::Record, || w.write(&block));
@@ -404,5 +490,74 @@ mod tests {
         // The command may land a block or two in; the rest is all there.
         assert!(len > 2 * 250_000 && len <= 2 * 300_000, "{len} bytes");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A DVB-T signal played through the thread with the sounder on: it
+    /// locks, makes fading rows and, after a couple of seconds, a map.
+    #[test]
+    fn the_sounder_runs_in_the_thread() {
+        use decdvbt_core::dvbt::Mode;
+        use decdvbt_io::IqFileReader;
+        use decdvbt_mod::channel::{Channel, Path as ChPath};
+        use decdvbt_mod::sim::{SimOptions, generate};
+
+        let opts = SimOptions {
+            mode: Mode::parse("64qam-2/3-8k-1/32").unwrap(),
+            cell_id: None,
+            ts_file: None,
+            seconds: 4.2,
+            out_rate_hz: Some(10e6),
+            level_dbfs: -20.0,
+            channel: Channel {
+                paths: vec![ChPath::echo(0.0, 0.0), ChPath::echo(3.0, -6.0)],
+                cfo_hz: 90_000.0,
+                cn_db: Some(28.0),
+                ..Default::default()
+            },
+        };
+        let path = std::env::temp_dir().join("decdvbt-engine-sounder.cs8");
+        let mut w = decdvbt_io::IqFileWriter::create(&path, SampleFormat::Cs8).unwrap();
+        generate(&opts, |b| w.write(b).map_err(|e| e.to_string())).unwrap();
+        w.finish().unwrap();
+
+        let src = IqFileReader::open(&path, SampleFormat::Cs8, 10e6, 1 << 17)
+            .unwrap()
+            .with_center_freq(546e6);
+        let rx = Rx::start(Box::new(src), RxOptions::default(), None);
+        rx.send(Command::Sounder(Some(546e6)));
+        let t0 = Instant::now();
+        let (mut rows, mut map, mut status) = (0usize, None, SounderStatus::default());
+        while t0.elapsed() < Duration::from_secs(7) && map.is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+            let u = rx.take_sounder();
+            status = u.status;
+            rows += u.fading.len();
+            map = u.map;
+        }
+        drop(rx);
+        let _ = std::fs::remove_file(&path);
+        assert!(status.tracking, "{status:?}");
+        assert!(
+            (status.cfo_hz - 90_000.0).abs() < 300.0,
+            "{}",
+            status.cfo_hz
+        );
+        assert!(rows > 20, "{rows} fading rows");
+        let m = map.expect("a map");
+        // The strongest path near 0 us and its echo 3 us later.
+        let c0 = ((0.0 - m.delay_start_us) / m.delay_step_us).round() as usize;
+        let c3 = ((3.0 - m.delay_start_us) / m.delay_step_us).round() as usize;
+        let at = |c: usize| {
+            (0..m.dopplers)
+                .flat_map(|r| (c.saturating_sub(5)..=c + 5).map(move |c| (r, c)))
+                .map(|(r, c)| m.at(r, c))
+                .fold(f32::MIN, f32::max)
+        };
+        assert!(
+            at(c0) > -1.0 && (at(c3) + 6.0).abs() < 3.0,
+            "{} {}",
+            at(c0),
+            at(c3)
+        );
     }
 }

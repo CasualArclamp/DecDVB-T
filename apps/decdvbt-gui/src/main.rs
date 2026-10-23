@@ -9,6 +9,7 @@
 
 mod band;
 mod card;
+mod channel_view;
 mod source;
 mod waterfall;
 
@@ -19,6 +20,7 @@ use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_cha
 use decdvbt_core::dvbt::Mode;
 use decdvbt_engine::{Command, CpuGauge, Row, Stats, spectral_cn_db};
 use decdvbt_io::name_hint;
+use decdvbt_rx::sounder::Geometry;
 use eframe::egui::{self, Color32, RichText};
 use source::{Gains, Session, Spec};
 use waterfall::{History, RingImage};
@@ -27,6 +29,8 @@ const AMBER: Color32 = Color32::from_rgb(255, 176, 40);
 const RED: Color32 = Color32::from_rgb(255, 90, 80);
 const GREEN: Color32 = Color32::from_rgb(110, 220, 130);
 
+/// Height of the channel panels (fading waterfall, delay-Doppler map).
+const CHANNEL_PANEL_H: f32 = 270.0;
 /// HackRF sample rates with the least clock jitter that hold a channel.
 const RATES_MSPS: [f64; 4] = [10.0, 12.5, 16.0, 20.0];
 /// Half a channel plus a margin: a channel is received without retuning only
@@ -44,6 +48,8 @@ struct Options {
     fps: f64,
     /// A mode to hold the C/N against, until the receiver reads the TPS.
     assume: Option<Mode>,
+    /// Start with the channel panels closed.
+    no_channel: bool,
 }
 
 impl Options {
@@ -56,6 +62,7 @@ impl Options {
             after: 4.0,
             fps: 15.0,
             assume: None,
+            no_channel: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -73,6 +80,7 @@ impl Options {
                     let v = value("a mode, e.g. 64qam-2/3-8k-1/32")?;
                     o.assume = Some(Mode::parse(&v)?);
                 }
+                "--no-channel" => o.no_channel = true,
                 "--fps" => o.fps = value("frames a second")?.parse().map_err(|_| "bad --fps")?,
                 "--after" => o.after = value("seconds")?.parse().map_err(|_| "bad --after")?,
                 f if !f.starts_with("--") => o.file = Some(f.into()),
@@ -95,7 +103,7 @@ fn main() -> eframe::Result {
             eprintln!("decdvbt-gui: {e}");
             eprintln!(
                 "usage: decdvbt-gui [capture.cs8] [--channel C26] [--rate MSPS] \
-                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32]"
+                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] [--no-channel]"
             );
             std::process::exit(2);
         }
@@ -130,6 +138,13 @@ enum SourceKind {
 
 struct App {
     opts: Options,
+    /// The channel panels (fading waterfall, delay-Doppler map), shown or
+    /// not: the sounder runs only while they are.
+    show_channel: bool,
+    chan_view: channel_view::ChannelView,
+    /// The RF frequency the sounder was last asked to look at (`Some(None)`:
+    /// asked to stop); `None`: not asked since the source began.
+    sounder_sent: Option<Option<f64>>,
     started: Instant,
     shot_sent: bool,
     /// For `--screenshot`: process CPU and time at 2 s, to average over the
@@ -208,6 +223,9 @@ impl App {
             ring: RingImage::default(),
             cn_db: None,
             cn_misses: 0,
+            show_channel: !opts.no_channel,
+            chan_view: channel_view::ChannelView::default(),
+            sounder_sent: None,
             stats: Stats::default(),
             stats_at: Instant::now(),
             cpu: CpuGauge::default(),
@@ -262,6 +280,7 @@ impl App {
         match Session::open(&spec) {
             Ok(s) => {
                 self.session = Some(s);
+                self.sounder_sent = None;
                 self.vfo_hz = vfo;
                 self.reset_view();
                 self.note.clear();
@@ -297,6 +316,28 @@ impl App {
         self.history.reset();
         self.smooth.clear();
         self.span_hz = 0.0;
+        self.chan_view.reset();
+    }
+
+    /// Ask the engine to run the sounder on the signal under the VFO while
+    /// the channel panels are open, and to stop when they are not (it costs
+    /// CPU only while it runs).
+    fn sync_sounder(&mut self) {
+        let Some(s) = &self.session else { return };
+        let want = self
+            .show_channel
+            .then(|| {
+                self.vfo_hz
+                    .or((self.centre_hz > 0.0).then_some(self.centre_hz))
+            })
+            .flatten();
+        if self.sounder_sent != Some(want) && (want.is_some() || self.sounder_sent.is_some()) {
+            s.rx.send(Command::Sounder(want));
+            self.sounder_sent = Some(want);
+            if want.is_none() {
+                self.chan_view.reset();
+            }
+        }
     }
 
     // ---- tuning ---------------------------------------------------------
@@ -381,6 +422,9 @@ impl App {
         // them every frame would be waste.
         let new_stats =
             (self.stats_at.elapsed() >= Duration::from_millis(250)).then(|| s.rx.stats());
+        if self.show_channel {
+            self.chan_view.update(s.rx.take_sounder());
+        }
         for row in rows {
             if row.tuning != self.tuning {
                 self.tuning = row.tuning;
@@ -446,13 +490,30 @@ impl App {
     }
 
     fn card(&self) -> card::Card {
-        let mode = self.opts.assume;
+        // What the sounder has read from the signal (the FFT size and the
+        // guard interval) wins over an assumption; the constellation and the
+        // code rate wait for the TPS (M3).
+        let locked: Option<Geometry> = self
+            .chan_view
+            .status
+            .geometry
+            .filter(|_| self.chan_view.status.tracking);
+        let mut mode = self.opts.assume;
+        if let (Some(m), Some(g)) = (&mut mode, locked) {
+            m.fft = g.fft;
+            m.guard = g.guard;
+        }
+        let details = match (mode, locked) {
+            (Some(m), _) => mode_details(&m),
+            (None, Some(g)) => lock_details(&g, self.chan_view.status.cfo_hz),
+            _ => Vec::new(),
+        };
         card::Card {
-            standard: mode.map(|_| card::Standard::DvbT),
+            standard: (mode.is_some() || locked.is_some()).then_some(card::Standard::DvbT),
             assumed: mode.is_some(),
             name: mode.map(|m| format!("{} {}", m.modulation.name(), m.rate_hp.name())),
             qef_db: mode.and_then(|m| m.qef_cn_db()),
-            details: mode.map(|m| mode_details(&m)).unwrap_or_default(),
+            details,
             cn_db: self.cn_db,
             cn_source: "spectrum",
             channel: self.vfo_hz.and_then(uhf_channel_at),
@@ -641,6 +702,22 @@ impl App {
                 ui.label(RichText::new("weak: raise the gain").color(AMBER));
             }
             ui.separator();
+            ui.checkbox(&mut self.show_channel, "channel");
+            if self.show_channel {
+                egui::ComboBox::from_id_salt("doppler")
+                    .selected_text(format!("±{} Hz", self.chan_view.doppler_view))
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        for d in channel_view::DOPPLER_VIEWS {
+                            ui.selectable_value(
+                                &mut self.chan_view.doppler_view,
+                                d,
+                                format!("±{d} Hz"),
+                            );
+                        }
+                    });
+            }
+            ui.separator();
             ui.label("display");
             egui::ComboBox::from_id_salt("fps")
                 .selected_text(format!("{} fps", self.opts.fps))
@@ -724,7 +801,9 @@ impl App {
                     // The stages, as a share of one core's time. "source" on
                     // a live radio is mostly waiting for the USB buffer.
                     for (stage, p) in decdvbt_engine::Stage::ALL.iter().zip(s.load.percent) {
-                        if *stage == decdvbt_engine::Stage::Record && s.recording.is_none() {
+                        if (*stage == decdvbt_engine::Stage::Record && s.recording.is_none())
+                            || (*stage == decdvbt_engine::Stage::Sounder && !self.show_channel)
+                        {
                             continue;
                         }
                         ui.label(RichText::new(format!("  {}", stage.name())).weak());
@@ -776,6 +855,7 @@ impl eframe::App for App {
             self.open_file(p);
         }
         self.take_rows();
+        self.sync_sounder();
         self.cpu_percent = self.cpu.poll();
         self.handle_screenshot(ctx);
         if self.session.is_some() || self.opts.screenshot.is_some() {
@@ -790,6 +870,15 @@ impl eframe::App for App {
         self.frames += 1;
         egui::Panel::top("controls").show(ui, |ui| self.control_bar(ui));
         egui::Panel::bottom("receiver").show(ui, |ui| self.status_panel(ui));
+        if self.show_channel {
+            egui::Panel::bottom("channel")
+                .resizable(false)
+                .show(ui, |ui| {
+                    // The panel is as tall as its content asks.
+                    ui.set_min_height(CHANNEL_PANEL_H);
+                    self.chan_view.show(ui);
+                });
+        }
         egui::Panel::right("services")
             .resizable(true)
             .default_size(380.0)
@@ -824,6 +913,31 @@ impl eframe::App for App {
         }
         self.frame_cost[1] += t0.elapsed();
     }
+}
+
+/// What the sounder knows of a signal it has locked to, for the signal card:
+/// the FFT size and the guard interval, and what follows from them.
+fn lock_details(g: &Geometry, cfo_hz: f64) -> Vec<(String, String)> {
+    let kv = |k: &str, v: String| (k.to_string(), v);
+    let useful_us = g.fft.n() as f64 / (g.carrier_spacing_hz * g.fft.n() as f64) * 1e6;
+    vec![
+        kv("FFT size", g.fft.name().to_string()),
+        kv(
+            "guard",
+            format!("{} ({:.0} µs)", g.guard.name(), g.guard_us),
+        ),
+        kv("symbol", format!("{:.0} µs", g.symbol_s * 1e6)),
+        kv("useful", format!("{useful_us:.0} µs")),
+        kv(
+            "carriers",
+            format!(
+                "{} ({} data)",
+                g.fft.active_carriers(),
+                g.fft.data_carriers()
+            ),
+        ),
+        kv("carrier offset", format!("{:+.2} kHz", cfo_hz / 1e3)),
+    ]
 }
 
 /// A mode's parameters for the signal card, as label / value pairs.

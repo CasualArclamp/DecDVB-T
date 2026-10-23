@@ -101,16 +101,25 @@ pub enum Stage {
     Record,
     /// FFT segments for the waterfall.
     Spectrum,
+    /// The channel sounder: acquisition, tracking, the channel estimate and
+    /// the delay-Doppler map (when its panel is open).
+    Sounder,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 3] = [Stage::Source, Stage::Record, Stage::Spectrum];
+    pub const ALL: [Stage; 4] = [
+        Stage::Source,
+        Stage::Record,
+        Stage::Spectrum,
+        Stage::Sounder,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Stage::Source => "source",
             Stage::Record => "record",
             Stage::Spectrum => "spectrum",
+            Stage::Sounder => "sounder",
         }
     }
 }
@@ -119,12 +128,12 @@ impl Stage {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StageLoad {
     /// Percent of the window, per [`Stage::ALL`] entry.
-    pub percent: [f32; 3],
+    pub percent: [f32; 4],
 }
 
 /// Accumulates the time each stage takes and reports it every second.
 pub struct StageMeter {
-    busy: [Duration; 3],
+    busy: [Duration; 4],
     window_start: Instant,
     pub last: StageLoad,
 }
@@ -132,7 +141,7 @@ pub struct StageMeter {
 impl Default for StageMeter {
     fn default() -> Self {
         StageMeter {
-            busy: [Duration::ZERO; 3],
+            busy: [Duration::ZERO; 4],
             window_start: Instant::now(),
             last: StageLoad::default(),
         }
@@ -157,7 +166,7 @@ impl StageMeter {
         for (p, b) in self.last.percent.iter_mut().zip(&self.busy) {
             *p = (100.0 * b.as_secs_f64() / dt.as_secs_f64()) as f32;
         }
-        self.busy = [Duration::ZERO; 3];
+        self.busy = [Duration::ZERO; 4];
         self.window_start = Instant::now();
         true
     }

@@ -174,3 +174,79 @@ others none):
 
 So M3 can be built and tested on five real DVB-T muxes, and C30 is the T2
 test for M6. Captures: `captures/c22…c30_…cs8` (1.6–6 s each, not committed).
+
+## M3a — OFDM front end and channel sounder (2026-10-23)
+
+Asked for: DecDRM's fading waterfall and delay–Doppler map. Both need a channel
+estimate per symbol, which needs the first half of the receiver, so that is
+what was built (the rest of M3 — equaliser, demapper, Viterbi, RS → TS — is
+next). 214 tests pass; clippy and rustfmt clean.
+
+- **`decdvbt-rx`** (new). `acquire`: from 58k samples at the signal's rate,
+  the **cyclic-prefix search** (every FFT size and guard, the sums folded over
+  the symbol periods, contrast of the peak over the median; pure noise reaches
+  3.6, so a lock needs 5) gives the mode, the symbol timing to a fraction of a
+  sample and the carrier offset within a spacing; the **spectrum's edges** give
+  the offset in whole carriers; the **pilots** give the scattered phase and
+  confirm DVB-T: the right phase and offset make the channel's impulse
+  response collapse into a few taps, a wrong one leaves noise (a fake OFDM
+  signal with a cyclic prefix is rejected). `interp`: 32-tap Kaiser-sinc
+  interpolation at any position, AVX2+FMA at run time (13 ns a sample, 3.2×
+  the plain loop). `sounder`: tracking, below. `delay_doppler`: DecDRM's
+  estimator (IFFT over frequency, FFT over time, Hann windows) on DVB-T's
+  rows.
+- **Cheap by design**: the sounder tells the engine which stretch of samples
+  it wants next (one symbol in 8, about 12 % of the stream), takes only those
+  and reads them by interpolation at exact fractional positions; nothing is
+  converted wholesale. Per symbol looked at: the cyclic prefix near the
+  prediction (timing, carrier fraction; an α-β loop follows position, clock
+  drift and carrier), the useful part read from the filtered timing, rotated
+  by the **integrated** carrier phase (an absolute-time rotation made phase
+  jumps at every update of the offset: found by the Doppler test) and
+  transformed (15 µs), the scattered pilots divided by their values = a row of
+  the transfer function at every 12th carrier. Measured: **2.5 % of real time**
+  on a capture (3.3 % live on the HackRF), 0.9 % with no DVB-T signal.
+- **Engine**: `Command::Sounder(Some(rf_hz))` / `None`; `Rx::take_sounder()`
+  gives status, fading rows and a new delay–Doppler map (once a second). It
+  runs only while the panels are open. A fourth stage in the CPU meter.
+- **GUI**: a Channel panel under the band view (checkbox "channel", Doppler
+  range ±5/15/30/60 Hz): the **fading waterfall** (gain per pilot carrier, 15 s,
+  a row every 30 ms, colours anchored to the median) and the **delay–Doppler
+  map** (inferno palette, 40 dB, guard-interval line, pointer readout), under a
+  status line (lock, mode, carrier offset, clock offset, pilot coherence). The
+  signal card now shows what the sounder read (FFT size, guard, symbol and
+  useful time, carrier offset) with no "assumed" label.
+- **CLI**: `decdvbt sound <file|C26>` locks and lists the strongest paths.
+
+**Tested on simulated signals** (the modulator and channel models): a locked
+carrier offset to within 300 Hz at +337 kHz, the clock offset (clean channel:
+within 1 ppm; with an echo a few ppm), 8k and 2k, a 2 µs echo 6 dB down at its
+delay, a +8 Hz path at its Doppler and not at the mirror, noise alone never
+locking.
+
+**On the real captures** (all five DVB-T muxes lock, the T2 mux does not):
+
+| channel | carrier offset | clock | strongest paths (µs, dB) |
+|---|---|---|---|
+| C22 | +35 Hz | +4 ppm | −0.9 (0), 0.1 (−3), 1.1 (−4), 2.7 (−6) |
+| C23 | +61 Hz | +6 ppm | 0.3 (0), −1.4 (−2), 0.5 (−7) |
+| C25 | +59 Hz | +1 ppm | −0.5 (0), 0.3 (−1.5), 1.5 (−8) |
+| C26 | +86 Hz | −5 ppm | −1.2 (0), −1.4 (−3), 0.7 (−4), 1.2 (−5), 2.6 (−6) |
+| C28 | **−166 641 Hz** | +1 ppm | −1.1 (0), −0.5 (−2), −1.1 (−4) |
+| C30 (T2) | no lock (contrast 3.7) | | |
+
+C28's offset is the UK's −166.67 kHz transmitter offset, read from the signal;
+the others sit within ±90 Hz of zero, which is the HackRF's LO error (a TCXO
+good to 0.15 ppm). Every path is at 0 Hz Doppler (static): the test site's
+multipath is a cluster of reflections from about −1.5 to +3 µs, the longer ones
+out to ~15 µs, all inside the 28 µs guard.
+
+**Not yet**: the lock restarts when a short capture loops (the map needs 2 s
+of rows, so a 1.6 s file never shows one); the channel view only handles DVB-T
+(T2 needs its own pilots); the interpolator's fractional timing is rough with
+an echo (the clock reading wobbles a few ppm); a 20 MS/s span needs a
+decimating filter first.
+
+**Next (M3b):** the equaliser from these estimates, TPS, the demapper,
+deinterleavers, Viterbi, RS and the descrambler → transport stream on the
+five captures. The signal card then gets a real MER and mode.

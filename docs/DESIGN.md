@@ -97,8 +97,10 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
   IQ recorder; first captures of the local muxes. *(done, 2026-10-23, except
   Airspy; the band scan CLI and the signal card came with it)*
 - **M2** — DVB-T modulator plus channel models (multipath, Doppler, noise). *(done, 2026-10-23)*
-- **M3** — DVB-T receiver: time/frequency sync, TPS, channel estimation,
-  demapping, inner deinterleavers, Viterbi, RS → TS. Live Freeview DVB-T.
+- **M3a** — OFDM front end and channel sounder: acquisition, tracking, channel
+  estimate, fading waterfall and delay–Doppler map. *(done, 2026-10-23)*
+- **M3b** — the rest of the DVB-T receiver: equaliser, TPS, demapping, inner
+  deinterleavers, Viterbi, RS → TS. Live Freeview DVB-T.
 - **M4** — player, PSI/SI, service panel, scopes, measurements.
 - **M5** — DVB-T2 modulator.
 - **M6** — DVB-T2 receiver: P1, P2/L1, LDPC/BCH, TI, rotated QAM → TS.
