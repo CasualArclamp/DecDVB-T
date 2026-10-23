@@ -70,6 +70,25 @@ pub struct T2Profile {
     pub equalise: Duration,
     /// L1, the time interleaver, LDPC and BCH, the packets.
     pub fec: Duration,
+    /// Of `fec`: the interleavers undone (one thread), and, summed over the
+    /// threads, the demapper, the bit deinterleaver, LDPC and BCH.
+    pub deinterleave: Duration,
+    pub demap: Duration,
+    pub gather: Duration,
+    pub ldpc: Duration,
+    pub bch: Duration,
+    /// Of `read`: the stretch resampled to the signal's rate, the carrier
+    /// offset taken out, and P1 and the symbols' timing found.
+    pub resample: Duration,
+    pub rotate: Duration,
+    pub p1: Duration,
+    pub timing: Duration,
+    /// Of `read` and `equalise`: the transforms, the alignment, the channel
+    /// from the pilots, and the cells.
+    pub fft: Duration,
+    pub align: Duration,
+    pub channel: Duration,
+    pub cells: Duration,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -479,11 +498,16 @@ impl T2Receiver {
         self.y.clear();
         self.interp
             .resample_planar(self.win.planar(), idx0, t.step, native, &mut self.y);
+        self.status.profile.resample += t_read.elapsed();
+        let t_rot = Instant::now();
         rotate(&mut self.y, t.cfo_hz, FS_NATIVE);
+        self.status.profile.rotate += t_rot.elapsed();
         // P1 near where it is expected.
+        let t_p1 = Instant::now();
         let lo = MARGIN.saturating_sub(2048);
         let hi = (MARGIN + 2048 + P1_SAMPLES + 64).min(self.y.len());
         let hits = p1det::find(&self.y[lo..hi], FS_NATIVE);
+        self.status.profile.p1 += t_p1.elapsed();
         let Some(p1) = hits
             .iter()
             .max_by(|a, b| a.metric.total_cmp(&b.metric))
@@ -497,7 +521,10 @@ impl T2Receiver {
             self.finish_frame(t);
             return;
         };
-        let Some(timing) = t.demod.timing(&self.y, p1 + P1_SAMPLES as f64) else {
+        let t_timing = Instant::now();
+        let timing = t.demod.timing(&self.y, p1 + P1_SAMPLES as f64);
+        self.status.profile.timing += t_timing.elapsed();
+        let Some(timing) = timing else {
             self.status.frames_bad += 1;
             t.misses += 1;
             t.next_p1 += t.geo.frame_samples() as f64 * t.step;
@@ -566,6 +593,11 @@ impl T2Receiver {
 
         let data = t.demod.data_cells(&mut carriers);
         self.status.profile.equalise += t_eq.elapsed();
+        {
+            let d = &t.demod.prof;
+            let p = &mut self.status.profile;
+            (p.fft, p.align, p.channel, p.cells) = (d.fft, d.align, d.channel, d.cells);
+        }
         let Some(data) = data else {
             self.status.frames_bad += 1;
             t.misses += 1;
@@ -634,6 +666,12 @@ impl T2Receiver {
     fn account(&mut self, stats: Option<FrameStats>, resyncs: u64) {
         match stats {
             Some(s) => {
+                let p = &mut self.status.profile;
+                p.deinterleave += s.deinterleave;
+                p.demap += s.blocks_time.demap;
+                p.gather += s.blocks_time.gather;
+                p.ldpc += s.blocks_time.ldpc;
+                p.bch += s.blocks_time.bch;
                 self.status.decoding = s.ok > 0;
                 self.status.blocks_ok += s.ok as u64;
                 self.status.blocks_bad += (s.blocks - s.ok) as u64;

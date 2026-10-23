@@ -116,15 +116,26 @@ impl CellInterleaver {
     /// One FEC block interleaved: input cell w goes to
     /// (perm[w] + shift) mod cell_size.
     pub fn interleave<T: Copy>(&self, shift: usize, input: &[T], out: &mut [T]) {
-        for (w, &v) in input.iter().enumerate() {
-            out[(self.perm[w] as usize + shift) % self.cell_size] = v;
+        let cs = self.cell_size;
+        for (&p, &v) in self.perm.iter().zip(input) {
+            // (perm + shift) mod cs, as a subtraction: both are under cs.
+            let mut at = p as usize + shift;
+            if at >= cs {
+                at -= cs;
+            }
+            out[at] = v;
         }
     }
 
     /// Undone.
     pub fn deinterleave<T: Copy>(&self, shift: usize, input: &[T], out: &mut [T]) {
-        for (w, o) in out.iter_mut().enumerate() {
-            *o = input[(self.perm[w] as usize + shift) % self.cell_size];
+        let cs = self.cell_size;
+        for (o, &p) in out.iter_mut().zip(&self.perm) {
+            let mut at = p as usize + shift;
+            if at >= cs {
+                at -= cs;
+            }
+            *o = input[at];
         }
     }
 }

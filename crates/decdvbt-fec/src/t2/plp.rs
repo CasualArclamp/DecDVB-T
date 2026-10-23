@@ -3,6 +3,8 @@
 //! scrambled, BCH and LDPC coded, bit-interleaved and mapped to the cells of
 //! one FEC block (or, the way back, the block's cells to the BBFRAME).
 
+use std::time::{Duration, Instant};
+
 use decdvbt_core::{CodeRate, FecFrame, Iq};
 
 use super::bitmap::BitMap;
@@ -13,7 +15,14 @@ use crate::params::FecParams;
 
 /// LDPC iterations at most, and the LLR scale for the decoder.
 const ITERATIONS: usize = 50;
-const SCALE: f32 = 4.0;
+/// Soft bits are quantised to a byte at this many steps per unit of LLR
+/// (d₁−d₀ over the cell's noise variance). Measured on the UK multiplex off
+/// the air: 4 took 12.3 LDPC iterations a block and failed 1 in 100; 8 takes
+/// 8.5 and fails 1 in 500; 16 saturates the strong bits and fails more again.
+const SCALE: f32 = 8.0;
+/// The min-sum's normalization 1 − 2^−4: 7/8 (the DVB-S2 default) failed
+/// twice as many blocks of the same signal.
+const NORM_SHIFT: u32 = 4;
 
 /// What decoding a block did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +30,26 @@ pub struct BlockStats {
     pub ldpc: DecodeOutcome,
     /// Bit errors the BCH code corrected.
     pub bch_corrected: usize,
+}
+
+/// Wall time spent in each stage of decoding blocks, since the last
+/// [`PlpCoder::take_times`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeTimes {
+    pub demap: Duration,
+    /// The bit deinterleaver and the quantiser.
+    pub gather: Duration,
+    pub ldpc: Duration,
+    pub bch: Duration,
+}
+
+impl std::ops::AddAssign for DecodeTimes {
+    fn add_assign(&mut self, o: DecodeTimes) {
+        self.demap += o.demap;
+        self.gather += o.gather;
+        self.ldpc += o.ldpc;
+        self.bch += o.bch;
+    }
 }
 
 pub struct PlpCoder {
@@ -33,11 +62,11 @@ pub struct PlpCoder {
     cst: Constellation,
     /// The BB scrambler's bytes for a BBFRAME.
     scrambler: Vec<u8>,
-    // Working memory.
-    cell_llr: Vec<f32>,
-    cw_llr: Vec<f32>,
+    // Working memory: the soft bits quantised, by cell and by codeword.
+    cell_q: Vec<i8>,
     q: Vec<i8>,
     info: Vec<u8>,
+    times: DecodeTimes,
 }
 
 impl PlpCoder {
@@ -64,12 +93,16 @@ impl PlpCoder {
         }
         Some(PlpCoder {
             bch: Bch::new(frame, params.t, params.n_bch),
-            decoder: LdpcDecoder::new(LdpcCode::new(params.ldpc_table())),
+            decoder: {
+                let mut d = LdpcDecoder::new(LdpcCode::new(params.ldpc_table()));
+                d.set_norm_shift(NORM_SHIFT);
+                d
+            },
             cst: Constellation::new(qam, rotated),
-            cell_llr: vec![0.0; n],
-            cw_llr: vec![0.0; n],
+            cell_q: vec![0; n],
             q: vec![0; n],
             info: vec![0; params.n_bch / 8],
+            times: DecodeTimes::default(),
             params,
             qam,
             rotated,
@@ -81,6 +114,11 @@ impl PlpCoder {
     /// Cells in one FEC block.
     pub fn cells(&self) -> usize {
         self.map.cells
+    }
+
+    /// The time the stages took since the last call.
+    pub fn take_times(&mut self) -> DecodeTimes {
+        std::mem::take(&mut self.times)
     }
 
     /// A BBFRAME's length in bytes.
@@ -116,14 +154,20 @@ impl PlpCoder {
     pub fn decode(&mut self, y: &[Iq], var: &[f32], bbframe: &mut [u8]) -> Option<BlockStats> {
         let p = self.params;
         assert_eq!(y.len(), self.map.cells);
-        self.cell_llr.resize(self.map.cells * self.qam.bits(), 0.0);
-        self.cst.demap_block(y, var, &mut self.cell_llr);
-        self.map.gather(&self.cell_llr, &mut self.cw_llr);
-        for (q, &l) in self.q.iter_mut().zip(&self.cw_llr) {
-            *q = (l * SCALE).round().clamp(-127.0, 127.0) as i8;
-        }
+        let t0 = Instant::now();
+        self.cst.demap_block_q(y, var, SCALE, &mut self.cell_q);
+        let t1 = Instant::now();
+        self.map.gather_q(&self.cell_q, &mut self.q);
+        let t2 = Instant::now();
         let ldpc = self.decoder.decode(&self.q, &mut self.info, ITERATIONS);
-        let bch_corrected = self.bch.decode(&mut self.info).ok()?;
+        let t3 = Instant::now();
+        let bch = self.bch.decode(&mut self.info);
+        let t4 = Instant::now();
+        self.times.demap += t1 - t0;
+        self.times.gather += t2 - t1;
+        self.times.ldpc += t3 - t2;
+        self.times.bch += t4 - t3;
+        let bch_corrected = bch.ok()?;
         for ((o, s), m) in bbframe
             .iter_mut()
             .zip(&self.info[..p.k_bch / 8])

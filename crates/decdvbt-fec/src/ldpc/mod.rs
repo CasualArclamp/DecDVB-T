@@ -20,6 +20,8 @@ pub mod tables;
 pub mod tables_s2x;
 pub mod tables_t2;
 
+#[cfg(target_arch = "x86_64")]
+mod avx2;
 mod decoder;
 
 pub use decoder::{DecodeOutcome, LdpcDecoder};
@@ -28,6 +30,11 @@ use tables::Table;
 
 /// Lanes per layer: the code's circulant size (§5.3.2, "M = 360").
 pub const LANES: usize = 360;
+
+/// Entries between the starts of two variable groups in the decoder's
+/// posteriors: the group, then 16 entries of room for the AVX2 kernel's copy of
+/// its head.
+pub(crate) const GROUP_STRIDE: usize = LANES + 16;
 
 /// One edge block of a layer: 360 checks joined to a 360-bit group by a
 /// cyclic shift.

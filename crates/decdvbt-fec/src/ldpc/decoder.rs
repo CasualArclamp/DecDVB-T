@@ -22,17 +22,19 @@
 //!
 //! LLR convention: positive means bit 0.
 
-use super::{LANES, LdpcCode};
+use super::{GROUP_STRIDE, LANES, LdpcCode};
 
 /// Message magnitude cap (i8, symmetric so negation never overflows).
-const MSG_MAX: i16 = 127;
+pub(super) const MSG_MAX: i16 = 127;
 /// Posterior cap: far above any sum of messages and channel value.
-const POST_MAX: i16 = 16_000;
+pub(super) const POST_MAX: i16 = 16_000;
 
 /// Normalization 1 − 2^−NORM_SHIFT. 7/8 measured better than 3/4 on the
 /// low-rate codes (whose small check degrees overestimate less) and no worse
-/// elsewhere; see the tests.
-const NORM_SHIFT: u32 = 3;
+/// elsewhere; see the tests. [`LdpcDecoder::set_norm_shift`] changes it (the
+/// T2 receiver's 256-QAM rate 2/3 code on a real signal wants 15/16: fewer
+/// iterations and a tenth of the failed blocks).
+pub(super) const NORM_SHIFT: u32 = 3;
 
 /// A decode that leaves this few checks unsatisfied, unchanged, for
 /// `STALL_ITERATIONS` iterations is stuck, not converging. The usual case is
@@ -69,14 +71,22 @@ pub struct DecodeOutcome {
 
 /// A decoder for one code, holding its working memory.
 pub struct LdpcDecoder {
-    code: LdpcCode,
-    /// Posteriors: information bits in order, then parity group r at
-    /// `k + r·360` holding parity bits j = c·q + r in lane c.
-    v: Vec<i16>,
+    pub(super) code: LdpcCode,
+    /// Posteriors, a group of 360 bits every `GROUP_STRIDE` entries: the
+    /// information groups in order, then parity group r holding parity bits
+    /// j = c·q + r in lane c. The 16 entries after each group copy its first
+    /// 16 (kept by the AVX2 kernel only, which reads a rotated group as one
+    /// contiguous run).
+    pub(super) v: Vec<i16>,
     /// Check-to-variable messages, one 360-lane block per edge.
-    r: Vec<i8>,
+    pub(super) r: Vec<i8>,
     /// Extrinsics of the layer being processed, one block per edge.
     t: Vec<[i16; LANES]>,
+    /// The AVX2 kernel's working memory.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) avx2: super::avx2::Scratch,
+    /// The min-sum normalization: 1 − 2^−norm_shift.
+    pub(super) norm_shift: u32,
 }
 
 impl LdpcDecoder {
@@ -88,15 +98,26 @@ impl LdpcDecoder {
             .max()
             .unwrap_or(0);
         LdpcDecoder {
-            v: vec![0; code.n],
-            r: vec![0; code.edges.len() * LANES],
+            // 16 more entries: the last group's contiguous read of a rotated
+            // run may reach that far.
+            v: vec![0; code.n / LANES * GROUP_STRIDE + 16],
+            // 16 more: the last block of the last edge is read 16 wide.
+            r: vec![0; code.edges.len() * LANES + 16],
             t: vec![[0; LANES]; max_deg],
+            #[cfg(target_arch = "x86_64")]
+            avx2: super::avx2::Scratch::new(max_deg),
+            norm_shift: NORM_SHIFT,
             code,
         }
     }
 
     pub fn code(&self) -> &LdpcCode {
         &self.code
+    }
+
+    /// Normalize the min-sum by 1 − 2^−`shift` (default 3: 7/8).
+    pub fn set_norm_shift(&mut self, shift: u32) {
+        self.norm_shift = shift.min(14);
     }
 
     /// Decode one codeword. `llr` holds N quantized LLRs in transmission
@@ -122,10 +143,11 @@ impl LdpcDecoder {
     ///
     /// Rust note: a release build targets plain x86-64 (SSE2) so that the
     /// one exe runs anywhere, and the 360-lane loops below then vectorise
-    /// 8 lanes wide. `#[target_feature]` compiles a second copy of the same
+    /// 8 lanes wide. `#[target_feature]` compiles further copies of the same
     /// code for AVX-512 (32 lanes of i16, with masked tails for 360 = 11 ×
-    /// 32 + 8), and `is_x86_feature_detected!` picks it at run time: about
-    /// 4.5 times faster on a Zen 5 / Ice Lake or newer, identical results.
+    /// 32 + 8) and for AVX2 (16 lanes: what a Zen 2 has), and
+    /// `is_x86_feature_detected!` picks one at run time: about 4.5 times
+    /// faster with AVX-512 on a Zen 5 / Ice Lake or newer, identical results.
     /// The `#[inline(always)]` helpers are compiled into each copy.
     fn decode_budget(
         &mut self,
@@ -141,7 +163,41 @@ impl LdpcDecoder {
             // SAFETY: the CPU has the features the function was compiled for.
             return unsafe { self.decode_budget_avx512(llr, info, max_iterations, hurried) };
         }
-        self.decode_budget_body(llr, info, max_iterations, hurried)
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("popcnt")
+        {
+            // SAFETY: as above, for AVX2 (16 lanes of i16).
+            return unsafe { self.decode_budget_avx2(llr, info, max_iterations, hurried) };
+        }
+        self.decode_budget_body::<false>(llr, info, max_iterations, hurried)
+    }
+
+    /// The decode with the hand-written AVX2 kernel (`super::avx2`). The
+    /// compiler leaves the portable loops scalar; the kernel is several
+    /// times faster on this machine class and gives the same decisions
+    /// (tested bit for bit).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,popcnt")]
+    pub(super) unsafe fn decode_budget_avx2(
+        &mut self,
+        llr: &[i8],
+        info: &mut [u8],
+        max_iterations: usize,
+        hurried: bool,
+    ) -> DecodeOutcome {
+        self.decode_budget_body::<true>(llr, info, max_iterations, hurried)
+    }
+
+    /// The portable decode, whatever the CPU (for tests against the kernels).
+    #[cfg(test)]
+    pub(super) fn decode_portable(
+        &mut self,
+        llr: &[i8],
+        info: &mut [u8],
+        max_iterations: usize,
+    ) -> DecodeOutcome {
+        self.decode_budget_body::<false>(llr, info, max_iterations, false)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -153,11 +209,33 @@ impl LdpcDecoder {
         max_iterations: usize,
         hurried: bool,
     ) -> DecodeOutcome {
-        self.decode_budget_body(llr, info, max_iterations, hurried)
+        self.decode_budget_body::<false>(llr, info, max_iterations, hurried)
+    }
+
+    /// One layer, by the kernel `AVX2` names.
+    #[inline(always)]
+    fn sweep_layer<const AVX2: bool>(&mut self, layer: usize) {
+        #[cfg(target_arch = "x86_64")]
+        if AVX2 {
+            // SAFETY: only instantiated inside functions compiled with AVX2.
+            unsafe { super::avx2::layer(self, layer) };
+            return;
+        }
+        self.layer(layer);
     }
 
     #[inline(always)]
-    fn decode_budget_body(
+    fn count_unsatisfied<const AVX2: bool>(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if AVX2 {
+            // SAFETY: as above.
+            return unsafe { super::avx2::unsatisfied(self) };
+        }
+        self.unsatisfied()
+    }
+
+    #[inline(always)]
+    fn decode_budget_body<const AVX2: bool>(
         &mut self,
         llr: &[i8],
         info: &mut [u8],
@@ -168,17 +246,24 @@ impl LdpcDecoder {
         assert_eq!(llr.len(), n);
         assert_eq!(info.len() * 8, k);
 
-        for (d, &s) in self.v[..k].iter_mut().zip(&llr[..k]) {
-            *d = s as i16;
+        for (g, chunk) in llr[..k].as_chunks::<LANES>().0.iter().enumerate() {
+            for (d, &s) in self.v[g * GROUP_STRIDE..][..LANES].iter_mut().zip(chunk) {
+                *d = s as i16;
+            }
         }
-        // Parity bit j = c·q + r lives at k + r·360 + c.
+        // Parity bit j = c·q + r lives in group k/360 + r, lane c.
+        let info_groups = k / LANES;
         for (j, &s) in llr[k..].iter().enumerate() {
             let (c, r) = (j / q, j % q);
-            self.v[k + r * LANES + c] = s as i16;
+            self.v[(info_groups + r) * GROUP_STRIDE + c] = s as i16;
+        }
+        for g in 0..n / LANES {
+            let base = g * GROUP_STRIDE;
+            self.v.copy_within(base..base + 16, base + LANES);
         }
         self.r.fill(0);
 
-        let unsatisfied = self.unsatisfied();
+        let unsatisfied = self.count_unsatisfied::<AVX2>();
         let mut outcome = DecodeOutcome {
             iterations: 0,
             converged: unsatisfied == 0,
@@ -189,10 +274,10 @@ impl LdpcDecoder {
         let (mut best, mut since_best) = (unsatisfied, 0);
         while !outcome.converged && outcome.iterations < max_iterations {
             for layer in 0..q {
-                self.layer(layer);
+                self.sweep_layer::<AVX2>(layer);
             }
             outcome.iterations += 1;
-            let now = self.unsatisfied();
+            let now = self.count_unsatisfied::<AVX2>();
             stalled = if now == outcome.unsatisfied && now <= STALL_CHECKS {
                 stalled + 1
             } else {
@@ -215,9 +300,12 @@ impl LdpcDecoder {
         }
 
         info.fill(0);
-        for (i, &x) in self.v[..k].iter().enumerate() {
-            if x < 0 {
-                info[i / 8] |= 0x80 >> (i % 8);
+        for g in 0..k / LANES {
+            for (c, &x) in self.v[g * GROUP_STRIDE..][..LANES].iter().enumerate() {
+                if x < 0 {
+                    let bit = g * LANES + c;
+                    info[bit / 8] |= 0x80 >> (bit % 8);
+                }
             }
         }
         outcome
@@ -228,7 +316,7 @@ impl LdpcDecoder {
     fn parity_bits(&self) -> Vec<u8> {
         let (n, k, q) = (self.code.n, self.code.k, self.code.q);
         (0..n - k)
-            .map(|j| (self.v[k + (j % q) * LANES + j / q] < 0) as u8)
+            .map(|j| (self.v[(k / LANES + j % q) * GROUP_STRIDE + j / q] < 0) as u8)
             .collect()
     }
 
@@ -252,7 +340,7 @@ impl LdpcDecoder {
 
         for e in 0..deg {
             let edge = self.code.edges[start + e];
-            let base = edge.group as usize * LANES;
+            let base = edge.group as usize * GROUP_STRIDE;
             let t = &mut self.t[e];
             rotate_in(&self.v[base..base + LANES], edge.shift as usize, t);
             let old = &self.r[(start + e) * LANES..(start + e + 1) * LANES];
@@ -274,8 +362,8 @@ impl LdpcDecoder {
         }
         // Normalized min-sum, in integers: m − m/2^NORM_SHIFT.
         for c in 0..LANES {
-            min1[c] -= min1[c] >> NORM_SHIFT;
-            min2[c] -= min2[c] >> NORM_SHIFT;
+            min1[c] -= min1[c] >> self.norm_shift;
+            min2[c] -= min2[c] >> self.norm_shift;
         }
 
         let mut delta = [0i16; LANES];
@@ -293,7 +381,7 @@ impl LdpcDecoder {
             if corner && e == deg - 1 {
                 delta[0] = 0;
             }
-            let base = edge.group as usize * LANES;
+            let base = edge.group as usize * GROUP_STRIDE;
             add_rotated(&delta, edge.shift as usize, &mut self.v[base..base + LANES]);
         }
     }
@@ -310,7 +398,7 @@ impl LdpcDecoder {
             );
             let mut parity = [0i16; LANES];
             for (e, edge) in self.code.edges[start..end].iter().enumerate() {
-                let base = edge.group as usize * LANES;
+                let base = edge.group as usize * GROUP_STRIDE;
                 rotate_in(
                     &self.v[base..base + LANES],
                     edge.shift as usize,

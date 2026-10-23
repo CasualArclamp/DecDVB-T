@@ -13,6 +13,7 @@
 //! on both sides whatever the timing's small errors.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use decdvbt_core::Iq;
 use decdvbt_ofdm::t2::carriers::p2_deal;
@@ -87,20 +88,62 @@ pub struct Timing {
     pub eps: f64,
 }
 
+/// Wall time in the parts of reading a frame, since the start.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DemodProfile {
+    /// The symbols' transforms.
+    pub fft: Duration,
+    /// The continual pilots' alignment of the symbols.
+    pub align: Duration,
+    /// The scattered pilots' sightings, and the channel from them.
+    pub channel: Duration,
+    /// The equalised cells, deinterleaved.
+    pub cells: Duration,
+}
+
+/// Which sightings of a node make its value at a symbol, and their weights:
+/// the sighting itself, or a cubic (Lagrange) through the nearest four.
+#[derive(Debug, Clone, Copy, Default)]
+struct TimeTap {
+    start: u8,
+    len: u8,
+    w: [f32; 4],
+}
+
 /// The pilots and carriers of a mode, and the machinery to read frames.
 pub struct Demod {
     pub geo: Geometry,
+    pub prof: DemodProfile,
     pub carriers: Carriers,
     reference: Reference,
     fft: SymbolFft,
     /// The lattice of scattered pilots: carriers (every D_x from the first),
     /// and for each node the data symbols it is seen in.
     nodes: Vec<usize>,
-    seen: Vec<Vec<u16>>,
-    /// The interpolator's weights by the phase of a carrier between nodes.
-    kernel: Vec<[f32; 2 * KERNEL_HALF]>,
+    /// The interpolator's weights, tap by tap and then by the phase of a
+    /// carrier between nodes (`kernel_t[t · dxp + phase]`, the phases padded
+    /// with zeros to a multiple of eight).
+    kernel_t: Vec<f32>,
+    dxp: usize,
     /// Carriers that are continual pilots in every symbol.
     cps: Vec<usize>,
+    /// The last data symbol read (the frame-closing one is read apart).
+    last_data: usize,
+    /// For each of the D_y places in the scattered pilots' pattern: the
+    /// carriers that are data cells, and that are continual pilots.
+    data_ks: Vec<Vec<u32>>,
+    cp_ks: Vec<Vec<u32>>,
+    /// The continual pilots' values at each symbol (aligned with `cp_ks`).
+    cp_pv: Vec<Vec<f32>>,
+    /// Each node's sightings, back to back: the symbol of each and the
+    /// reciprocal of the pilot's value there.
+    sight_off: Vec<u32>,
+    sight_sym: Vec<u16>,
+    sight_inv: Vec<f32>,
+    /// Nodes seen at the same symbols share a pattern; a pattern says, for
+    /// each data symbol, which sightings make a node's value there.
+    pattern_of: Vec<u16>,
+    patterns: Vec<Vec<TimeTap>>,
     fi_p2: FreqInterleaver,
     fi_data: FreqInterleaver,
     fi_fc: Option<FreqInterleaver>,
@@ -127,7 +170,8 @@ impl Demod {
                 }
             }
         }
-        let mut kernel = Vec::with_capacity(dx);
+        let dxp = dx.next_multiple_of(8);
+        let mut kernel_t = vec![0f32; 2 * KERNEL_HALF * dxp];
         for phase in 0..dx {
             let frac = phase as f32 / dx as f32;
             let mut w = [0f32; 2 * KERNEL_HALF];
@@ -144,16 +188,79 @@ impl Demod {
                 *wt = sinc * win;
                 sum += *wt;
             }
-            for wt in &mut w {
-                *wt /= sum;
+            for (t, wt) in w.iter().enumerate() {
+                kernel_t[t * dxp + phase] = *wt / sum;
             }
-            kernel.push(w);
         }
         let cps: Vec<usize> = (0..geo.c_ps)
             .filter(|&k| (0..dy).all(|ph| carriers.data(ph)[k] == Role::Continual))
             .collect();
+        let reference = Reference::new(&mode);
+        let last_data = if geo.has_fc {
+            geo.symbols - 1
+        } else {
+            geo.symbols
+        };
+        let data_ks: Vec<Vec<u32>> = (0..dy)
+            .map(|ph| {
+                carriers
+                    .data(ph)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| **r == Role::Data)
+                    .map(|(k, _)| k as u32)
+                    .collect()
+            })
+            .collect();
+        let cp_ks: Vec<Vec<u32>> = (0..dy)
+            .map(|ph| {
+                carriers
+                    .data(ph)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| **r == Role::Continual)
+                    .map(|(k, _)| k as u32)
+                    .collect()
+            })
+            .collect();
+        let cp_pv: Vec<Vec<f32>> = (0..geo.symbols)
+            .map(|j| {
+                cp_ks[j % dy]
+                    .iter()
+                    .map(|&k| mode.pilot_value(Role::Continual, &reference, k as usize, j))
+                    .collect()
+            })
+            .collect();
+        let mut sight_off = vec![0u32; nodes.len() + 1];
+        let (mut sight_sym, mut sight_inv) = (Vec::new(), Vec::new());
+        let mut pattern_of = Vec::with_capacity(nodes.len());
+        let mut pattern_ids: std::collections::HashMap<Vec<u16>, u16> = Default::default();
+        let mut patterns: Vec<Vec<TimeTap>> = Vec::new();
+        for (m, &k) in nodes.iter().enumerate() {
+            let ts: Vec<u16> = seen[m]
+                .iter()
+                .copied()
+                .filter(|&j| (j as usize) < last_data)
+                .collect();
+            for &j in &ts {
+                sight_sym.push(j);
+                let pv = mode.pilot_value(Role::Scattered, &reference, k, j as usize);
+                sight_inv.push(1.0 / pv);
+            }
+            sight_off[m + 1] = sight_sym.len() as u32;
+            let id = *pattern_ids.entry(ts.clone()).or_insert_with(|| {
+                patterns.push(
+                    (geo.n_p2..last_data)
+                        .map(|j| time_tap(&ts, j as u16))
+                        .collect(),
+                );
+                (patterns.len() - 1) as u16
+            });
+            pattern_of.push(id);
+        }
         Demod {
-            reference: Reference::new(&mode),
+            prof: DemodProfile::default(),
+            reference,
             fft: SymbolFft::new(geo.n),
             fi_p2: FreqInterleaver::new(mode.fft, carriers.p2_cells()),
             fi_data: FreqInterleaver::new(mode.fft, carriers.data_cells()),
@@ -163,9 +270,18 @@ impl Demod {
             geo,
             carriers,
             nodes,
-            seen,
-            kernel,
+            kernel_t,
+            dxp,
             cps,
+            last_data,
+            data_ks,
+            cp_ks,
+            cp_pv,
+            sight_off,
+            sight_sym,
+            sight_inv,
+            pattern_of,
+            patterns,
         }
     }
 
@@ -263,10 +379,12 @@ pub struct Equalised {
 impl Demod {
     /// All the symbols' carriers (`symbols · c_ps`, symbol by symbol).
     pub fn all_carriers(&mut self, y: &[Iq], t: &Timing) -> Vec<Iq> {
+        let t0 = Instant::now();
         let mut out = Vec::with_capacity(self.geo.symbols * self.geo.c_ps);
         for j in 0..self.geo.symbols {
             self.transform(y, t.start[j], t.eps, &mut out);
         }
+        self.prof.fft += t0.elapsed();
         out
     }
 
@@ -325,15 +443,13 @@ impl Demod {
         let geo = self.geo;
         let (c_ps, mid) = (geo.c_ps, geo.mid);
         let first = geo.n_p2;
-        let last = if geo.has_fc {
-            geo.symbols - 1
-        } else {
-            geo.symbols
-        };
+        let last = self.last_data;
         if last <= first + 1 || self.cps.len() < 8 {
             return None;
         }
         let mode = geo.mode;
+        let dy = self.data_ks.len();
+        let t_align = Instant::now();
         // --- Alignment to the first data symbol by the stronger continual
         // pilots.
         let obs = |j: usize, c: &[Iq], k: usize| -> Iq {
@@ -356,14 +472,15 @@ impl Demod {
                 .collect();
             let (slope, phi) = align(&d, &sel, &self.cps, mid);
             slopes.push((j as f64, slope));
-            for k in 0..c_ps {
-                let ph = -(phi + slope * (k as f64 - mid as f64));
-                carriers[j * c_ps + k] *= Iq::new(ph.cos() as f32, ph.sin() as f32);
-            }
+            ramp(
+                &mut carriers[j * c_ps..(j + 1) * c_ps],
+                -phi + slope * mid as f64,
+                -slope,
+            );
         }
+        self.prof.align += t_align.elapsed();
+        let t_chan = Instant::now();
 
-        // --- The lattice: each node's sightings, then its value at every
-        // data symbol by a cubic through the four nearest.
         // The alignment's slopes grow with the symbol if the windows' line has
         // the wrong drift: a slope of 2πδ/N is the window δ samples late.
         let drift_residual = if slopes.len() >= 4 {
@@ -383,87 +500,99 @@ impl Demod {
         } else {
             0.0
         };
+
+        // --- The lattice: each node's sightings, then its value at every
+        // data symbol (its sighting or a cubic through the four nearest), the
+        // channel across the symbol from those, and the cells divided by it.
         let n_nodes = self.nodes.len();
-        let mut sight: Vec<Vec<(u16, Iq)>> = Vec::with_capacity(n_nodes);
+        let mut sight: Vec<Iq> = Vec::with_capacity(self.sight_sym.len());
         for (m, &k) in self.nodes.iter().enumerate() {
-            sight.push(
-                self.seen[m]
-                    .iter()
-                    .filter(|&&j| (j as usize) < last)
-                    .map(|&j| {
-                        let pv = mode.pilot_value(Role::Scattered, &self.reference, k, j as usize);
-                        (j, carriers[j as usize * c_ps + k] / pv)
-                    })
-                    .collect(),
-            );
+            let (a, b) = (self.sight_off[m] as usize, self.sight_off[m + 1] as usize);
+            for i in a..b {
+                let j = self.sight_sym[i] as usize;
+                sight.push(carriers[j * c_ps + k] * self.sight_inv[i]);
+            }
         }
-        let dx = mode.pp.dx();
-        let mut cells: Vec<Iq> = Vec::new();
-        let mut var: Vec<f32> = Vec::new();
-        let mut node_val = vec![Iq::new(0.0, 0.0); n_nodes];
-        let mut h = vec![Iq::new(0.0, 0.0); c_ps];
+        let c_data = self.data_ks[first % dy].len();
+        let n_syms = last - first;
+        let mut cells = vec![Iq::new(0.0, 0.0); n_syms * c_data];
+        // The reciprocal of each cell's channel power until the noise is known.
+        let mut var = vec![0f32; n_syms * c_data];
+        let (mut pad_re, mut pad_im) = (
+            vec![0f32; n_nodes + 2 * KERNEL_HALF + 1],
+            vec![0f32; n_nodes + 2 * KERNEL_HALF + 1],
+        );
+        let (mut hr, mut hi) = (vec![0f32; c_ps], vec![0f32; c_ps]);
         // For the noise, and the SNR: continual pilots' errors, and the
         // channel's mean power.
         let mut errs: Vec<f32> = Vec::new();
         let mut gain = 0f64;
         let mut chan_mid = vec![Iq::new(0.0, 0.0); c_ps];
-        let mut per_symbol: Vec<(Vec<usize>, Vec<Iq>, Vec<Iq>)> = Vec::new();
         let mut sym_snr: Vec<f32> = Vec::new();
+        let mut own: Vec<f32> = Vec::new();
         for j in first..last {
-            for (m, obs) in sight.iter().enumerate() {
-                node_val[m] = interpolate_time(obs, j as u16);
+            let rel = j - first;
+            for m in 0..n_nodes {
+                let tap = self.patterns[self.pattern_of[m] as usize][rel];
+                let s = &sight[self.sight_off[m] as usize..self.sight_off[m + 1] as usize];
+                let (mut re, mut im) = (0f32, 0f32);
+                for i in 0..tap.len as usize {
+                    let v = s[tap.start as usize + i];
+                    re += tap.w[i] * v.re;
+                    im += tap.w[i] * v.im;
+                }
+                pad_re[m + KERNEL_HALF] = re;
+                pad_im[m + KERNEL_HALF] = im;
             }
-            self.interpolate_frequency(&node_val, dx, &mut h);
+            self.interpolate_frequency(&mut pad_re, &mut pad_im, n_nodes, &mut hr, &mut hi);
             if j == (first + last) / 2 {
-                chan_mid.copy_from_slice(&h);
-            }
-            let roles = self.carriers.data(j);
-            let row = &carriers[j * c_ps..(j + 1) * c_ps];
-            let mut own: Vec<f32> = Vec::new();
-            for (k, r) in roles.iter().enumerate() {
-                if *r == Role::Continual {
-                    let pv = mode.pilot_value(*r, &self.reference, k, j);
-                    let e = (row[k] - h[k] * pv).norm_sqr();
-                    errs.push(e);
-                    own.push(e);
+                for (k, c) in chan_mid.iter_mut().enumerate() {
+                    *c = Iq::new(hr[k], hi[k]);
                 }
             }
+            let row = &carriers[j * c_ps..(j + 1) * c_ps];
+            own.clear();
+            for (&k, &pv) in self.cp_ks[j % dy].iter().zip(&self.cp_pv[j]) {
+                let k = k as usize;
+                let e = (row[k] - Iq::new(hr[k], hi[k]) * pv).norm_sqr();
+                errs.push(e);
+                own.push(e);
+            }
             own.sort_by(f32::total_cmp);
-            let g_j = h.iter().map(|c| c.norm_sqr()).sum::<f32>() / c_ps as f32;
+            let g_j = hr.iter().zip(&hi).map(|(a, b)| a * a + b * b).sum::<f32>() / c_ps as f32;
             let v_j = (own.get(own.len() / 2).copied().unwrap_or(1.0) / std::f32::consts::LN_2)
                 .max(1e-12);
             sym_snr.push(10.0 * (g_j / v_j).log10());
             gain += f64::from(g_j);
-            let ks: Vec<usize> = roles
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| **r == Role::Data)
-                .map(|(k, _)| k)
-                .collect();
-            per_symbol.push((
-                ks.clone(),
-                ks.iter().map(|&k| row[k]).collect(),
-                ks.iter().map(|&k| h[k]).collect(),
-            ));
+            // The data cells, undone from the frequency interleaver as they
+            // are written.
+            let perm = self.fi_data.h(j);
+            let base = rel * c_data;
+            let (cells_j, var_j) = (
+                &mut cells[base..base + c_data],
+                &mut var[base..base + c_data],
+            );
+            for (&k, &p) in self.data_ks[j % dy].iter().zip(perm) {
+                let k = k as usize;
+                let (y, hre, him) = (row[k], hr[k], hi[k]);
+                let r = 1.0 / (hre * hre + him * him).max(1e-9);
+                cells_j[p as usize] =
+                    Iq::new((y.re * hre + y.im * him) * r, (y.im * hre - y.re * him) * r);
+                var_j[p as usize] = r;
+            }
         }
         if errs.is_empty() {
             return None;
         }
+        self.prof.channel += t_chan.elapsed();
+        let t_cells = Instant::now();
         errs.sort_by(f32::total_cmp);
         // The median of |e|² of complex Gaussian noise is variance · ln 2.
         let vy = (errs[errs.len() / 2] / std::f32::consts::LN_2).max(1e-12);
         let mean_gain = (gain / (last - first) as f64) as f32;
         let snr_db = 10.0 * (mean_gain / vy).log10();
-        for (idx, (ks, ys, hs)) in per_symbol.into_iter().enumerate() {
-            let j = first + idx;
-            let x: Vec<Iq> = ys.iter().zip(&hs).map(|(y, h)| *y / *h).collect();
-            let v: Vec<f32> = hs.iter().map(|h| vy / h.norm_sqr().max(1e-9)).collect();
-            let mut lx = vec![Iq::new(0.0, 0.0); ks.len()];
-            let mut lv = vec![0f32; ks.len()];
-            self.fi_data.deinterleave(j, &x, &mut lx);
-            self.fi_data.deinterleave(j, &v, &mut lv);
-            cells.extend(lx);
-            var.extend(lv);
+        for v in &mut var {
+            *v *= vy;
         }
         // The frame-closing symbol, which has scattered pilots at every node
         // of the lattice and so is equalised by its own alone.
@@ -484,15 +613,23 @@ impl Demod {
             let amp = mode.pilot_amplitude(Role::Scattered);
             let var_h = d2[d2.len() / 2] / std::f32::consts::LN_2 / 1.5;
             let vy = (var_h * amp * amp).max(1e-12);
-            self.interpolate_frequency(&node_h, dx, &mut h);
+            for (m, v) in node_h.iter().enumerate() {
+                pad_re[m + KERNEL_HALF] = v.re;
+                pad_im[m + KERNEL_HALF] = v.im;
+            }
+            self.interpolate_frequency(&mut pad_re, &mut pad_im, n_nodes, &mut hr, &mut hi);
             let ks: Vec<usize> = roles
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| **r == Role::Data)
                 .map(|(k, _)| k)
                 .collect();
-            let x: Vec<Iq> = ks.iter().map(|&k| row[k] / h[k]).collect();
-            let v: Vec<f32> = ks.iter().map(|&k| vy / h[k].norm_sqr().max(1e-9)).collect();
+            let h_of = |k: usize| Iq::new(hr[k], hi[k]);
+            let x: Vec<Iq> = ks.iter().map(|&k| row[k] / h_of(k)).collect();
+            let v: Vec<f32> = ks
+                .iter()
+                .map(|&k| vy / h_of(k).norm_sqr().max(1e-9))
+                .collect();
             if let Some(fi) = &self.fi_fc {
                 let mut lx = vec![Iq::new(0.0, 0.0); ks.len()];
                 let mut lv = vec![0f32; ks.len()];
@@ -502,6 +639,7 @@ impl Demod {
                 var.extend(lv);
             }
         }
+        self.prof.cells += t_cells.elapsed();
         Some(Equalised {
             cells,
             var,
@@ -512,58 +650,137 @@ impl Demod {
         })
     }
 
-    /// The channel at every carrier from its values at the lattice's nodes.
-    fn interpolate_frequency(&self, node: &[Iq], dx: usize, h: &mut [Iq]) {
-        let n_nodes = node.len();
+    /// The channel at every carrier from its values at the lattice's nodes
+    /// (in `pad_re`/`pad_im` from index `KERNEL_HALF`, the edges padded here
+    /// by repeating the end nodes): each node's cell of carriers is the 16
+    /// nearest nodes weighted by the carrier's phase, with the weights laid
+    /// out so that the phases are the vector lanes.
+    fn interpolate_frequency(
+        &self,
+        pad_re: &mut [f32],
+        pad_im: &mut [f32],
+        n_nodes: usize,
+        hr: &mut [f32],
+        hi: &mut [f32],
+    ) {
+        for p in [&mut *pad_re, &mut *pad_im] {
+            let (lo, hi_v) = (p[KERNEL_HALF], p[KERNEL_HALF + n_nodes - 1]);
+            p[..KERNEL_HALF].fill(lo);
+            p[KERNEL_HALF + n_nodes..].fill(hi_v);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU has the feature the function was compiled for.
+            return unsafe { self.interpolate_frequency_avx2(pad_re, pad_im, hr, hi) };
+        }
+        self.interpolate_frequency_body(pad_re, pad_im, hr, hi);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn interpolate_frequency_avx2(
+        &self,
+        pad_re: &[f32],
+        pad_im: &[f32],
+        hr: &mut [f32],
+        hi: &mut [f32],
+    ) {
+        self.interpolate_frequency_body(pad_re, pad_im, hr, hi);
+    }
+
+    #[inline(always)]
+    fn interpolate_frequency_body(
+        &self,
+        pad_re: &[f32],
+        pad_im: &[f32],
+        hr: &mut [f32],
+        hi: &mut [f32],
+    ) {
+        match self.dxp {
+            8 => self.interpolate_cells::<8>(pad_re, pad_im, hr, hi),
+            16 => self.interpolate_cells::<16>(pad_re, pad_im, hr, hi),
+            _ => self.interpolate_cells::<24>(pad_re, pad_im, hr, hi),
+        }
+    }
+
+    #[inline(always)]
+    fn interpolate_cells<const DXP: usize>(
+        &self,
+        pad_re: &[f32],
+        pad_im: &[f32],
+        hr: &mut [f32],
+        hi: &mut [f32],
+    ) {
+        let dx = self.geo.mode.pp.dx();
         let first = self.nodes[0];
-        for (k, hk) in h.iter_mut().enumerate() {
-            // The node at or before k, and the carrier's phase after it.
-            let (m0, phase) = if k < first {
-                (-1isize, k + dx - first)
+        let c_ps = hr.len();
+        for m0 in -1..self.nodes.len() as isize {
+            let q0 = (m0 + 1) as usize;
+            // The carriers between this node and the next, and the phase of
+            // the first of them.
+            let (k0, k1, p0) = if m0 < 0 {
+                (0, first, dx - first)
             } else {
-                (((k - first) / dx) as isize, (k - first) % dx)
+                let k0 = first + m0 as usize * dx;
+                (k0, (k0 + dx).min(c_ps), 0)
             };
-            let w = &self.kernel[phase];
-            let mut re = 0f32;
-            let mut im = 0f32;
-            for (t, &wt) in w.iter().enumerate() {
-                let m = (m0 + t as isize - (KERNEL_HALF as isize - 1))
-                    .clamp(0, n_nodes as isize - 1) as usize;
-                re += wt * node[m].re;
-                im += wt * node[m].im;
+            if k1 <= k0 {
+                continue;
             }
-            *hk = Iq::new(re, im);
+            let (mut ar, mut ai) = ([0f32; DXP], [0f32; DXP]);
+            for t in 0..2 * KERNEL_HALF {
+                let (xr, xi) = (pad_re[q0 + t], pad_im[q0 + t]);
+                let w: &[f32; DXP] = self.kernel_t[t * DXP..(t + 1) * DXP]
+                    .try_into()
+                    .expect("DXP weights");
+                for p in 0..DXP {
+                    ar[p] += w[p] * xr;
+                    ai[p] += w[p] * xi;
+                }
+            }
+            let len = k1 - k0;
+            hr[k0..k1].copy_from_slice(&ar[p0..p0 + len]);
+            hi[k0..k1].copy_from_slice(&ai[p0..p0 + len]);
         }
     }
 }
 
-/// A node's value at symbol `j`: a sighting if there is one, else a cubic
-/// (Lagrange) through the four nearest.
-fn interpolate_time(obs: &[(u16, Iq)], j: u16) -> Iq {
-    let after = obs.partition_point(|(t, _)| *t < j);
-    if after < obs.len() && obs[after].0 == j {
-        return obs[after].1;
+/// How a node's value at symbol `j` is made from its sightings `ts` (sorted
+/// symbols): the sighting there if there is one, else a cubic (Lagrange)
+/// through the four nearest.
+fn time_tap(ts: &[u16], j: u16) -> TimeTap {
+    let after = ts.partition_point(|t| *t < j);
+    if after < ts.len() && ts[after] == j {
+        return TimeTap {
+            start: after as u8,
+            len: 1,
+            w: [1.0, 0.0, 0.0, 0.0],
+        };
     }
     let lo = after.saturating_sub(2);
-    let hi = (after + 2).min(obs.len());
-    let pts = &obs[lo..hi];
+    let hi = (after + 2).min(ts.len());
+    let pts = &ts[lo..hi];
+    let mut tap = TimeTap {
+        start: lo as u8,
+        len: pts.len() as u8,
+        w: [0.0; 4],
+    };
     match pts.len() {
-        0 => Iq::new(0.0, 0.0),
-        1 => pts[0].1,
+        0 => {}
+        1 => tap.w[0] = 1.0,
         _ => {
-            let mut acc = Iq::new(0.0, 0.0);
-            for (i, (ti, vi)) in pts.iter().enumerate() {
+            for (i, ti) in pts.iter().enumerate() {
                 let mut w = 1.0f32;
-                for (m, (tm, _)) in pts.iter().enumerate() {
+                for (m, tm) in pts.iter().enumerate() {
                     if m != i {
                         w *= (f32::from(j) - f32::from(*tm)) / (f32::from(*ti) - f32::from(*tm));
                     }
                 }
-                acc += *vi * w;
+                tap.w[i] = w;
             }
-            acc
         }
     }
+    tap
 }
 
 /// The cells of `n_p2` P2 symbols' carriers (`c_ps` each, one after the
@@ -670,6 +887,32 @@ pub fn cp_peak(
     Some((at as f64 + sub, best, best_c))
 }
 
+/// `e^{j(a0 + k·da)}` as a single-precision phasor.
+fn cis(a: f64) -> Iq {
+    Iq::new(a.cos() as f32, a.sin() as f32)
+}
+
+/// `x[k] *= e^{j(a0 + k·da)}`: a turning phasor by recurrence in place of a
+/// sine and cosine for every sample. Four chains run side by side so that
+/// their multiplies overlap, and each block of 256 starts afresh from the exact
+/// angle, so that the single-precision recurrence never drifts.
+pub fn ramp(x: &mut [Iq], a0: f64, da: f64) {
+    const BLOCK: usize = 256;
+    let step4 = cis(4.0 * da);
+    for (b, block) in x.chunks_mut(BLOCK).enumerate() {
+        let a = a0 + (b * BLOCK) as f64 * da;
+        let mut z = [cis(a), cis(a + da), cis(a + 2.0 * da), cis(a + 3.0 * da)];
+        for quad in block.chunks_mut(4) {
+            for (v, w) in quad.iter_mut().zip(&z) {
+                *v *= *w;
+            }
+            for w in &mut z {
+                *w *= step4;
+            }
+        }
+    }
+}
+
 /// The transform of symbols' windows, for one FFT size.
 pub struct SymbolFft {
     pub n: usize,
@@ -709,30 +952,21 @@ impl SymbolFft {
         let pos = symbol_start + (g - early) as f64;
         let s = pos.round() as usize;
         let frac = pos - s as f64;
-        let w = -std::f64::consts::TAU * eps / n as f64;
-        let step = Iq::new(w.cos() as f32, w.sin() as f32);
-        let mut rot = Iq::new(1.0, 0.0);
-        for (k, (b, x)) in self.buf.iter_mut().zip(&y[s..s + n]).enumerate() {
-            *b = *x * rot;
-            rot *= step;
-            if k % 256 == 255 {
-                let ph = w * (k + 1) as f64;
-                rot = Iq::new(ph.cos() as f32, ph.sin() as f32);
-            }
-        }
+        self.buf.copy_from_slice(&y[s..s + n]);
+        ramp(&mut self.buf, 0.0, -std::f64::consts::TAU * eps / n as f64);
         self.plan
             .process_with_scratch(&mut self.buf, &mut self.scratch);
         let mid = (c_ps - 1) / 2;
-        let (mid_i, n_i) = (mid as isize, n as isize);
+        // The carriers are the bins around DC: the negative ones at the end of
+        // the transform's output come first.
+        let start = out.len();
+        out.extend_from_slice(&self.buf[n - mid..]);
+        out.extend_from_slice(&self.buf[..c_ps - mid]);
         // A window `frac` samples later than the symbol's true place sees each
         // carrier advanced; the start's earliness is the same for every
         // symbol and left to the channel estimate.
         let dphi = std::f64::consts::TAU * frac / n as f64;
-        for k in 0..c_ps {
-            let bin = (k as isize - mid_i).rem_euclid(n_i) as usize;
-            let ph = dphi * (k as f64 - mid as f64);
-            out.push(self.buf[bin] * Iq::new(ph.cos() as f32, ph.sin() as f32));
-        }
+        ramp(&mut out[start..], -dphi * mid as f64, dphi);
     }
 }
 
@@ -743,28 +977,39 @@ impl SymbolFft {
 /// allows (±3·10⁻³ rad a carrier is ±15 samples at 32K) for the best coherent
 /// sum, then refined.
 fn align(d: &[Iq], sel: &[usize], cps: &[usize], mid: usize) -> (f64, f64) {
+    const STEPS: usize = 300;
+    const RANGE: f64 = 6e-3;
     let coherent = |slope: f64| -> Iq {
         let mut acc = Iq::new(0.0, 0.0);
         for &i in sel {
-            let ph = -slope * (cps[i] as f64 - mid as f64);
-            acc += d[i] * Iq::new(ph.cos() as f32, ph.sin() as f32);
+            acc += d[i] * cis(-slope * (cps[i] as f64 - mid as f64));
         }
         acc
     };
+    // The coarse grid, a turning phasor for each pilot along it.
+    let (s0, delta) = (-0.5 * RANGE, RANGE / STEPS as f64);
+    let mut sums = [Iq::new(0.0, 0.0); STEPS + 1];
+    for &i in sel {
+        let x = cps[i] as f64 - mid as f64;
+        let mut z = cis(-s0 * x);
+        let w = cis(-delta * x);
+        for a in sums.iter_mut() {
+            *a += d[i] * z;
+            z *= w;
+        }
+    }
     let (mut best, mut best_s) = (0f32, 0f64);
-    let steps = 300;
-    for i in 0..=steps {
-        let s = (i as f64 / steps as f64 - 0.5) * 6e-3;
-        let m = coherent(s).norm();
-        if m > best {
-            (best, best_s) = (m, s);
+    for (m, a) in sums.iter().enumerate() {
+        let p = a.norm_sqr();
+        if p > best {
+            (best, best_s) = (p, s0 + m as f64 * delta);
         }
     }
     // Refine: a few halvings around the best.
-    let mut width = 6e-3 / steps as f64;
+    let mut best = best.sqrt();
+    let mut width = delta;
     for _ in 0..12 {
-        let candidates = [best_s - width * 0.5, best_s, best_s + width * 0.5];
-        for c in candidates {
+        for c in [best_s - width * 0.5, best_s + width * 0.5] {
             let m = coherent(c).norm();
             if m > best {
                 (best, best_s) = (m, c);

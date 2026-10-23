@@ -185,6 +185,13 @@ impl BitMap {
         }
     }
 
+    /// [`Self::gather`] for quantised LLRs.
+    pub fn gather_q(&self, cell_llr: &[i8], codeword_llr: &mut [i8]) {
+        for (&cw, &l) in self.label_to_cw.iter().zip(cell_llr) {
+            codeword_llr[cw as usize] = l;
+        }
+    }
+
     /// A codeword's LLRs from the cells' (`cells · bits` of them, label bit
     /// order): the way back.
     pub fn gather(&self, cell_llr: &[f32], codeword_llr: &mut [f32]) {

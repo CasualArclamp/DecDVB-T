@@ -3,9 +3,11 @@
 //! interleavers undone, each FEC block decoded (LDPC, BCH) on as many threads
 //! as asked, and the BBFRAMEs unpacked.
 
+use std::time::{Duration, Instant};
+
 use decdvbt_core::{CodeRate, FecFrame, Iq};
 use decdvbt_fec::t2::bbframe::{TS_LEN, Unpacker};
-use decdvbt_fec::t2::plp::{BlockStats, PlpCoder};
+use decdvbt_fec::t2::plp::{BlockStats, DecodeTimes, PlpCoder};
 use decdvbt_fec::t2::qam::Qam;
 use decdvbt_fec::t2::timeint::{CellInterleaver, deinterleave_frame, ti_block_sizes};
 use decdvbt_ofdm::t2::l1::PlpConfig;
@@ -70,6 +72,9 @@ pub struct FrameStats {
     pub ldpc_iterations: u64,
     pub bch_corrected: u64,
     pub packets: usize,
+    /// Wall time (summed over the threads) of the stages.
+    pub deinterleave: Duration,
+    pub blocks_time: DecodeTimes,
 }
 
 pub struct PlpDecoder {
@@ -116,10 +121,12 @@ impl PlpDecoder {
         if blocks == 0 || end > cells.len() {
             return None;
         }
+        let t_di = Instant::now();
         let sizes = ti_block_sizes(blocks, self.params.ti_blocks, false);
         let columns = self.params.ti_blocks != 0;
         let rx = deinterleave_frame(&self.ci, &sizes, columns, &cells[start..end]);
         let rxv = deinterleave_frame(&self.ci, &sizes, columns, &var[start..end]);
+        let deinterleave = t_di.elapsed();
 
         let bb_len = self.workers[0].bbframe_bytes();
         let mut frames: Vec<Option<(Vec<u8>, BlockStats)>> = vec![None; blocks];
@@ -151,8 +158,12 @@ impl PlpDecoder {
         });
         let mut stats = FrameStats {
             blocks,
+            deinterleave,
             ..Default::default()
         };
+        for w in &mut self.workers {
+            stats.blocks_time += w.take_times();
+        }
         let before = out.len();
         for f in frames {
             match f {
