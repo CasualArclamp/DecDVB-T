@@ -51,7 +51,7 @@ struct Options {
     assume: Option<Mode>,
     /// Start with the channel panels closed.
     no_channel: bool,
-    /// Start with the receiver decoding.
+    /// Start with the receiver decoding (on unless `--no-decode`).
     decode: bool,
 }
 
@@ -66,7 +66,7 @@ impl Options {
             fps: 15.0,
             assume: None,
             no_channel: false,
-            decode: false,
+            decode: true,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -86,6 +86,7 @@ impl Options {
                 }
                 "--no-channel" => o.no_channel = true,
                 "--decode" => o.decode = true,
+                "--no-decode" => o.decode = false,
                 "--fps" => o.fps = value("frames a second")?.parse().map_err(|_| "bad --fps")?,
                 "--after" => o.after = value("seconds")?.parse().map_err(|_| "bad --after")?,
                 f if !f.starts_with("--") => o.file = Some(f.into()),
@@ -108,7 +109,7 @@ fn main() -> eframe::Result {
             eprintln!("decdvbt-gui: {e}");
             eprintln!(
                 "usage: decdvbt-gui [capture.cs8] [--channel C26] [--rate MSPS] \
-                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] [--no-channel] [--decode]"
+                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] [--no-channel] [--no-decode]"
             );
             std::process::exit(2);
         }

@@ -21,10 +21,13 @@ pub struct Gains {
 
 impl Default for Gains {
     fn default() -> Self {
+        // What decodes DVB-T on the author's roof: the RF amplifier on (off,
+        // the front end's noise figure leaves 64-QAM undecodable), LNA 32,
+        // VGA 8 (peaks near 0.8 of full scale).
         Gains {
-            amp: false,
-            lna: 24,
-            vga: 20,
+            amp: true,
+            lna: 32,
+            vga: 8,
         }
     }
 }
