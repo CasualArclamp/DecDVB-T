@@ -112,12 +112,17 @@ pub fn ldpc_iteration_time(frame: FecFrame, rate: CodeRate) {
         .collect();
     let mut info = vec![0u8; p.n_bch / 8];
     let iterations = 20;
-    let t = Instant::now();
     let reps = 5;
-    for _ in 0..reps {
-        dec.decode(&llr, &mut info, iterations);
-    }
-    let per = t.elapsed().as_secs_f64() / (reps * iterations) as f64;
+    // The best of several rounds: a laptop's clocks and neighbours are noisy.
+    let per = (0..7)
+        .map(|_| {
+            let t = Instant::now();
+            for _ in 0..reps {
+                dec.decode(&llr, &mut info, iterations);
+            }
+            t.elapsed().as_secs_f64() / (reps * iterations) as f64
+        })
+        .fold(f64::MAX, f64::min);
     // Without iterating: the load, one syndrome check and the read-out.
     let t = Instant::now();
     for _ in 0..reps * 4 {

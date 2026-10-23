@@ -21,39 +21,40 @@
 //! The layers' semantics follow the portable code exactly: every extrinsic of
 //! a layer is gathered before any posterior is updated, and updates are
 //! differences.
+//!
+//! **Registers.** Two blocks at a time are taken through all of a layer's
+//! edges, so that each lane's two smallest magnitudes, argmin and sign
+//! product stay in registers instead of being loaded and stored for every
+//! edge: 58 µs an iteration against 75 for the pass-by-pass version (a chunk
+//! of one gave 63, of three 59, of four 61: more accumulators than registers).
 
 use std::arch::x86_64::*;
 
 use super::decoder::{LdpcDecoder, MSG_MAX, POST_MAX};
-use super::{GROUP_STRIDE, LANES};
+use super::{Edge, GROUP_STRIDE, LANES};
 
 /// 16-lane blocks in a group, the last one half real.
 const BLOCKS: usize = LANES.div_ceil(16);
-/// A block-padded group.
-const PADDED: usize = BLOCKS * 16;
 const _: () = assert!(LANES - (BLOCKS - 1) * 16 == 8);
+
+/// Entries of one edge's deltas, twice over, then room for a block's overshoot.
+const DM: usize = 2 * LANES + 16;
+/// Blocks a pass works on together (their accumulators stay in registers).
+const CHUNK: usize = 2;
 
 /// Working memory of the kernel.
 pub(crate) struct Scratch {
-    /// The extrinsics of a layer, one padded group per edge.
+    /// The extrinsics of a chunk of blocks, a chunk's width for each edge.
     t: Vec<i16>,
-    min1: [i16; PADDED],
-    min2: [i16; PADDED],
-    arg: [i16; PADDED],
-    sign: [i16; PADDED],
-    /// A layer's new deltas, twice over, then room for a block's overshoot.
-    twice: [i16; 2 * LANES + 16],
+    /// Each edge's new deltas of a layer, twice over (see the module's note).
+    dm: Vec<i16>,
 }
 
 impl Scratch {
     pub(crate) fn new(max_degree: usize) -> Scratch {
         Scratch {
-            t: vec![0; max_degree * PADDED],
-            min1: [0; PADDED],
-            min2: [0; PADDED],
-            arg: [0; PADDED],
-            sign: [0; PADDED],
-            twice: [0; 2 * LANES + 16],
+            t: vec![0; max_degree * CHUNK * 16],
+            dm: vec![0; max_degree * DM],
         }
     }
 }
@@ -77,114 +78,87 @@ fn rotated_offset(c0: usize, s: usize) -> usize {
     if c0 >= s { c0 - s } else { c0 + LANES - s }
 }
 
-/// One layer of normalized min-sum, as `LdpcDecoder::layer`.
+/// One chunk of `NB` 16-lane blocks (b0, ...) of a layer: the extrinsics of
+/// every edge, the two smallest magnitudes, where the smallest is and the sign
+/// product (kept in registers across the edges), then each edge's new message
+/// and the change it makes to its group, which goes to `dm`.
 ///
 /// # Safety
-/// The CPU must have AVX2.
-#[target_feature(enable = "avx2,popcnt")]
-pub(super) unsafe fn layer(d: &mut LdpcDecoder, layer: usize) {
-    let (start, end) = (d.code.layer_start[layer], d.code.layer_start[layer + 1]);
-    let deg = end - start;
-    // Layer 0's last edge links p_(j−1) as group q−1 shifted by one; lane 0
-    // (check 0) has no such bit.
-    let corner = layer == 0;
-    let sc = &mut d.avx2;
-    let msg_max = _mm256_set1_epi16(MSG_MAX);
-    let zero = _mm256_setzero_si256();
-
+/// The CPU must have AVX2; the pointers are the decoder's (`v` the
+/// posteriors, `r` the messages, `t` and `dm` the scratch) with `edges` the
+/// layer's edges, `start` the first one's number.
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn chunk<const NB: usize>(
+    edges: &[Edge],
+    v: *const i16,
+    r: *mut i8,
+    t: *mut i16,
+    dm: *mut i16,
+    start: usize,
+    corner: bool,
+    b0: usize,
+    shift: __m128i,
+) {
+    let deg = edges.len();
     unsafe {
-        for b in 0..BLOCKS {
-            st(sc.min1.as_mut_ptr().add(b * 16), msg_max);
-            st(sc.min2.as_mut_ptr().add(b * 16), msg_max);
-            st(sc.arg.as_mut_ptr().add(b * 16), zero);
-            st(sc.sign.as_mut_ptr().add(b * 16), zero);
-        }
-
-        // Pass 1: every edge's extrinsic, the two smallest magnitudes and
-        // where the smallest is, and the sign product.
-        for e in 0..deg {
-            let edge = d.code.edges[start + e];
+        let msg_max = _mm256_set1_epi16(MSG_MAX);
+        let zero = _mm256_setzero_si256();
+        let (mut m1, mut m2) = ([msg_max; NB], [msg_max; NB]);
+        let (mut ar, mut sg) = ([zero; NB], [zero; NB]);
+        for (e, edge) in edges.iter().enumerate() {
             let s = edge.shift as usize;
-            let vg = d.v.as_ptr().add(edge.group as usize * GROUP_STRIDE);
-            let rp = d.r.as_ptr().add((start + e) * LANES);
-            let tp = sc.t.as_mut_ptr().add(e * PADDED);
+            let vg = v.add(edge.group as usize * GROUP_STRIDE);
+            let rp = r.add((start + e) * LANES);
+            let tp = t.add(e * CHUNK * 16);
             let ev = _mm256_set1_epi16(e as i16);
             let patch = corner && e == deg - 1;
-            for b in 0..BLOCKS {
-                let c0 = b * 16;
-                let v = ld(vg.add(rotated_offset(c0, s)));
+            for j in 0..NB {
+                let c0 = (b0 + j) * 16;
+                let x = ld(vg.add(rotated_offset(c0, s)));
                 let old = _mm256_cvtepi8_epi16(_mm_loadu_si128(rp.add(c0) as *const __m128i));
-                let mut t = _mm256_sub_epi16(v, old);
-                if patch && b == 0 {
+                let mut tv = _mm256_sub_epi16(x, old);
+                if patch && b0 + j == 0 {
                     // A certain 0: changes neither the sign product nor the
                     // minima.
-                    t = _mm256_insert_epi16::<0>(t, POST_MAX);
+                    tv = _mm256_insert_epi16::<0>(tv, POST_MAX);
                 }
-                st(tp.add(c0), t);
-                let a = _mm256_min_epi16(_mm256_abs_epi16(t), msg_max);
-                let m1 = ld(sc.min1.as_ptr().add(c0));
-                let m2 = ld(sc.min2.as_ptr().add(c0));
-                let ar = ld(sc.arg.as_ptr().add(c0));
-                let sg = ld(sc.sign.as_ptr().add(c0));
-                let below1 = _mm256_cmpgt_epi16(m1, a);
-                st(
-                    sc.min2.as_mut_ptr().add(c0),
-                    _mm256_min_epi16(m2, _mm256_max_epi16(m1, a)),
-                );
-                st(sc.min1.as_mut_ptr().add(c0), _mm256_min_epi16(m1, a));
-                st(
-                    sc.arg.as_mut_ptr().add(c0),
-                    _mm256_blendv_epi8(ar, ev, below1),
-                );
-                st(sc.sign.as_mut_ptr().add(c0), _mm256_xor_si256(sg, t));
+                st(tp.add(16 * j), tv);
+                let a = _mm256_min_epi16(_mm256_abs_epi16(tv), msg_max);
+                let below1 = _mm256_cmpgt_epi16(m1[j], a);
+                m2[j] = _mm256_min_epi16(m2[j], _mm256_max_epi16(m1[j], a));
+                m1[j] = _mm256_min_epi16(m1[j], a);
+                ar[j] = _mm256_blendv_epi8(ar[j], ev, below1);
+                sg[j] = _mm256_xor_si256(sg[j], tv);
             }
         }
         // Normalized min-sum, in integers: m − m/2^norm_shift.
-        let shift = _mm_cvtsi32_si128(d.norm_shift as i32);
-        for b in 0..BLOCKS {
-            let c0 = b * 16;
-            let m1 = ld(sc.min1.as_ptr().add(c0));
-            let m2 = ld(sc.min2.as_ptr().add(c0));
-            st(
-                sc.min1.as_mut_ptr().add(c0),
-                _mm256_sub_epi16(m1, _mm256_sra_epi16(m1, shift)),
-            );
-            st(
-                sc.min2.as_mut_ptr().add(c0),
-                _mm256_sub_epi16(m2, _mm256_sra_epi16(m2, shift)),
-            );
+        for j in 0..NB {
+            m1[j] = _mm256_sub_epi16(m1[j], _mm256_sra_epi16(m1[j], shift));
+            m2[j] = _mm256_sub_epi16(m2[j], _mm256_sra_epi16(m2[j], shift));
         }
-
-        // Pass 2: the new messages and the change each makes to its group.
-        let post_max = _mm256_set1_epi16(POST_MAX);
-        let post_min = _mm256_set1_epi16(-POST_MAX);
-        for e in 0..deg {
-            let edge = d.code.edges[start + e];
-            let s = edge.shift as usize;
-            let rp = d.r.as_mut_ptr().add((start + e) * LANES);
-            let tp = sc.t.as_ptr().add(e * PADDED);
-            let tw = sc.twice.as_mut_ptr();
+        for (e, _) in edges.iter().enumerate() {
+            let rp = r.add((start + e) * LANES);
+            let tp = t.add(e * CHUNK * 16);
+            let tw = dm.add(e * DM);
             let ev = _mm256_set1_epi16(e as i16);
             let patch = corner && e == deg - 1;
-            for b in 0..BLOCKS {
-                let c0 = b * 16;
-                let t = ld(tp.add(c0));
-                let m1 = ld(sc.min1.as_ptr().add(c0));
-                let m2 = ld(sc.min2.as_ptr().add(c0));
-                let ar = ld(sc.arg.as_ptr().add(c0));
-                let sg = ld(sc.sign.as_ptr().add(c0));
+            for j in 0..NB {
+                let blk = b0 + j;
+                let c0 = blk * 16;
+                let tv = ld(tp.add(16 * j));
                 // The smallest of the other edges, with the sign of the
                 // product without this edge's own.
-                let mag = _mm256_blendv_epi8(m1, m2, _mm256_cmpeq_epi16(ar, ev));
-                let neg = _mm256_srai_epi16::<15>(_mm256_xor_si256(sg, t));
+                let mag = _mm256_blendv_epi8(m1[j], m2[j], _mm256_cmpeq_epi16(ar[j], ev));
+                let neg = _mm256_srai_epi16::<15>(_mm256_xor_si256(sg[j], tv));
                 let new = _mm256_sub_epi16(_mm256_xor_si256(mag, neg), neg);
                 let old = _mm256_cvtepi8_epi16(_mm_loadu_si128(rp.add(c0) as *const __m128i));
                 let mut delta = _mm256_sub_epi16(new, old);
-                if patch && b == 0 {
+                if patch && blk == 0 {
                     delta = _mm256_insert_epi16::<0>(delta, 0);
                 }
                 let lo = _mm256_castsi256_si128(new);
-                if b + 1 < BLOCKS {
+                if blk + 1 < BLOCKS {
                     let hi = _mm256_extracti128_si256::<1>(new);
                     _mm_storeu_si128(rp.add(c0) as *mut __m128i, _mm_packs_epi16(lo, hi));
                     st(tw.add(c0), delta);
@@ -197,8 +171,47 @@ pub(super) unsafe fn layer(d: &mut LdpcDecoder, layer: usize) {
                     _mm_storeu_si128(tw.add(LANES + c0) as *mut __m128i, dl);
                 }
             }
-            // Add the deltas to the group, in its own lane order.
-            let vg = d.v.as_mut_ptr().add(edge.group as usize * GROUP_STRIDE);
+        }
+    }
+}
+
+/// One layer of normalized min-sum, as `LdpcDecoder::layer`.
+///
+/// # Safety
+/// The CPU must have AVX2.
+#[target_feature(enable = "avx2,popcnt")]
+pub(super) unsafe fn layer(d: &mut LdpcDecoder, layer: usize) {
+    let (start, end) = (d.code.layer_start[layer], d.code.layer_start[layer + 1]);
+    // Layer 0's last edge links p_(j−1) as group q−1 shifted by one; lane 0
+    // (check 0) has no such bit.
+    let corner = layer == 0;
+    let edges = &d.code.edges[start..end];
+    let sc = &mut d.avx2;
+    let (v, r) = (d.v.as_mut_ptr(), d.r.as_mut_ptr());
+    let (t, dm) = (sc.t.as_mut_ptr(), sc.dm.as_mut_ptr());
+
+    unsafe {
+        // Every edge's extrinsic, then every edge's message, a chunk of blocks
+        // at a time: all of the layer's extrinsics are gathered before any
+        // posterior is changed.
+        let shift = _mm_cvtsi32_si128(d.norm_shift as i32);
+        let mut b = 0;
+        while b + CHUNK < BLOCKS {
+            chunk::<CHUNK>(edges, v, r, t, dm, start, corner, b, shift);
+            b += CHUNK;
+        }
+        while b < BLOCKS {
+            chunk::<1>(edges, v, r, t, dm, start, corner, b, shift);
+            b += 1;
+        }
+
+        // Add each edge's deltas to its group, in the group's own lane order.
+        let post_max = _mm256_set1_epi16(POST_MAX);
+        let post_min = _mm256_set1_epi16(-POST_MAX);
+        for (e, edge) in edges.iter().enumerate() {
+            let s = edge.shift as usize;
+            let tw = dm.add(e * DM);
+            let vg = v.add(edge.group as usize * GROUP_STRIDE);
             for b in 0..BLOCKS - 1 {
                 let i0 = b * 16;
                 let sum = _mm256_add_epi16(ld(vg.add(i0)), ld(tw.add(i0 + s)));
