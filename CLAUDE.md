@@ -45,6 +45,10 @@ package folder even before the PATH is refreshed).
 - **Licence:** GPL-3.0-or-later. Algorithms are borrowed from GPL-3 code
   (gr-dtv, OnAir, Ron Economos's DVB-T2 work, DecSAT, DecDRM). Credit the
   source in a comment on the function or module that borrows from it.
+- The GUI keeps its settings in `%APPDATA%\DecDVB-T\prefs.txt` (channel, gains,
+  view, SDR window, learned offsets). Screenshot runs do not write it, but
+  live runs, the optimiser and the app itself do: do not delete it without
+  looking, it may be the user's.
 - **Never commit** IQ captures, reference clones (`reference/`), or built exes.
 - **The specs are the authority:** ETSI EN 300 744 (DVB-T), EN 302 755
   (DVB-T2), TS 102 831 (T2 implementation guidelines). Cite the clause or

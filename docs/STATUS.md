@@ -733,3 +733,20 @@ map, the heat rows and smooth pacing in the engine thread, the sounder's map in
 the thread, the SDR front end, the optimiser, the error maps). New test aids:
 `--bottom maps|history`, `--window sdr`, `--optimise` (start the optimiser
 after the lock), `--fps 60`.
+
+## Remembered settings (2026-10-23)
+
+Asked for: remember the last channel, the gains, and whatever else is worth
+keeping. The app now writes `%APPDATA%\DecDVB-T\prefs.txt` (beside the SDR
+window's settings, the learned carrier offsets and the player's volume) with:
+the radio's channel and exact frequency (so a carrier found off its centre, or
+a frequency typed on the dial, comes back), the source (HackRF or the IQ file
+last opened, offered again, not started), the HackRF's sample rate, LNA, VGA
+and RF amp, the decode switch, the bottom panel, the display rate, the Doppler
+range, and the window's size. A change is written once it has held still for
+0.8 s (a gain dragged across many values writes once) and again on exit, and
+nothing is started by it: the app still waits for Start. The command line wins
+over what was kept (and what it gives is kept in turn). **Screenshot runs
+neither read the view settings nor write anything**, so a test comes out the
+same each time and leaves the next real run as it found it; they do read the
+gains, the channel and the SDR settings, as the radio is the user's.

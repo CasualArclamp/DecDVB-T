@@ -22,6 +22,7 @@ mod freq_display;
 mod heatmaps;
 mod player;
 mod prefs;
+mod remember;
 mod scopes;
 mod sdr;
 mod services;
@@ -61,6 +62,8 @@ const SMOOTH_FPS: f64 = 45.0;
 /// [`SNAP_HZ`] of one is taken to be on it.
 const PLAN_OFFSETS_HZ: [f64; 5] = [-333_333.0, -166_667.0, 0.0, 166_667.0, 333_333.0];
 const SNAP_HZ: f64 = 40e3;
+/// The display rates the list offers.
+const FPS_CHOICES: [f64; 6] = [5.0, 10.0, 15.0, 20.0, 30.0, 60.0];
 /// HackRF sample rates with the least clock jitter that hold a channel.
 const RATES_MSPS: [f64; 4] = [10.0, 12.5, 16.0, 20.0];
 /// Half a channel plus a margin: a channel is received without retuning only
@@ -97,6 +100,14 @@ struct Options {
     record: bool,
     /// Run the gain optimiser once the receiver has locked (a test aid).
     optimise: bool,
+    /// Which view settings the command line gave: what it did not is what
+    /// was kept from the last run (but a screenshot, which has to come out
+    /// the same each time, keeps nothing).
+    bottom_given: bool,
+    fps_given: bool,
+    decode_given: bool,
+    /// What was kept from the last run.
+    kept: remember::Saved,
 }
 
 /// What the bottom panel shows.
@@ -114,6 +125,29 @@ enum Bottom {
     /// constellation point.
     Maps,
     Hidden,
+}
+
+impl Bottom {
+    fn name(self) -> &'static str {
+        match self {
+            Bottom::Scopes => "scopes",
+            Bottom::Channel => "channel",
+            Bottom::Maps => "maps",
+            Bottom::Heat => "history",
+            Bottom::Hidden => "none",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Bottom> {
+        Some(match s {
+            "scopes" => Bottom::Scopes,
+            "channel" => Bottom::Channel,
+            "maps" => Bottom::Maps,
+            "history" | "heat" => Bottom::Heat,
+            "none" => Bottom::Hidden,
+            _ => return None,
+        })
+    }
 }
 
 impl Options {
@@ -136,6 +170,10 @@ impl Options {
             udp: None,
             record: false,
             optimise: false,
+            bottom_given: false,
+            fps_given: false,
+            decode_given: false,
+            kept: remember::Saved::default(),
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -153,20 +191,16 @@ impl Options {
                     let v = value("a mode, e.g. 64qam-2/3-8k-1/32")?;
                     o.assume = Some(Mode::parse(&v)?);
                 }
-                "--no-channel" => o.bottom = Bottom::Hidden,
+                "--no-channel" => {
+                    o.bottom = Bottom::Hidden;
+                    o.bottom_given = true;
+                }
                 "--bottom" => {
-                    o.bottom = match value("scopes, channel, maps, history or none")?.as_str() {
-                        "scopes" => Bottom::Scopes,
-                        "channel" => Bottom::Channel,
-                        "maps" => Bottom::Maps,
-                        "history" | "heat" => Bottom::Heat,
-                        "none" => Bottom::Hidden,
-                        v => {
-                            return Err(format!(
-                                "--bottom: not scopes, channel, maps, history or none: {v}"
-                            ));
-                        }
-                    };
+                    let v = value("scopes, channel, maps, history or none")?;
+                    o.bottom = Bottom::parse(&v).ok_or(format!(
+                        "--bottom: not scopes, channel, maps, history or none: {v}"
+                    ))?;
+                    o.bottom_given = true;
                 }
                 "--window" => o.window = Some(value("ts, epg or sdr")?),
                 "--http" => o.http = Some(value("an address, e.g. 127.0.0.1:8001")?),
@@ -184,14 +218,40 @@ impl Options {
                             .map_err(|_| "bad --service")?,
                     )
                 }
-                "--decode" => o.decode = true,
-                "--no-decode" => o.decode = false,
-                "--fps" => o.fps = value("frames a second")?.parse().map_err(|_| "bad --fps")?,
+                "--decode" | "--no-decode" => {
+                    o.decode = a == "--decode";
+                    o.decode_given = true;
+                }
+                "--fps" => {
+                    o.fps = value("frames a second")?.parse().map_err(|_| "bad --fps")?;
+                    o.fps_given = true;
+                }
                 "--after" => o.after = value("seconds")?.parse().map_err(|_| "bad --after")?,
                 f if !f.starts_with("--") => o.file = Some(f.into()),
                 _ => return Err(format!("unknown option {a}")),
             }
         }
+        let kept = remember::Saved::load();
+        // The view as it was left, where the command line said nothing; a
+        // screenshot, which has to come out the same each time, keeps none.
+        if o.screenshot.is_none() {
+            if !o.bottom_given
+                && let Some(b) = kept.bottom.as_deref().and_then(Bottom::parse)
+            {
+                o.bottom = b;
+            }
+            if !o.fps_given
+                && let Some(f) = kept.fps.filter(|f| FPS_CHOICES.contains(f))
+            {
+                o.fps = f;
+            }
+            if !o.decode_given
+                && let Some(d) = kept.decode
+            {
+                o.decode = d;
+            }
+        }
+        o.kept = kept;
         Ok(o)
     }
 }
@@ -272,8 +332,13 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
+    let (w, h) = opts
+        .kept
+        .window
+        .filter(|_| opts.screenshot.is_none())
+        .unwrap_or((1400, 860));
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1400.0, 860.0])
+        .with_inner_size([w as f32, h as f32])
         .with_min_inner_size([900.0, 560.0])
         .with_title("DecDVB-T")
         .with_drag_and_drop(true);
@@ -416,20 +481,40 @@ struct App {
     heat: heatmaps::HeatView,
     errors: errormaps::ErrorMaps,
     heat_sent: Option<f64>,
+    /// What is kept from run to run (none for a screenshot), the radio's
+    /// channel and frequency as they were when the source last was the
+    /// radio, and the window's size.
+    keeper: Option<remember::Keeper>,
+    radio: (u8, f64),
+    window_size: (u32, u32),
 }
 
 impl App {
-    fn new(opts: Options) -> App {
-        let channel = opts.channel.unwrap_or(26);
+    fn new(mut opts: Options) -> App {
+        let kept = std::mem::take(&mut opts.kept);
+        // Where the radio was left, unless the command line says where to go.
+        let by_hand = opts.channel.is_some() || opts.file.is_some();
+        let mut channel = opts.channel.or(kept.channel).unwrap_or(26);
         let sdr = sdr::SdrSettings::load();
         let offsets = load_offsets();
-        let tune_hz = uhf_centre_hz(channel).map_or(0.0, |c| {
+        let mut tune_hz = uhf_centre_hz(channel).map_or(0.0, |c| {
             c + if sdr.auto_centre {
                 offsets.get(&channel).copied().unwrap_or(0.0)
             } else {
                 0.0
             }
         });
+        if !by_hand && let Some(h) = kept.tune_hz {
+            tune_hz = h;
+            channel = uhf_channel_at(h).unwrap_or(channel);
+        }
+        // The capture last opened (offered again, not opened).
+        let file = kept.file.clone().filter(|f| f.exists());
+        let kind = if !by_hand && kept.file_source && file.is_some() {
+            SourceKind::File
+        } else {
+            SourceKind::HackRf
+        };
         let mut app = App {
             started: Instant::now(),
             shot_sent: false,
@@ -440,14 +525,17 @@ impl App {
             last_frame: None,
             delay_ms: 1000.0 / 15.0,
             session: None,
-            kind: SourceKind::HackRf,
+            kind,
             channel,
             channel_text: format!("C{channel}"),
-            rate_msps: opts.rate_msps.unwrap_or(10.0),
-            gains: Gains::default(),
-            file: None,
-            file_centre_mhz: 0.0,
-            file_rate_msps: 10.0,
+            rate_msps: opts
+                .rate_msps
+                .or(kept.rate_msps.filter(|r| RATES_MSPS.contains(r)))
+                .unwrap_or(10.0),
+            gains: kept.gains.unwrap_or_default(),
+            file,
+            file_centre_mhz: kept.file_centre_mhz.unwrap_or(0.0),
+            file_rate_msps: kept.file_rate_msps.unwrap_or(10.0),
             centre_hz: 0.0,
             span_hz: 0.0,
             vfo_hz: Some(tune_hz).filter(|h| *h > 0.0),
@@ -511,15 +599,76 @@ impl App {
             heat: heatmaps::HeatView::default(),
             errors: errormaps::ErrorMaps::default(),
             heat_sent: None,
+            keeper: None,
+            radio: (channel, tune_hz),
+            window_size: kept.window.unwrap_or((1400, 860)),
             opts,
         };
+        if app.opts.screenshot.is_none()
+            && let Some(d) = kept
+                .doppler_hz
+                .filter(|d| channel_view::DOPPLER_VIEWS.contains(d))
+        {
+            app.chan_view.doppler_view = d;
+        }
         // Started from the command line: begin at once.
         if let Some(f) = app.opts.file.clone() {
             app.open_file(f);
         } else if app.opts.channel.is_some() {
             app.start();
         }
+        // From here what changes is kept (not by a screenshot: a test run
+        // must leave the next real one as it found it).
+        if app.opts.screenshot.is_none() {
+            app.keeper = Some(remember::Keeper::new());
+        }
         app
+    }
+
+    /// What is kept from run to run, as the app is now.
+    fn snapshot(&self) -> remember::Snapshot {
+        let (channel, tune_hz) = if self.kind == SourceKind::HackRf {
+            (self.channel, self.tune_hz)
+        } else {
+            self.radio
+        };
+        remember::Snapshot {
+            channel,
+            tune_hz: tune_hz.round() as i64,
+            file_source: self.kind == SourceKind::File,
+            rate_khz: (self.rate_msps * 1e3).round() as i64,
+            gains: self.gains,
+            file: self
+                .file
+                .as_ref()
+                .map_or(String::new(), |p| p.display().to_string()),
+            file_centre_hz: (self.file_centre_mhz * 1e6).round() as i64,
+            file_rate_khz: (self.file_rate_msps * 1e3).round() as i64,
+            decode: self.decode,
+            bottom: self.bottom.name().to_string(),
+            fps: self.opts.fps as u32,
+            doppler_hz: self.chan_view.doppler_view as u32,
+            window: self.window_size,
+        }
+    }
+
+    /// Once a frame: note what is to be kept (written when it has settled).
+    fn remember(&mut self, ctx: &egui::Context) {
+        if self.keeper.is_none() {
+            return;
+        }
+        if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
+            self.window_size = (r.width().round() as u32, r.height().round() as u32);
+        }
+        if self.kind == SourceKind::HackRf {
+            self.radio = (self.channel, self.tune_hz);
+        }
+        let now = self.snapshot();
+        if let Some(k) = self.keeper.as_mut()
+            && let Some(after) = k.look(now, Instant::now())
+        {
+            ctx.request_repaint_after(after);
+        }
     }
 
     // ---- sources --------------------------------------------------------
@@ -1549,7 +1698,7 @@ impl App {
                 .selected_text(format!("{} fps", self.opts.fps))
                 .width(70.0)
                 .show_ui(ui, |ui| {
-                    for f in [5.0, 10.0, 15.0, 20.0, 30.0, 60.0] {
+                    for f in FPS_CHOICES {
                         let label = if f >= SMOOTH_FPS {
                             format!("{f} fps (smooth)")
                         } else {
@@ -1695,6 +1844,16 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.kind == SourceKind::HackRf {
+            self.radio = (self.channel, self.tune_hz);
+        }
+        let now = self.snapshot();
+        if let Some(k) = self.keeper.as_mut() {
+            k.flush(now);
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let t0 = Instant::now();
         // A file dropped on the window is opened.
@@ -1724,6 +1883,7 @@ impl eframe::App for App {
         }
         self.optimise_tick();
         self.apply_dial(ctx);
+        self.remember(ctx);
         self.cpu_percent = self.cpu.poll();
         self.handle_screenshot(ctx);
         if self.session.is_some() || self.opts.screenshot.is_some() {
