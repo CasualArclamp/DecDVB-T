@@ -79,6 +79,9 @@ pub struct ReedSolomon {
     p: usize,
     /// Generator coefficients, g[0] the x^p term's (= 1), highest first.
     g: Vec<u8>,
+    /// `times[i][x]` = x·α^i: one lookup a byte per syndrome, the receiver's
+    /// hot path (most blocks are clean and cost nothing else).
+    times: Vec<[u8; 256]>,
 }
 
 impl ReedSolomon {
@@ -100,7 +103,13 @@ impl ReedSolomon {
             }
             g = next;
         }
-        ReedSolomon { n, k, p, g }
+        let times = (0..p)
+            .map(|i| {
+                let a = GF.pow(i);
+                std::array::from_fn(|x| GF.mul(x as u8, a))
+            })
+            .collect();
+        ReedSolomon { n, k, p, g, times }
     }
 
     /// DVB-S's RS(204, 188).
@@ -136,17 +145,12 @@ impl ReedSolomon {
         // Syndromes S_i = c(α^i), i = 0..p (Horner, highest degree first:
         // byte 0 is the coefficient of x^(n−1)).
         let mut s = vec![0u8; self.p];
-        let mut clean = true;
-        for (i, si) in s.iter_mut().enumerate() {
-            let a = GF.pow(i);
-            let mut acc = 0u8;
-            for &b in block.iter() {
-                acc = GF.mul(acc, a) ^ b;
+        for &b in block.iter() {
+            for (si, t) in s.iter_mut().zip(&self.times) {
+                *si = t[*si as usize] ^ b;
             }
-            *si = acc;
-            clean &= acc == 0;
         }
-        if clean {
+        if s.iter().all(|&x| x == 0) {
             return Ok(0);
         }
         // Berlekamp–Massey: error locator Λ(x), lowest degree first.

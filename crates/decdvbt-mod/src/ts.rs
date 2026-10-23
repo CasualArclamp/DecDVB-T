@@ -14,8 +14,7 @@ use std::path::Path;
 
 use decdvbt_core::crc::crc32_mpeg2;
 
-pub const TS_LEN: usize = 188;
-pub const TS_SYNC: u8 = 0x47;
+pub use decdvbt_fec::outer::{TS_LEN, TS_SYNC};
 
 pub const PID_PAT: u16 = 0x0000;
 pub const PID_NIT: u16 = 0x0010;

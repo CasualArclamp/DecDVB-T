@@ -16,8 +16,11 @@ cargo run --release -p decdvbt-cli -- scan                       # HackRF: which
 cargo run --release -p decdvbt-cli -- capture C26 --record x.cs8 # level, drops, CPU; optional IQ
 cargo run --release -p decdvbt-cli -- modulate --cn 25 --profile urban  # a DVB-T test signal file
 cargo run --release -p decdvbt-cli -- sound captures/c26_514.000MHz_10Msps.cs8  # lock, offsets, paths
+cargo run --release -p decdvbt-cli -- decode captures/c23_490.000MHz_10Msps_amp.cs8 -o out/c23.ts  # a transport stream, the services, RS and CPU stats
+cargo run --release -p decdvbt-cli -- capture C23 --amp --lna 32 --vga 8 --record x.cs8  # the RF amp must be on for DVB-T
+cargo run --release -p decdvbt-rx --example diag -- x.cs8   # per-symbol equaliser diagnostics (see its header)
 cargo run --release -p decdvbt-gui                               # the GUI
-cargo run --release -p decdvbt-gui -- captures/c26_514.000MHz_10Msps.cs8 --screenshot out/x.png
+cargo run --release -p decdvbt-gui -- captures/c23_490.000MHz_10Msps_amp.cs8 --decode --screenshot out/x.png
 ```
 
 Captures live in `captures/` and are named by their tuning

@@ -19,6 +19,7 @@ use decdvbt_core::{Iq, SampleFormat};
 use decdvbt_io::{IqFileWriter, IqSource};
 
 use decdvbt_rx::delay_doppler::DelayDoppler;
+use decdvbt_rx::receiver::{Receiver as OfdmReceiver, ReceiverConfig, ReceiverStatus};
 use decdvbt_rx::sounder::{Sounder, SounderConfig, Status as SounderStatus};
 
 use crate::meter::{Stage, StageLoad, StageMeter};
@@ -89,6 +90,9 @@ pub enum Command {
     /// stop it with `None`. It costs CPU only while it runs, so the GUI
     /// asks for it only while its panels are open.
     Sounder(Option<f64>),
+    /// Run the receiver on the signal at this RF frequency, Hz (lock, equalise,
+    /// decode to a transport stream), or stop it with `None`.
+    Decode(Option<f64>),
     /// Start recording to this file (cs8), or stop with `None`.
     Record(Option<PathBuf>),
 }
@@ -112,12 +116,38 @@ pub struct SounderUpdate {
     pub map: Option<Arc<DelayDoppler>>,
 }
 
+/// What the receiver has made, waiting for the GUI.
+#[derive(Default)]
+struct DecoderOut {
+    status: ReceiverStatus,
+    /// Transport packets (188 bytes each) not yet taken.
+    ts: Vec<u8>,
+    /// Packets made since the receiver was started, taken or not.
+    packets: u64,
+}
+
+/// What [`Rx::take_decoder`] hands over.
+#[derive(Default)]
+pub struct DecoderUpdate {
+    pub status: ReceiverStatus,
+    /// Transport packets decoded since the last call (188 bytes each).
+    pub ts: Vec<u8>,
+    /// Packets decoded since the receiver was started.
+    pub packets: u64,
+}
+
 struct Shared {
     rows: Mutex<VecDeque<Row>>,
     stats: Mutex<Stats>,
     sounder: Mutex<SounderOut>,
+    decoder: Mutex<DecoderOut>,
     stop: AtomicBool,
 }
+
+/// Transport stream kept for a consumer that is slow to collect it: about
+/// 2 MB, a second of a UK mux. What the consumer does not take in time is
+/// dropped, oldest first, and counted by the packet continuity it breaks.
+const MAX_QUEUED_TS: usize = 188 * 11_000;
 
 /// Rows kept for a GUI that is slow to collect them.
 const MAX_QUEUED_ROWS: usize = 100;
@@ -143,6 +173,7 @@ impl Rx {
                 ..Default::default()
             }),
             sounder: Mutex::new(SounderOut::default()),
+            decoder: Mutex::new(DecoderOut::default()),
             stop: AtomicBool::new(false),
         });
         let (cmd, cmd_rx) = mpsc::channel();
@@ -183,6 +214,16 @@ impl Rx {
             } else {
                 None
             },
+        }
+    }
+
+    /// What the receiver has made since the last call.
+    pub fn take_decoder(&self) -> DecoderUpdate {
+        let mut o = self.shared.decoder.lock().unwrap();
+        DecoderUpdate {
+            status: o.status.clone(),
+            ts: std::mem::take(&mut o.ts),
+            packets: o.packets,
         }
     }
 
@@ -246,6 +287,10 @@ fn run(
     // The sounder, with the RF frequency of the signal it was asked for.
     let mut sounder: Option<(Sounder, f64)> = None;
     let mut sounder_pub = Instant::now();
+    // The receiver, with the RF frequency of the signal it was asked for.
+    let mut decoder: Option<(OfdmReceiver, f64)> = None;
+    let mut decoder_pub = Instant::now();
+    let mut ts_scratch: Vec<u8> = Vec::new();
     let mut map_at = Instant::now();
     let started = Instant::now();
     let set_error = |e: String| sh.stats.lock().unwrap().error = Some(e);
@@ -255,6 +300,10 @@ fn run(
         let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
         Sounder::new(SounderConfig::new(rate, offset))
     };
+    let new_decoder = |vfo_hz: f64, centre: f64, rate: f64| {
+        let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
+        OfdmReceiver::new(ReceiverConfig::new(rate, offset))
+    };
 
     while !sh.stop.load(Ordering::Relaxed) {
         loop {
@@ -263,12 +312,19 @@ fn run(
                     sounder = vfo.map(|v| (new_sounder(v, source.center_freq(), rate), v));
                     *sh.sounder.lock().unwrap() = SounderOut::default();
                 }
+                Ok(Command::Decode(vfo)) => {
+                    decoder = vfo.map(|v| (new_decoder(v, source.center_freq(), rate), v));
+                    *sh.decoder.lock().unwrap() = DecoderOut::default();
+                }
                 Ok(Command::Retune(hz)) => match source.retune(hz) {
                     Ok(true) => {
                         tuning += 1;
                         sh.rows.lock().unwrap().clear();
                         if let Some((s, v)) = &mut sounder {
                             *s = new_sounder(*v, source.center_freq(), rate);
+                        }
+                        if let Some((d, v)) = &mut decoder {
+                            *d = new_decoder(*v, source.center_freq(), rate);
                         }
                     }
                     Ok(false) => {}
@@ -307,6 +363,9 @@ fn run(
                     if let Some((s, _)) = &mut sounder {
                         s.reset();
                     }
+                    if let Some((d, _)) = &mut decoder {
+                        d.reset();
+                    }
                     continue;
                 }
                 _ => {
@@ -337,6 +396,23 @@ fn run(
                     o.map = Some(Arc::new(m));
                     o.map_new = true;
                 }
+            }
+        }
+
+        if let Some((d, _)) = &mut decoder {
+            meter.time(Stage::Decoder, || {
+                d.push(&block, at);
+                d.take_ts(&mut ts_scratch);
+            });
+            if decoder_pub.elapsed() >= Duration::from_millis(100) {
+                decoder_pub = Instant::now();
+                let mut o = sh.decoder.lock().unwrap();
+                o.status = d.status().clone();
+                o.packets += (ts_scratch.len() / 188) as u64;
+                o.ts.append(&mut ts_scratch);
+                // A consumer that stops collecting does not make this grow.
+                let extra = o.ts.len().saturating_sub(MAX_QUEUED_TS) / 188 * 188;
+                o.ts.drain(..extra);
             }
         }
 
@@ -559,5 +635,74 @@ mod tests {
             at(c0),
             at(c3)
         );
+    }
+
+    /// The same kind of signal with the receiver on: it locks, reads the TPS
+    /// and hands over transport packets that are the stream that went in.
+    #[test]
+    fn the_receiver_runs_in_the_thread() {
+        use decdvbt_core::dvbt::Mode;
+        use decdvbt_io::IqFileReader;
+        use decdvbt_mod::channel::{Channel, Path as ChPath};
+        use decdvbt_mod::sim::{SimOptions, generate};
+        use decdvbt_mod::ts::check_test_payload;
+
+        let opts = SimOptions {
+            mode: Mode::parse("64qam-2/3-8k-1/32").unwrap(),
+            cell_id: None,
+            ts_file: None,
+            seconds: 2.4,
+            out_rate_hz: Some(10e6),
+            level_dbfs: -20.0,
+            channel: Channel {
+                paths: vec![ChPath::echo(0.0, 0.0), ChPath::echo(3.0, -9.0)],
+                cfo_hz: 90_000.0,
+                cn_db: Some(30.0),
+                ..Default::default()
+            },
+        };
+        let path = std::env::temp_dir().join("decdvbt-engine-decoder.cs8");
+        let mut w = decdvbt_io::IqFileWriter::create(&path, SampleFormat::Cs8).unwrap();
+        generate(&opts, |b| w.write(b).map_err(|e| e.to_string())).unwrap();
+        w.finish().unwrap();
+
+        let src = IqFileReader::open(&path, SampleFormat::Cs8, 10e6, 1 << 17)
+            .unwrap()
+            .with_center_freq(546e6);
+        let rx = Rx::start(Box::new(src), RxOptions::default(), None);
+        rx.send(Command::Decode(Some(546e6)));
+        let t0 = Instant::now();
+        let (mut ts, mut status) = (Vec::new(), None);
+        // Until a few thousand packets are in, before the file ends and the
+        // engine plays it again from the start (the counters would restart).
+        while t0.elapsed() < Duration::from_secs(5) && ts.len() < 188 * 3000 {
+            std::thread::sleep(Duration::from_millis(50));
+            let u = rx.take_decoder();
+            ts.extend(u.ts);
+            status = Some(u.status);
+        }
+        let u = rx.take_decoder();
+        ts.extend(u.ts);
+        let packets = u.packets;
+        drop(rx);
+        let _ = std::fs::remove_file(&path);
+        let st = status.expect("a status");
+        assert!(st.tracking && st.decoding, "{st:?}");
+        assert_eq!(
+            st.tps.unwrap().modulation,
+            decdvbt_core::dvbt::Modulation::Qam64
+        );
+        let counters: Vec<u32> = ts
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .filter_map(|p| check_test_payload(p))
+            .collect();
+        assert!(
+            counters.len() > 500,
+            "{} data packets of {packets}",
+            counters.len()
+        );
+        assert!(counters.windows(2).all(|w| w[1] == w[0] + 1));
     }
 }

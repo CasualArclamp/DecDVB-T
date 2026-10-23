@@ -16,13 +16,7 @@ use num_complex::Complex32;
 
 /// The code rate in the FEC crate's terms.
 pub fn conv_rate(r: Rate) -> conv::Rate {
-    match r {
-        Rate::R1_2 => conv::Rate::R1_2,
-        Rate::R2_3 => conv::Rate::R2_3,
-        Rate::R3_4 => conv::Rate::R3_4,
-        Rate::R5_6 => conv::Rate::R5_6,
-        Rate::R7_8 => conv::Rate::R7_8,
-    }
+    r.into()
 }
 
 pub struct InnerEncoder {

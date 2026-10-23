@@ -27,22 +27,13 @@ use decdvbt_core::Iq;
 use decdvbt_core::dvbt::{Bandwidth, FftSize, Guard};
 use decdvbt_ofdm::pilots::prbs;
 
-use crate::acquire::{self, Fft1, MIN_CONTRAST, bin_of, parabola, search_best};
 use crate::delay_doppler::{ChannelHistory, DelayDoppler};
-use crate::interp::{AFTER, BEFORE, Interpolator, Planar};
+use crate::interp::{Interpolator, Planar};
+use crate::lock::{ACQ_NATIVE, Failure, lock_on};
+use crate::symbol::{PAD, SymbolReader};
 
-/// Input samples taken to acquire, and the wait between attempts, seconds.
-const ACQ_NATIVE: usize = 58_000;
+/// The wait between attempts to acquire, seconds.
 const RETRY_S: f64 = 0.4;
-/// The timing search around the prediction, native samples either side.
-const SEARCH: usize = 32;
-/// Margin, input samples, either side of a wanted stretch for the
-/// interpolator.
-const PAD: usize = BEFORE + AFTER + 8;
-/// Loop gains: position, clock rate, carrier offset.
-const ALPHA: f64 = 0.25;
-const BETA: f64 = 0.02;
-const GAMMA: f64 = 0.03;
 /// Rows of power averaged into one fading row.
 const FADE_GROUP: usize = 4;
 /// Lock is lost after this many rows with no coherence.
@@ -122,24 +113,10 @@ struct Want {
 }
 
 struct Track {
-    n: usize,
-    g: usize,
-    per: usize,
-    delta: usize,
-    kmid: usize,
+    reader: SymbolReader,
     pilots: Vec<u16>,
     /// 3/4 · (1 − 2 w_k) for each pilot: the reciprocal of its value.
     inv: Vec<f32>,
-    /// Native position of the next symbol's guard start, predicted.
-    apex: f64,
-    rate: f64,
-    f_total: f64,
-    /// The rotation taken out so far, radians, at native position `rot_at`:
-    /// the integral of the carrier offset, so that a change of the offset
-    /// changes the phase's slope from then on and never jumps it.
-    rot_phase: f64,
-    rot_at: f64,
-    plan: Fft1,
     hist: ChannelHistory,
     group: Vec<f32>,
     group_n: usize,
@@ -159,6 +136,8 @@ pub struct Sounder {
     win_start: u64,
     filled: usize,
     track: Option<Track>,
+    /// The carriers of the symbol just read.
+    carriers: Vec<Iq>,
     fading: Vec<Vec<f32>>,
     status: Status,
     next_attempt: u64,
@@ -178,6 +157,7 @@ impl Sounder {
             win_start: 0,
             filled: 0,
             track: None,
+            carriers: Vec::new(),
             fading: Vec::new(),
             status: Status::default(),
             next_attempt: 0,
@@ -262,16 +242,6 @@ impl Sounder {
         self.set_want(start, len);
     }
 
-    /// Native position (absolute, fractional) of window sample `j`.
-    fn native_of_window(&self, j: f64) -> f64 {
-        (self.win_start as f64 + j) / self.rho
-    }
-
-    /// Window coordinate of an absolute native position.
-    fn window_of_native(&self, native: f64) -> f64 {
-        native * self.rho - self.win_start as f64
-    }
-
     fn process(&mut self) {
         self.planar.set(&self.win);
         self.status.tracking = self.track.is_some();
@@ -284,59 +254,35 @@ impl Sounder {
 
     fn try_acquire(&mut self) {
         self.status.attempts += 1;
-        // The window at the signal's rate, from the first sample the
-        // interpolator can use, the vfo offset taken out.
-        let first = PAD as f64;
-        let native0 = self.native_of_window(first);
-        let n_native = ((self.win.len() - 2 * PAD) as f64 / self.rho) as usize;
-        let mut x = Vec::with_capacity(n_native);
-        self.interp
-            .resample_planar(&self.planar, first, self.rho, n_native, &mut x);
-        if self.cfg.vfo_offset_hz != 0.0 {
-            let w = -std::f64::consts::TAU * self.cfg.vfo_offset_hz / self.fs_native;
-            let t0 = native0;
-            let mut ph = (w * t0).rem_euclid(std::f64::consts::TAU);
-            let step = Iq::new(w.cos() as f32, w.sin() as f32);
-            let mut rot = Iq::new(ph.cos() as f32, ph.sin() as f32);
-            for (j, v) in x.iter_mut().enumerate() {
-                *v *= rot;
-                rot *= step;
-                if j % 512 == 511 {
-                    ph = (w * (t0 + j as f64 + 1.0)).rem_euclid(std::f64::consts::TAU);
-                    rot = Iq::new(ph.cos() as f32, ph.sin() as f32);
-                }
-            }
-        }
         let next = self.win_start + self.win.len() as u64;
         self.next_attempt = self.win_start + (RETRY_S * self.cfg.fs_in) as u64;
-        let Some(cp) = search_best(&x) else {
-            self.after_failed_attempt();
-            return;
-        };
-        self.status.contrast = self.status.contrast.max(cp.contrast);
-        if cp.contrast < MIN_CONTRAST {
-            self.after_failed_attempt();
-            return;
-        }
-        let Some(a) = acquire::acquire(&x, &cp) else {
-            self.after_failed_attempt();
-            return;
-        };
-
-        // Locked. The first symbol looked at is the first at least a
-        // symbol past the end of the stretch (so its samples are ahead).
-        let fft = a.fft;
-        let n = fft.n();
-        let g = n / a.guard.divisor();
-        let per = n + g;
-        let apex_abs = native0 + a.apex;
+        // The first symbol looked at is the first at least a symbol past
+        // the end of the stretch, so its samples are still to come.
         let now_native = next as f64 / self.rho;
-        let m = ((now_native + per as f64 - apex_abs) / per as f64)
-            .ceil()
-            .max(1.0);
-        let apex = apex_abs + m * per as f64;
-        // That symbol's scattered phase.
-        let phase = (a.phase + m as usize) % 4;
+        let min_apex = now_native + (8192 + 2048) as f64;
+        let l = match lock_on(
+            &self.interp,
+            &self.planar,
+            self.win_start,
+            self.rho,
+            self.fs_native,
+            self.cfg.vfo_offset_hz,
+            min_apex,
+        ) {
+            Ok(l) => l,
+            Err(Failure::NoPrefix(c)) | Err(Failure::NotDvbt(c)) => {
+                self.status.contrast = self.status.contrast.max(c);
+                self.after_failed_attempt();
+                return;
+            }
+        };
+        self.status.contrast = self.status.contrast.max(l.contrast);
+
+        let fft = l.fft;
+        let n = fft.n();
+        let g = n / l.guard.divisor();
+        let per = n + g;
+        let (apex, phase) = (l.apex, l.phase);
         let k_total = fft.active_carriers();
         let pilots: Vec<u16> = (3 * phase..k_total).step_by(12).map(|k| k as u16).collect();
         let wk = prbs(k_total);
@@ -347,21 +293,19 @@ impl Sounder {
         let df = self.fs_native / n as f64;
         let symbol_s = per as f64 / self.fs_native;
         let row_s = self.cfg.step as f64 * symbol_s;
-        let delta = (g / 4).clamp(8, 128);
+        let reader = SymbolReader::new(
+            fft,
+            l.guard,
+            apex,
+            l.f_total,
+            self.rho,
+            self.fs_native,
+            self.cfg.step,
+        );
         self.track = Some(Track {
-            n,
-            g,
-            per,
-            delta,
-            kmid: (k_total - 1) / 2,
+            reader,
             pilots,
             inv,
-            apex,
-            rate: 0.0,
-            f_total: self.cfg.vfo_offset_hz + a.cfo_spacings * df,
-            rot_phase: 0.0,
-            rot_at: apex,
-            plan: Fft1::new(n),
             hist: ChannelHistory::new(12.0 * df, row_s, g as f64 / self.fs_native * 1e6),
             group: Vec::new(),
             group_n: 0,
@@ -373,7 +317,7 @@ impl Sounder {
         self.status.attempts = 0;
         self.status.geometry = Some(Geometry {
             fft,
-            guard: a.guard,
+            guard: l.guard,
             columns: (3 * phase..k_total).step_by(12).count(),
             first_carrier: 3 * phase,
             mid_carrier: (k_total - 1) / 2,
@@ -394,121 +338,32 @@ impl Sounder {
     /// Ask for the stretch the next symbol lies in.
     fn want_symbol(&mut self) {
         let Some(t) = &self.track else { return };
-        let lo = t.apex - SEARCH as f64 - 4.0;
-        let hi = t.apex + SEARCH as f64 + (t.n + t.g) as f64 + 4.0;
-        let a = (lo * self.rho).floor() as i64 - PAD as i64;
-        let b = (hi * self.rho).ceil() as i64 + PAD as i64;
-        if a < 0 {
-            self.track = None;
-            return;
+        match t.reader.want() {
+            Some((start, len)) => self.set_want(start, len),
+            None => self.track = None,
         }
-        self.set_want(a as u64, (b - a) as usize);
     }
 
     fn track_symbol(&mut self) {
         let Some(mut t) = self.track.take() else {
             return;
         };
-        let (n, g) = (t.n, t.g);
-        let tt = 1.0 / self.fs_native;
-        let two_pi = std::f64::consts::TAU;
-
-        // 1. The cyclic prefix near the prediction: two regions a symbol
-        // apart, read on the native grid.
-        let a_int = (t.apex - SEARCH as f64).floor();
-        let len = g + 2 * SEARCH + 1;
-        let (mut r1, mut r2) = (Vec::with_capacity(len), Vec::with_capacity(len));
-        let pos = |native: f64| self.window_of_native(native);
-        let ok = pos(a_int) >= BEFORE as f64
-            && pos(a_int + (n + len) as f64) + AFTER as f64 <= self.win.len() as f64;
-        if !ok {
-            self.track = None;
+        let mut carriers = std::mem::take(&mut self.carriers);
+        if t.reader
+            .read(&self.interp, &self.planar, self.win_start, &mut carriers)
+            .is_err()
+        {
+            self.carriers = carriers;
             self.after_failed_attempt();
             return;
         }
-        self.interp
-            .resample_planar(&self.planar, pos(a_int), self.rho, len, &mut r1);
-        self.interp
-            .resample_planar(&self.planar, pos(a_int + n as f64), self.rho, len, &mut r2);
-        let mut c: Vec<Iq> = Vec::with_capacity(2 * SEARCH + 1);
-        let mut acc = Iq::new(0.0, 0.0);
-        for m in 0..g {
-            acc += r1[m] * r2[m].conj();
-        }
-        c.push(acc);
-        for j in 0..2 * SEARCH {
-            acc += r1[j + g] * r2[j + g].conj() - r1[j] * r2[j].conj();
-            c.push(acc);
-        }
-        let mag: Vec<f32> = c.iter().map(|v| v.norm()).collect();
-        let (j0, &peak) = mag
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap();
-        let edge = j0 == 0 || j0 == mag.len() - 1;
-        let sub = if edge {
-            0.0
-        } else {
-            parabola(mag[j0 - 1], peak, mag[j0 + 1])
-        };
-        let measured = a_int + j0 as f64 + sub;
-        // The carrier offset's fraction: measured against what we expect.
-        let df = self.fs_native / n as f64;
-        let eps_meas = -(c[j0].im as f64).atan2(c[j0].re as f64) / two_pi;
-        let expected = t.f_total / df;
-        let eps_exp = expected - expected.round();
-        let mut resid = eps_meas - eps_exp;
-        resid -= resid.round();
 
-        // 2. The loops.
-        let step_len = (self.cfg.step * t.per) as f64;
-        let err = measured - t.apex;
-        t.apex += ALPHA * err;
-        t.rate += BETA * err / step_len;
-        t.f_total += GAMMA * resid * df;
-
-        // 3. The useful part, read from where the filtered timing puts it,
-        // and rotated from absolute time.
-        let start = t.apex + (g - t.delta) as f64;
-        let p0 = pos(start);
-        if p0 < BEFORE as f64 || p0 + n as f64 * self.rho + AFTER as f64 > self.win.len() as f64 {
-            self.track = None;
-            self.after_failed_attempt();
-            return;
-        }
-        let mut buf = Vec::with_capacity(n);
-        self.interp
-            .resample_planar(&self.planar, p0, self.rho, n, &mut buf);
-        // The rotation's phase at this window's start: what was taken out
-        // before, plus the offset now believed over the time since.
-        t.rot_phase =
-            (t.rot_phase + two_pi * t.f_total * (start - t.rot_at) * tt).rem_euclid(two_pi);
-        t.rot_at = start;
-        let w = -two_pi * t.f_total * tt;
-        let step = Iq::new(w.cos() as f32, w.sin() as f32);
-        let mut ph = -t.rot_phase;
-        let mut rot = Iq::new(ph.cos() as f32, ph.sin() as f32);
-        for (j, v) in buf.iter_mut().enumerate() {
-            *v *= rot;
-            rot *= step;
-            if j % 512 == 511 {
-                // Renormalise the running phasor against rounding.
-                ph = -t.rot_phase + w * (j + 1) as f64;
-                rot = Iq::new(ph.cos() as f32, ph.sin() as f32);
-            }
-        }
-        t.plan.forward(&mut buf);
-
-        // 4. The pilots: the channel at every 12th carrier. The window began
-        // `delta` samples early, which is a ramp of e^{+j2πkΔ/N} to undo.
+        // The pilots: the channel at every 12th carrier.
         let mut row = Vec::with_capacity(t.pilots.len());
         for (&k, &inv) in t.pilots.iter().zip(&t.inv) {
-            let bin = bin_of(k as usize, t.kmid, 0, n);
-            let k_signed = k as f64 - t.kmid as f64;
-            let ramp = two_pi * k_signed * t.delta as f64 / n as f64;
-            row.push(buf[bin] * Iq::new(ramp.cos() as f32, ramp.sin() as f32) * inv);
+            row.push(carriers[k as usize] * inv);
         }
+        self.carriers = carriers;
         // Coherence of neighbouring pilots: high on a locked signal.
         let (mut num, mut den) = (Iq::new(0.0, 0.0), 0.0f32);
         for w2 in row.windows(2) {
@@ -544,13 +399,10 @@ impl Sounder {
 
         self.status.rows += 1;
         self.status.coherence = coherence;
-        self.status.cfo_hz = t.f_total;
-        self.status.clock_ppm = t.rate * 1e6;
+        self.status.cfo_hz = t.reader.f_total;
+        self.status.clock_ppm = t.reader.rate * 1e6;
 
-        // Next symbol.
-        t.apex += step_len * (1.0 + t.rate);
         if t.bad >= LOST_AFTER {
-            self.track = None;
             self.status.tracking = false;
             self.status.geometry = None;
             self.after_failed_attempt();
@@ -715,7 +567,9 @@ mod tests {
         let st = s.status();
         assert!(st.tracking, "{st:?}");
         let g = st.geometry.unwrap();
-        assert_eq!((g.fft, g.guard, g.columns), (FftSize::K2, Guard::G1_4, 142));
+        assert_eq!((g.fft, g.guard), (FftSize::K2, Guard::G1_4));
+        // 142 or 143 pilots a row, by the scattered phase of the symbols read.
+        assert!((142..=143).contains(&g.columns), "{}", g.columns);
         assert!((st.cfo_hz + 45_000.0).abs() < 300.0, "{}", st.cfo_hz);
     }
 

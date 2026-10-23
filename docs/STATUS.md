@@ -247,6 +247,130 @@ of rows, so a 1.6 s file never shows one); the channel view only handles DVB-T
 an echo (the clock reading wobbles a few ppm); a 20 MS/s span needs a
 decimating filter first.
 
-**Next (M3b):** the equaliser from these estimates, TPS, the demapper,
-deinterleavers, Viterbi, RS and the descrambler → transport stream on the
-five captures. The signal card then gets a real MER and mode.
+(What M3b did about these: see below.)
+
+## M3b — the receiver: equaliser to transport stream (2026-10-23)
+
+Asked for: the equaliser, TPS, demapper, deinterleavers, Viterbi, RS and
+descrambler, to a transport stream on the five DVB-T captures. Done; the
+whole chain runs from a capture (or the HackRF) to a `.ts` that the PSI
+analyser reads, in the CLI (`decdvbt decode`), the engine thread and the GUI
+("decode" checkbox). 240 tests pass, clippy and rustfmt clean.
+
+**The chain** (`decdvbt-rx` unless said):
+
+- `symbol`: the reader shared with the sounder (cyclic-prefix timing, carrier
+  loop, interpolated window, integrated rotation, FFT). Now reads at the clock
+  rate it has tracked, and takes a fine timing correction from the pilots.
+- `chest` (the equaliser): the common phase and timing slope of each symbol
+  from the 177 continual pilots against a running reference — **the maximum-
+  likelihood slope** (peak of the pilots' coherent sum over ±6 rad, then a
+  weighted line fit; the first try, from neighbouring pilots' phase
+  differences, was 75× noisier and failed below ~15 dB pilot SNR); the
+  channel on a 3-carrier grid from the scattered pilots (IIR, four symbols to
+  fill it); every carrier by an 8-tap windowed-sinc interpolator (linear
+  interpolation cost 8 dB with a 20 µs echo in 2k); a symbol whose pilots will
+  not line up is equalised but not used to update anything. **Noise per
+  carrier** from each scattered pilot's innovation against the estimate it joins,
+  smoothed over ±3 grid points: an adjacent channel's skirt or a spur shows
+  up where it is.
+- `tps_rx`: DBPSK vote over the 17/68 TPS carriers weighted by |H|², sync word
+  + BCH(67,53) parity for the frame start (`decdvbt-ofdm::tps::parse_correcting`
+  mends up to two wrong bits by syndrome table; one is allowed while
+  searching, two once following), then the block read every frame: position
+  of every symbol, the constellation, rate, guard, hierarchy and cell id.
+- `demap`: max-log soft bits per axis in closed form (checked against brute
+  force), weighted by |H|²/σ²(carrier), 8 bits; the symbol deinterleaver as a
+  gather and the bit deinterleaver as a scatter in the same pass.
+- `decdvbt-fec::viterbi` (new): K = 7 (171, 133), eight-bit soft inputs,
+  sixteen-bit metrics, AVX2 butterfly kernel keeping the 64 metrics in
+  registers, a portable twin that must (and does, tested) give identical
+  decisions, depuncturing built in, traceback in chunks of 512 bits. **10–12
+  ns a decoded bit** (80–100 Mbit/s a core; the old float decoder was ~90 ns).
+- `outer`: sync hunt on the 0x47/0xB8 bytes 204 apart at every bit alignment,
+  the convolutional deinterleaver, Reed–Solomon (the syndromes by table
+  lookup: a clean block costs a fraction of a microsecond), the descrambler
+  as a precomputed 1503-byte sequence XORed on, transport-error flag on what
+  the code could not fix, loss of sync after 20 bad blocks in a row.
+  `Prbs` and `ConvInterleaver` moved to `decdvbt-fec::outer`, shared with the
+  modulator.
+- `receiver`: runs it all on pushed blocks (the same want-a-stretch method as
+  the sounder, `window`): acquire → lock → TPS → decode, with the pilot phase
+  checked against the frame position and the mode checked against the lock.
+  Per-stage times in `status().profile`.
+
+**Tested on simulated signals** (the modulator and channel models, through
+the whole receiver): a clean UK signal and one through echoes at +9/+14 dB,
+166 kHz of carrier offset and 15 ppm of clock error both decode to exactly the
+test stream's packets, consecutive, none lost; 2k QPSK at 12 dB C/N; the
+equaliser holds 27 dB MER at 28 dB C/N and 24 dB in 2k with a 20 µs echo.
+
+**On the real captures.** Decoding the first five captures failed at first and
+the reason was not the receiver: **the HackRF's RF amplifier was off**. It is
+the +14 dB stage with a low noise figure; without it the front end's noise
+figure (and the 8-bit ADC at −24 dBFS) leaves 24 dB of C/N at best and the
+upper half of the band at 10–13 dB (the test channel has two near-equal paths
+1.75 µs apart, so half the band is 6–10 dB down). With `--amp --lna 32 --vga 8`
+the C/N is 32–33 dB, and all five channels were recorded again
+(`captures/cNN_…_10Msps_amp.cs8`, 4 s each) and decode:
+
+| channel | mode | packets | flagged (RS lost) | before RS | SNR |
+|---|---|---|---|---|---|
+| C22 | 64-QAM 3/4 1/32 8k | 70 525 | 30 (0.04 %) | 7.3e-4 | 18.3 dB |
+| C23 | 64-QAM 2/3 | 62 374 | **0** | 4.5e-6 | 21.4 dB |
+| C25 | 64-QAM 3/4 | 70 487 | 86 (0.12 %) | 2.3e-3 | 17.7 dB |
+| C26 | 64-QAM 2/3 | 62 715 | **0** | 3.0e-5 | 18.6 dB |
+| C28 | 64-QAM 3/4 | 69 632 | 1 597 (2.3 %) | 3.5e-3 | 19.8 dB |
+| C30 (T2) | does not lock (contrast 3.7) | | | | |
+
+C23 (the BBC mux, 26 services, the stream's clock 10:33:59 UTC, network
+"(region)") and C26 are error-free (QEF is 2e-4 before the code). C28 still
+loses packets: it has the UK's −166.67 kHz offset and the weakest margin. The
+original amp-off captures decode only partly (C26 62 240 packets, 32 flagged;
+the others far less): they are noise-limited, not a receiver fault.
+
+**What it cost to find** (the diagnostics are in `examples/diag.rs`, with a
+numpy cross-check outside the repo): pilots only 10 dB above their own
+variation on a 24 dB C/N capture → the slope fit failing (75× noisier seed)
+→ fixed; MER profile bad in the upper half of the band → not the interpolator
+(−48 dB error everywhere), not phase noise (−38…−44 dB), not an impulse
+response beyond the guard (nothing past −26 dB), not intermodulation
+(gain sweep) → the front end's noise figure; edge carriers and an adjacent
+channel make the noise uneven across the band → per-carrier noise from the
+pilots, which took C22/C25/C28 from "nothing" to "almost clean" by itself.
+The demapper's first noise figure was one global decision-directed estimate,
+which read 0 dB whenever many cells were wrong and scaled every bit down.
+
+**CPU (the main requirement), on this machine, one core, per second of
+signal** (64-QAM, 8k, release build):
+
+| stage | 2/3 mux (24 Mbit/s) | 3/4 mux (27 Mbit/s) |
+|---|---|---|
+| read symbols (interpolate + FFT) | 19 % | 22–23 % |
+| equalise | 14 % | 18 % |
+| demap + deinterleave | 7 % | 9 % |
+| Viterbi | 26 % | 30 % |
+| outer (RS etc.) | 3 % | 5–7 % |
+| **total** | **72 %** | **89 %** |
+
+So a UK mux decodes in real time on one core, barely at 3/4. M7 has to bring
+this down, in order of size: the **Viterbi** (6 AVX2 cross-lane permutes a
+step; 8-bit metrics halve the ops; the traceback is another third), **reading
+symbols** (a decimating filter for the radio's rate and a window FFT with no
+per-sample interpolation, the timing as a phase ramp), the **equaliser**
+(per-carrier division, allocations, scalar interpolator, scalar atan2 in the
+fit: all vectorisable), and running Viterbi + outer on a second thread.
+
+**Also**: `Stage::Decoder` in the CPU meter, `Command::Decode(Some(rf_hz))`
+and `Rx::take_decoder()` (status and the transport stream, bounded); the GUI
+card shows the TPS mode (no "assumed"), the pilots' SNR as "MER" against the
+mode's QEF threshold, the stream rate, RS blocks fixed/lost and the error rate
+before RS. The services list still waits for M4.
+
+**Not yet**: hierarchical transmission (the HP stream alone would need the
+other demultiplexer; refused with a message); 4k; the TS goes nowhere in the
+GUI yet (file, UDP and the player are M4); a 20 MS/s radio rate needs a
+decimating filter before the interpolator (it aliases the adjacent channels
+otherwise); the receiver and the sounder each acquire and read symbols (the
+channel panels should come from the receiver's own estimates); MER/SNR
+needs the threshold table in `dvbt.rs` checked against EN 300 744 Table A.1.

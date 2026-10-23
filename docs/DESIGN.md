@@ -100,7 +100,8 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
 - **M3a** — OFDM front end and channel sounder: acquisition, tracking, channel
   estimate, fading waterfall and delay–Doppler map. *(done, 2026-10-23)*
 - **M3b** — the rest of the DVB-T receiver: equaliser, TPS, demapping, inner
-  deinterleavers, Viterbi, RS → TS. Live Freeview DVB-T.
+  deinterleavers, Viterbi, RS → TS. Live Freeview DVB-T. *(done, 2026-10-23;
+  five muxes decode from the HackRF with the RF amp on, two error-free)*
 - **M4** — player, PSI/SI, service panel, scopes, measurements.
 - **M5** — DVB-T2 modulator.
 - **M6** — DVB-T2 receiver: P1, P2/L1, LDPC/BCH, TI, rotated QAM → TS.
@@ -114,7 +115,15 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
   AVX-512 LDPC path will not run here, so real-time T2 rests on the AVX2/portable
   kernel and the thread pool; this needs measuring early (M6 at the latest).
 - HackRF tools (`hackrf_info` etc.) are not on PATH; the HackRF One is
-  enumerated by Windows. DecSAT loads `libhackrf` at run time.
+  enumerated by Windows. DecSAT loads `libhackrf` at run time (DecDVB-T uses
+  the pure-Rust `seify-hackrfone` driver).
+- **The HackRF needs its RF amplifier on for DVB-T** (`--amp`, LNA 32, VGA 8
+  on this roof): off, the noise figure leaves 24 dB of C/N and 64-QAM does not
+  decode; on, 32–33 dB. The amp is a receive-side stage, not the antenna-port
+  power, which stays off.
+- At 10 MS/s the HackRF's default baseband filter and the neighbouring muxes'
+  aliases cost the band edges some SNR; 20 MS/s with a decimating filter is
+  the clean answer (the front end must then decimate before interpolating).
 
 ## 7. Open questions
 

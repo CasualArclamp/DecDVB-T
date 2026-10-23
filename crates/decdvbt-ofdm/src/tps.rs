@@ -22,6 +22,8 @@
 //! Field codes follow gr-dtv's `format_tps_data` (GPL-3, Free Software
 //! Foundation) and the spec's Tables 9–12.
 
+use std::sync::OnceLock;
+
 use decdvbt_core::dvbt::{Alpha, FftSize, Guard, Mode, Modulation, Rate};
 
 /// Bits in a TPS block.
@@ -230,6 +232,62 @@ pub fn parse(w: &[u8; TPS_BITS]) -> Result<TpsFrame, TpsError> {
     })
 }
 
+/// The code's syndrome of a block: the parity its s1–s53 call for against the
+/// parity received, as a 14-bit number (0 for a codeword). Linear in the
+/// block, so an error pattern's syndrome is the sum of its bits'.
+fn syndrome(w: &[u8; TPS_BITS]) -> u16 {
+    bch_parity(&w[1..=53])
+        .iter()
+        .zip(&w[54..])
+        .fold(0, |a, (&x, &y)| (a << 1) | u16::from((x ^ y) & 1))
+}
+
+/// For each syndrome that one or two errors in s1–s67 can make, which bits
+/// (1-based; 0 for "none"). The shortened BCH code has distance 5, so no two
+/// patterns of two or fewer errors share a syndrome.
+fn error_table() -> &'static [(u8, u8)] {
+    static TABLE: OnceLock<Vec<(u8, u8)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let one: Vec<u16> = (0..TPS_BITS)
+            .map(|p| {
+                let mut e = [0u8; TPS_BITS];
+                e[p] = 1;
+                syndrome(&e)
+            })
+            .collect();
+        let mut t = vec![(0u8, 0u8); 1 << 14];
+        for p in 1..TPS_BITS {
+            t[one[p] as usize] = (p as u8, 0);
+        }
+        for p in 1..TPS_BITS {
+            for q in p + 1..TPS_BITS {
+                t[(one[p] ^ one[q]) as usize] = (p as u8, q as u8);
+            }
+        }
+        t
+    })
+}
+
+/// [`parse`], first correcting up to `max_fix` (0–2) wrong bits among s1–s67.
+/// Returns what the block says and how many bits it took.
+pub fn parse_correcting(w: &[u8; TPS_BITS], max_fix: usize) -> Result<(TpsFrame, usize), TpsError> {
+    let syn = syndrome(w);
+    let mut fixed = *w;
+    let mut n = 0;
+    if syn != 0 {
+        let (a, b) = error_table()[syn as usize];
+        n = usize::from(a != 0) + usize::from(b != 0);
+        if n == 0 || n > max_fix {
+            return Err(TpsError::Parity);
+        }
+        fixed[a as usize] ^= 1;
+        if b != 0 {
+            fixed[b as usize] ^= 1;
+        }
+    }
+    parse(&fixed).map(|f| (f, n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +385,29 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn up_to_two_wrong_bits_are_corrected() {
+        let t = Tps {
+            mode: Mode::uk(Modulation::Qam64, Rate::R3_4),
+            cell_id: None,
+        };
+        let w = t.word(3);
+        let good = parse(&w).unwrap();
+        assert_eq!(parse_correcting(&w, 2), Ok((good, 0)));
+        for i in 1..TPS_BITS {
+            let mut bad = w;
+            bad[i] ^= 1;
+            assert_eq!(parse_correcting(&bad, 2), Ok((good, 1)), "bit {i}");
+            assert!(parse_correcting(&bad, 0).is_err());
+            for j in i + 1..TPS_BITS {
+                let mut worse = bad;
+                worse[j] ^= 1;
+                assert_eq!(parse_correcting(&worse, 2), Ok((good, 2)), "bits {i}, {j}");
+                assert!(parse_correcting(&worse, 1).is_err());
             }
         }
     }

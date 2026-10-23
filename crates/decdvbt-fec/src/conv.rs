@@ -27,6 +27,19 @@ pub enum Rate {
     R7_8,
 }
 
+impl From<decdvbt_core::dvbt::Rate> for Rate {
+    fn from(r: decdvbt_core::dvbt::Rate) -> Rate {
+        use decdvbt_core::dvbt::Rate as R;
+        match r {
+            R::R1_2 => Rate::R1_2,
+            R::R2_3 => Rate::R2_3,
+            R::R3_4 => Rate::R3_4,
+            R::R5_6 => Rate::R5_6,
+            R::R7_8 => Rate::R7_8,
+        }
+    }
+}
+
 impl Rate {
     pub const ALL: [Rate; 5] = [Rate::R1_2, Rate::R2_3, Rate::R3_4, Rate::R5_6, Rate::R7_8];
 

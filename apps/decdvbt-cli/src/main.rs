@@ -8,14 +8,18 @@
 //!   multipath, fading, noise and the radio's faults.
 //! - `sound`: lock to a DVB-T signal in a capture or on the HackRF and list
 //!   its paths (delay, Doppler, strength).
+//! - `decode`: run the receiver over a capture (or the HackRF): the transport
+//!   stream, the signal's quality and the services in it.
 //! - `capture`: run the receive engine on the HackRF (or replay a file) for a
 //!   few seconds, print level, drops and CPU, and optionally record the IQ.
 //!   The headless check of the front end, and the first CPU benchmark.
 //!
-//! Decoding arrives with M3.
+//! T2 arrives with M6.
 
+mod decode;
 mod modulate;
 mod sound;
+mod source;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -56,6 +60,8 @@ enum Command {
     },
     /// Run the channel sounder: lock to a DVB-T signal and list its paths.
     Sound(Box<sound::SoundArgs>),
+    /// Decode a DVB-T signal to a transport stream and report on it.
+    Decode(Box<decode::DecodeArgs>),
     /// Make a DVB-T test signal as an IQ file, optionally through a channel.
     Modulate(Box<modulate::ModulateArgs>),
     /// Run the receive engine for a few seconds and report what it sees.
@@ -107,6 +113,7 @@ fn main() -> Result<()> {
         }
         Command::Modulate(a) => modulate::run(*a)?,
         Command::Sound(a) => sound::run(*a)?,
+        Command::Decode(a) => decode::run(*a)?,
         Command::Scan {
             lna,
             vga,
@@ -177,7 +184,7 @@ fn capture(
             }
         }
         let s = rx.stats();
-        let [src_load, rec_load, spec_load, _] = s.load.percent;
+        let [src_load, rec_load, spec_load, ..] = s.load.percent;
         println!(
             "{:5.1} s  rms {:6.1} dBFS  peak {:.2}  clip {:4.2}%  dropped {}  rows {}  \
              C/N {}  CPU {:5.1}%  [{}: {:.1}%  {}: {:.1}%  {}: {:.1}%]{}",

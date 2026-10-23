@@ -12,6 +12,7 @@ rust-version.workspace = true
 decdvbt-core = { path = "../decdvbt-core" }
 decdvbt-ofdm = { path = "../decdvbt-ofdm" }
 decdvbt-dsp = { path = "../decdvbt-dsp" }
+decdvbt-fec = { path = "../decdvbt-fec" }
 num-complex.workspace = true
 rustfft.workspace = true
 

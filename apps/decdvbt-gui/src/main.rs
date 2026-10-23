@@ -20,6 +20,7 @@ use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_cha
 use decdvbt_core::dvbt::Mode;
 use decdvbt_engine::{Command, CpuGauge, Row, Stats, spectral_cn_db};
 use decdvbt_io::name_hint;
+use decdvbt_rx::receiver::ReceiverStatus;
 use decdvbt_rx::sounder::Geometry;
 use eframe::egui::{self, Color32, RichText};
 use source::{Gains, Session, Spec};
@@ -50,6 +51,8 @@ struct Options {
     assume: Option<Mode>,
     /// Start with the channel panels closed.
     no_channel: bool,
+    /// Start with the receiver decoding.
+    decode: bool,
 }
 
 impl Options {
@@ -63,6 +66,7 @@ impl Options {
             fps: 15.0,
             assume: None,
             no_channel: false,
+            decode: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -81,6 +85,7 @@ impl Options {
                     o.assume = Some(Mode::parse(&v)?);
                 }
                 "--no-channel" => o.no_channel = true,
+                "--decode" => o.decode = true,
                 "--fps" => o.fps = value("frames a second")?.parse().map_err(|_| "bad --fps")?,
                 "--after" => o.after = value("seconds")?.parse().map_err(|_| "bad --after")?,
                 f if !f.starts_with("--") => o.file = Some(f.into()),
@@ -103,7 +108,7 @@ fn main() -> eframe::Result {
             eprintln!("decdvbt-gui: {e}");
             eprintln!(
                 "usage: decdvbt-gui [capture.cs8] [--channel C26] [--rate MSPS] \
-                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] [--no-channel]"
+                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] [--no-channel] [--decode]"
             );
             std::process::exit(2);
         }
@@ -145,6 +150,14 @@ struct App {
     /// The RF frequency the sounder was last asked to look at (`Some(None)`:
     /// asked to stop); `None`: not asked since the source began.
     sounder_sent: Option<Option<f64>>,
+    /// The receiver: on or off, the frequency it was last asked to decode
+    /// (as for the sounder), what it reports, and the packets it has made
+    /// with when they were counted, for the transport stream's rate.
+    decode: bool,
+    decoder_sent: Option<Option<f64>>,
+    dec: ReceiverStatus,
+    dec_packets: u64,
+    dec_rate: Option<(u64, Instant, f64)>,
     started: Instant,
     shot_sent: bool,
     /// For `--screenshot`: process CPU and time at 2 s, to average over the
@@ -226,6 +239,11 @@ impl App {
             show_channel: !opts.no_channel,
             chan_view: channel_view::ChannelView::default(),
             sounder_sent: None,
+            decode: opts.decode,
+            decoder_sent: None,
+            dec: ReceiverStatus::default(),
+            dec_packets: 0,
+            dec_rate: None,
             stats: Stats::default(),
             stats_at: Instant::now(),
             cpu: CpuGauge::default(),
@@ -281,6 +299,10 @@ impl App {
             Ok(s) => {
                 self.session = Some(s);
                 self.sounder_sent = None;
+                self.decoder_sent = None;
+                self.dec = ReceiverStatus::default();
+                self.dec_packets = 0;
+                self.dec_rate = None;
                 self.vfo_hz = vfo;
                 self.reset_view();
                 self.note.clear();
@@ -338,6 +360,34 @@ impl App {
                 self.chan_view.reset();
             }
         }
+    }
+
+    /// Ask the engine to decode the signal under the VFO while the decode
+    /// switch is on, and to stop when it is not.
+    fn sync_decoder(&mut self) {
+        let Some(s) = &self.session else { return };
+        let want = self
+            .decode
+            .then(|| {
+                self.vfo_hz
+                    .or((self.centre_hz > 0.0).then_some(self.centre_hz))
+            })
+            .flatten();
+        if self.decoder_sent != Some(want) && (want.is_some() || self.decoder_sent.is_some()) {
+            s.rx.send(Command::Decode(want));
+            self.decoder_sent = Some(want);
+            if want.is_none() {
+                self.dec = ReceiverStatus::default();
+                self.dec_packets = 0;
+                self.dec_rate = None;
+            }
+        }
+    }
+
+    /// The transport stream's rate, Mbit/s, from the packets counted over the
+    /// last second or so.
+    fn ts_mbps(&self) -> Option<f64> {
+        self.dec_rate.map(|(_, _, r)| r).filter(|r| *r > 0.0)
     }
 
     // ---- tuning ---------------------------------------------------------
@@ -425,6 +475,25 @@ impl App {
         if self.show_channel {
             self.chan_view.update(s.rx.take_sounder());
         }
+        if self.decode {
+            // The transport stream itself goes nowhere yet (M4: the player,
+            // the viewers and the outputs); what is kept is its rate.
+            let u = s.rx.take_decoder();
+            self.dec = u.status;
+            self.dec_packets = u.packets;
+            let now = Instant::now();
+            match &mut self.dec_rate {
+                Some((at, t, rate)) if t.elapsed() >= Duration::from_secs(1) => {
+                    *rate = (u.packets.saturating_sub(*at)) as f64 * 188.0 * 8.0
+                        / t.elapsed().as_secs_f64()
+                        / 1e6;
+                    *at = u.packets;
+                    *t = now;
+                }
+                None => self.dec_rate = Some((u.packets, now, 0.0)),
+                _ => {}
+            }
+        }
         for row in rows {
             if row.tuning != self.tuning {
                 self.tuning = row.tuning;
@@ -490,32 +559,67 @@ impl App {
     }
 
     fn card(&self) -> card::Card {
-        // What the sounder has read from the signal (the FFT size and the
-        // guard interval) wins over an assumption; the constellation and the
-        // code rate wait for the TPS (M3).
+        // What the receiver has read from the TPS wins, then what the sounder
+        // has read of the signal (the FFT size and the guard interval), then
+        // an assumption.
         let locked: Option<Geometry> = self
             .chan_view
             .status
             .geometry
             .filter(|_| self.chan_view.status.tracking);
-        let mut mode = self.opts.assume;
-        if let (Some(m), Some(g)) = (&mut mode, locked) {
+        let tps = self.dec.tps.filter(|_| self.dec.tps_synced && self.decode);
+        let read: Option<Mode> = tps.map(|t| {
+            let mut m = Mode::uk(t.modulation, t.rate_hp);
+            m.fft = t.fft;
+            m.guard = t.guard;
+            m.rate_lp = t.rate_lp;
+            m.alpha = t.alpha;
+            m
+        });
+        let mut mode = read.or(self.opts.assume);
+        if read.is_none()
+            && let (Some(m), Some(g)) = (&mut mode, locked)
+        {
             m.fft = g.fft;
             m.guard = g.guard;
         }
-        let details = match (mode, locked) {
+        let mut details = match (mode, locked) {
             (Some(m), _) => mode_details(&m),
             (None, Some(g)) => lock_details(&g, self.chan_view.status.cfo_hz),
             _ => Vec::new(),
         };
+        let decoding = self.decode && self.dec.decoding;
+        if decoding {
+            let kv = |k: &str, v: String| (k.to_string(), v);
+            let o = &self.dec.outer;
+            if let Some(r) = self.ts_mbps() {
+                details.push(kv("stream", format!("{r:.2} Mbit/s")));
+            }
+            details.push(kv(
+                "RS blocks",
+                format!(
+                    "{} fixed · {} lost",
+                    o.corrected + o.uncorrectable,
+                    o.uncorrectable
+                ),
+            ));
+            details.push(kv("before RS", format!("{:.1e} BER", o.pre_rs_ber())));
+        }
+        // The pilots' signal-to-noise ratio replaces the spectrum's C/N once
+        // decoding: it is the figure the code sees.
+        let (cn_db, cn_source) = if decoding && self.dec.snr_db.is_finite() {
+            (Some(self.dec.snr_db), "MER")
+        } else {
+            (self.cn_db, "spectrum")
+        };
         card::Card {
             standard: (mode.is_some() || locked.is_some()).then_some(card::Standard::DvbT),
-            assumed: mode.is_some(),
+            assumed: read.is_none() && mode.is_some(),
             name: mode.map(|m| format!("{} {}", m.modulation.name(), m.rate_hp.name())),
             qef_db: mode.and_then(|m| m.qef_cn_db()),
             details,
-            cn_db: self.cn_db,
-            cn_source: "spectrum",
+            cn_db,
+            cn_source,
             channel: self.vfo_hz.and_then(uhf_channel_at),
             freq_hz: self.vfo_hz,
             active: self.session.is_some(),
@@ -703,6 +807,7 @@ impl App {
             }
             ui.separator();
             ui.checkbox(&mut self.show_channel, "channel");
+            ui.checkbox(&mut self.decode, "decode");
             if self.show_channel {
                 egui::ComboBox::from_id_salt("doppler")
                     .selected_text(format!("±{} Hz", self.chan_view.doppler_view))
@@ -803,6 +908,7 @@ impl App {
                     for (stage, p) in decdvbt_engine::Stage::ALL.iter().zip(s.load.percent) {
                         if (*stage == decdvbt_engine::Stage::Record && s.recording.is_none())
                             || (*stage == decdvbt_engine::Stage::Sounder && !self.show_channel)
+                            || (*stage == decdvbt_engine::Stage::Decoder && !self.decode)
                         {
                             continue;
                         }
@@ -856,6 +962,7 @@ impl eframe::App for App {
         }
         self.take_rows();
         self.sync_sounder();
+        self.sync_decoder();
         self.cpu_percent = self.cpu.poll();
         self.handle_screenshot(ctx);
         if self.session.is_some() || self.opts.screenshot.is_some() {

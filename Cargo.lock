@@ -592,6 +592,7 @@ dependencies = [
  "decdvbt-io",
  "decdvbt-mod",
  "decdvbt-rx",
+ "decdvbt-ts",
 ]
 
 [[package]]
@@ -686,6 +687,7 @@ version = "0.1.0"
 dependencies = [
  "decdvbt-core",
  "decdvbt-dsp",
+ "decdvbt-fec",
  "decdvbt-mod",
  "decdvbt-ofdm",
  "num-complex",

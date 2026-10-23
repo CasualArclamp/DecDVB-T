@@ -104,14 +104,18 @@ pub enum Stage {
     /// The channel sounder: acquisition, tracking, the channel estimate and
     /// the delay-Doppler map (when its panel is open).
     Sounder,
+    /// The receiver: every symbol read, equalised and decoded to a transport
+    /// stream (when decoding is on).
+    Decoder,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 4] = [
+    pub const ALL: [Stage; 5] = [
         Stage::Source,
         Stage::Record,
         Stage::Spectrum,
         Stage::Sounder,
+        Stage::Decoder,
     ];
 
     pub fn name(self) -> &'static str {
@@ -120,6 +124,7 @@ impl Stage {
             Stage::Record => "record",
             Stage::Spectrum => "spectrum",
             Stage::Sounder => "sounder",
+            Stage::Decoder => "decoder",
         }
     }
 }
@@ -128,12 +133,12 @@ impl Stage {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StageLoad {
     /// Percent of the window, per [`Stage::ALL`] entry.
-    pub percent: [f32; 4],
+    pub percent: [f32; 5],
 }
 
 /// Accumulates the time each stage takes and reports it every second.
 pub struct StageMeter {
-    busy: [Duration; 4],
+    busy: [Duration; 5],
     window_start: Instant,
     pub last: StageLoad,
 }
@@ -141,7 +146,7 @@ pub struct StageMeter {
 impl Default for StageMeter {
     fn default() -> Self {
         StageMeter {
-            busy: [Duration::ZERO; 4],
+            busy: [Duration::ZERO; 5],
             window_start: Instant::now(),
             last: StageLoad::default(),
         }
@@ -166,7 +171,7 @@ impl StageMeter {
         for (p, b) in self.last.percent.iter_mut().zip(&self.busy) {
             *p = (100.0 * b.as_secs_f64() / dt.as_secs_f64()) as f32;
         }
-        self.busy = [Duration::ZERO; 4];
+        self.busy = [Duration::ZERO; 5];
         self.window_start = Instant::now();
         true
     }

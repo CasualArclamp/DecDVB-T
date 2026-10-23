@@ -13,6 +13,8 @@ pub mod snr;
 pub mod spectrum;
 
 pub use meter::{CpuGauge, Stage, StageLoad, StageMeter, process_cpu_seconds};
-pub use rx::{Command, DropProbe, Recording, Row, Rx, RxOptions, SounderUpdate, Stats};
+pub use rx::{
+    Command, DecoderUpdate, DropProbe, Recording, Row, Rx, RxOptions, SounderUpdate, Stats,
+};
 pub use snr::spectral_cn_db;
 pub use spectrum::{RowBuilder, Spectrum};

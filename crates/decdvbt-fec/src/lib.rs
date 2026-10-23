@@ -24,8 +24,10 @@ pub mod constellation;
 pub mod conv;
 pub mod demap;
 pub mod ldpc;
+pub mod outer;
 pub mod params;
 pub mod rs;
+pub mod viterbi;
 pub mod vlsnr;
 
 pub use bch::{Bch, BchError};

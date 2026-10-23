@@ -3,15 +3,14 @@
 //! HackRF) and say what it finds: the mode, the carrier and clock offsets,
 //! and the strongest paths of the delay–Doppler map.
 
-use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
-use decdvbt_core::SampleFormat;
-use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at};
-use decdvbt_io::{IqFileReader, IqSource, format_from_path, name_hint};
+use anyhow::Result;
+use decdvbt_core::channel::{uhf_centre_hz, uhf_channel_at};
 use decdvbt_rx::delay_doppler::DelayDoppler;
 use decdvbt_rx::sounder::{Sounder, SounderConfig};
+
+use crate::source;
 
 #[derive(clap::Args)]
 pub struct SoundArgs {
@@ -58,34 +57,7 @@ fn peaks(m: &DelayDoppler, floor: f32, max: usize) -> Vec<(f64, f64, f32)> {
 }
 
 pub fn run(a: SoundArgs) -> Result<()> {
-    let mut src: Box<dyn IqSource> = match parse_channel(&a.source) {
-        #[cfg(feature = "hackrf")]
-        Some(n) => {
-            use decdvbt_io::{HackRfGains, HackRfSettings, HackRfSource};
-            Box::new(HackRfSource::open(HackRfSettings {
-                center_hz: uhf_centre_hz(n).unwrap().round() as u64,
-                sample_rate: 10_000_000,
-                gains: HackRfGains::default(),
-            })?)
-        }
-        #[cfg(not(feature = "hackrf"))]
-        Some(_) => anyhow::bail!("built without the hackrf feature"),
-        None => {
-            let path = PathBuf::from(&a.source);
-            let fmt = format_from_path(&path).unwrap_or(SampleFormat::Cs8);
-            let hint = name_hint(&path);
-            Box::new(
-                IqFileReader::open(
-                    &path,
-                    fmt,
-                    hint.sample_rate.unwrap_or(a.file_rate * 1e6),
-                    1 << 17,
-                )
-                .with_context(|| format!("cannot open {}", a.source))?
-                .with_center_freq(hint.center_hz.unwrap_or(0.0)),
-            )
-        }
-    };
+    let mut src = source::open(&a.source, a.file_rate)?;
     let fs = src.sample_rate();
     let centre = src.center_freq();
     let channel_centre = uhf_channel_at(centre).and_then(uhf_centre_hz);
