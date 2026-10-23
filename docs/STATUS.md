@@ -750,3 +750,126 @@ over what was kept (and what it gives is kept in turn). **Screenshot runs
 neither read the view settings nor write anything**, so a test comes out the
 same each time and leaves the next real run as it found it; they do read the
 gains, the channel and the SDR settings, as the radio is the user's.
+
+## M5 + M6 — DVB-T2: the modulator and the receiver (2026-10-23)
+
+Asked for: the DVB-T2 modulator and receiver, validated on the real UK
+multiplex on C30 (256-QAM 2/3 rotated, 32K extended, GI 1/128, PP7, 64K LDPC,
+one PLP, 202 FEC blocks a frame). Done: it decodes C30 from a HackRF capture
+and live, 13 services, no block lost over 40 s, the engine thread at about 36 %
+of real time and the whole app at about 175 % of one core (the FEC on its own
+threads). 356 tests pass, clippy and rustfmt are clean.
+
+**What is supported.** SISO T2 base: every FFT size (1K to 32K, normal and
+extended carriers), every guard interval and pilot pattern (PP1 to PP8), QPSK
+to 256-QAM with or without rotation, 16K and 64K LDPC at rates 1/2 to 5/6, one
+PLP of type 1 (the first data PLP) with TIME_IL_TYPE 0, frame-closing symbols,
+and the PAPR tone-reservation carriers' positions. **Not yet:** MISO, FEF
+parts, T2-Lite rates 1/3 and 2/5, time interleaving over several frames
+(TIME_IL_TYPE 1), picking a PLP other than the first, several PLPs.
+
+**The modulator** (`decdvbt-mod::t2`, `decdvbt-ofdm::t2`, `decdvbt-fec::t2`;
+after gr-dtv's DVB-T2 blocks): P1 (C, A and B parts, S1 and S2 by DBPSK), P2
+symbols with L1-pre (BCH 3072/3240 + LDPC 1/4 short, BPSK) and L1-post
+(BCH 7032/7200 + LDPC 1/2 short, BPSK to 64-QAM, interleaved), data symbols with
+scattered and continual pilots (the tables generated from gr-dtv's C by
+`scratchpad/gen_t2_tables.py`), edge pilots and the PRBS-signed pilot values,
+the frequency interleaver, the PLP chain (BB scrambler, BCH, LDPC with T2's
+own tables for 2/3 normal and 3/5 short, parity and column-twist interleaver,
+demultiplexer, QAM mapping with rotation and the one-cell Q delay, cell
+interleaver, time interleaver, HEM BBFRAMEs with ISSY and CRC-8). `decdvbt
+modulate --t2 uk --seconds 2.4 --cn 30 --cfo 50123 --sco 4 --path 0:0 --path
+3:-12 x.cs8` makes a T2 test signal through the M2 channel models (`uk`, or
+`small`, or a spec like `8k-1/16-pp4-16qam-3/4-short-ext`).
+
+**The receiver** (`decdvbt-rx::t2`), a frame at a time (a T2 frame is 217 ms
+here; the time interleaver spans one):
+
+- `p1det`: P1 by two running coherent sums (C against A's start, A's end
+  against B); the carrier offset from their phases to ±4.5 kHz and the whole P1
+  spacings from where its carriers sit; S1 and S2 by DBPSK.
+- `receiver`: acquisition on a quarter-second stretch resampled to the signal's
+  native 64/7 MS/s; the guard interval chosen as the longest window whose
+  cyclic-prefix correlation is within 90 % of the best, the extended mode and
+  the rest confirmed by reading L1-pre; then per frame: P1 near where it is
+  expected, the symbols' positions by their cyclic prefixes and a robust line
+  through them (the clock from its slope, the carrier from the prefixes'
+  phase), L1 read again every frame (and the lock dropped after three misses),
+  the PLP's cells to the FEC stage.
+- `frame`: each symbol's transform (early start, the fractional sample undone
+  by a phase ramp), the symbols aligned to the first data symbol by the
+  continual pilots (a coherent search over ±3·10⁻³ rad a carrier, then the
+  slopes' trend fed back to the clock), the channel from the scattered-pilot
+  lattice (a least-squares polynomial in time through the nearest four
+  sightings, a six-point line past the ends; a polyphase windowed sinc across
+  frequency), the noise from the continual pilots, per-cell variance
+  `σ²/|H|²`, the data cells deinterleaved as they are written. P2 symbols are
+  equalised from their own pilots, the closing symbol likewise.
+- `plp` and `pipe`: the cells to transport packets on a thread of its own with
+  two frames in flight and 2 to 4 worker threads (a quarter of the machine's
+  threads): time and cell deinterleavers, the rotated-QAM demapper to bytes,
+  the bit deinterleaver, LDPC, BCH, the HEM/NM unpacker. A block whose LDPC
+  stalled is passed to BCH anyway (the information bits are usually right).
+- `auto` (`AutoReceiver`): DVB-T and DVB-T2 acquisition run side by side while
+  there is no lock and the one that locks keeps the stream. The engine thread,
+  `decdvbt decode` and the GUI use it.
+
+**What the real signal taught** (see also the `hackrf-rf-amp` memory): the
+HackRF needs its RF amp on; C30 has two paths almost as strong as each other
+(6.5 and 8.4 µs) and so deep notches, and the channel moves, so a pooled
+static estimate fails and each symbol is aligned on its own; the 32K mode
+needs the clock followed by resampling (the interpolator's step is steered
+from the timing line); the first and last symbols of a frame got 3 to 4 dB
+less SNR than the others until the pilots were extrapolated by a line, not a
+cubic; a window that starts a little behind the block completing the last one
+used to be zero-filled and cost a frame in twenty (`Window::with_history`).
+Wider least-squares windows raise the MER the pilots show by up to 2 dB and
+lose two or three times as many blocks: the estimate's errors are then
+correlated, which the LDPC code likes less than independent noise.
+
+**CPU** (6 s of C30, seconds of one thread; the receiver was 0.05× real time at
+first and runs at about 2× now):
+
+| stage | first | now |
+|---|---|---|
+| LDPC | 56 | 4.0 |
+| rotated 256-QAM demap | 12 | 1.8 |
+| equaliser | 2.2 | 0.7 |
+| deinterleave | 0.75 | 0.46 |
+
+The LDPC loops compile to scalar code (about ten cycles a lane); a hand-written
+AVX2 kernel (`ldpc/avx2.rs`, 74 µs an iteration for a 64K block against 760)
+gives the same decisions bit for bit (a test compares them). Normalization
+15/16 and an LLR scale of 8 (found on the off-air signal) cut the iterations a
+block from 12.3 to 7 to 9 and the failed blocks tenfold. The rotated demapper
+is exact and O(G) a cell: for each level of one axis the best level of the other
+is the lattice point nearest a parabola's vertex. The equaliser's sines and
+cosines became phase ramps by recurrence; the time interpolation's weights and
+the pilots' values are worked out once; the frequency interpolation puts the
+phases in vector lanes. Per-stage times: `t2_decode`, `decdvbt decode`
+(per stage, % of real time) and `t2_bench` (one block).
+
+**Thresholds** (`decdvbt-fec::t2::threshold`, generated by `t2_thresholds`): the
+C/N this decoder needs per mode with the noise known exactly, 0.5 dB (QPSK) to
+1.3 dB (256-QAM 2/3) above the standard's TS 102 831 Table 44 (non-iterative
+demapping, 8-bit min-sum). The card's margin is against these: C30 shows
++1.4 dB (MER 20.8 dB against 19.4).
+
+**GUI and CLI.** The card names DVB-T2, the mode, the PLP, the FEC and the
+LDPC blocks lost and iterations a block; the scopes show the pilots and the
+equalised cells (the ideal grid for an unrotated constellation), the channel's
+gain, SNR and impulse response come from the frame's estimate, and the
+services, the programme guide and the TS analyser work as for DVB-T. `decdvbt
+decode C30 --amp --lna 32 --vga 8 -o x.ts` decodes live (the gain flags are
+new); both it and the GUI say which standard they found. Tools: `cargo run
+--release -p decdvbt-rx --example t2_decode -- x.cs8 out.ts [MS/s] [vfo_hz]
+[seconds]` (env `THREADS`), `-p decdvbt-fec --example t2_bench -- 256 2/3 normal
+rot 22`, `--example t2_thresholds`, `--example t2_tune`.
+
+**Known gaps and next steps.** The UK EPG's text is Huffman-compressed
+(DVB's 0x1F tables), which the text decoder does not do yet, so event names
+show as noise (service names are fine). MISO, FEF, T2-Lite and TIME_IL_TYPE 1
+are not decoded. The band scan does not look for T2. The channel's moving
+echoes at 32K are followed frame by frame, not within one. Resampling is 14 %
+of the receive thread (the HackRF could run at 64/7 MS/s and skip it); the
+LDPC is still most of the CPU.

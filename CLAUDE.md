@@ -19,6 +19,11 @@ cargo run --release -p decdvbt-cli -- sound captures/c26_514.000MHz_10Msps.cs8  
 cargo run --release -p decdvbt-cli -- decode captures/c23_490.000MHz_10Msps_amp.cs8 -o out/c23.ts  # a transport stream, the services, RS and CPU stats
 cargo run --release -p decdvbt-cli -- capture C23 --amp --lna 32 --vga 8 --record x.cs8  # the RF amp must be on for DVB-T
 cargo run --release -p decdvbt-rx --example diag -- x.cs8   # per-symbol equaliser diagnostics (see its header)
+cargo run --release -p decdvbt-cli -- decode C30 --amp --lna 32 --vga 8 -o out/c30.ts   # live DVB-T2 (or T) from the HackRF; --progress prints a line a second
+cargo run --release -p decdvbt-cli -- modulate --t2 uk --seconds 2.4 --cn 30 --cfo 50123 --sco 4 --path 0:0 --path 3:-12 captures/x.cs8   # a DVB-T2 test signal (uk, small, or 8k-1/16-pp4-16qam-3/4-short-ext)
+cargo run --release -p decdvbt-rx --example t2_decode -- captures/c30_546.000MHz_10Msps_amp.cs8 out/c30.ts 10 0 8   # the T2 receiver alone, per-frame lines and per-stage times (env THREADS)
+cargo run --release -p decdvbt-fec --example t2_bench -- 256 2/3 normal rot 22   # one T2 FEC block: demap, LDPC, BCH times
+cargo run --release -p decdvbt-fec --example t2_thresholds   # regenerates t2/threshold.rs's table
 cargo run --release -p decdvbt-gui                               # the GUI
 cargo run --release -p decdvbt-gui -- captures/c23_490.000MHz_10Msps_amp.cs8 --decode --screenshot out/x.png
 cargo run -p decdvbt-gui --example make_icon                      # redraws apps/decdvbt-gui/assets/icon.ico and icon-256.png (preview in out/)

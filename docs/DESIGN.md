@@ -122,10 +122,12 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
   optimiser, the non-time maps (delay–Doppler, frequency–Doppler, error cloud,
   MER per constellation point) and a 60 fps mode. *(done, 2026-10-23, see
   STATUS.md)*
-- **M5** — DVB-T2 modulator.
+- **M5** — DVB-T2 modulator. *(done, 2026-10-23, see STATUS.md)*
 - **M6** — DVB-T2 receiver: P1, P2/L1, LDPC/BCH, TI, rotated QAM → TS.
-  Live Freeview HD.
-- **M7** — real-time T2 performance, band scan, release.
+  Live Freeview HD. *(done, 2026-10-23: C30 decodes live from the HackRF, 13
+  services, in real time; the LDPC runs on a hand-written AVX2 kernel)*
+- **M7** — band scan with T2, the UK EPG's Huffman text, Airspy, release; the
+  CPU work that is left (resampling, LDPC).
 
 ## 6. Constraints found at kickoff
 
