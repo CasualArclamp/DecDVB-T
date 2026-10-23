@@ -886,8 +886,9 @@ continuity jump and no bad section; `decdvbt decode --plp N` picks a PLP.
 Freeview/Freesat Huffman tables (DVB text type 0x1F), which the text decoder
 does not do yet, so event names show as noise (service names are fine): it
 needs the tables (MythTV's `freesat_tables`, GPL-2+). MISO, FEF, T2-Lite and
-TIME_IL_TYPE 1 are not decoded, and only one PLP at a time. The band scan does
-not look for T2. The Maps tab and the channel sounder are DVB-T's (the Channel
+TIME_IL_TYPE 1 are not decoded, and only one PLP at a time. `decdvbt scan --classify 5` tunes each channel that looks like digital TV and
+says DVB-T or DVB-T2 and its mode (live: C22, C23, C25, C26 and C28 are DVB-T,
+C30 DVB-T2 256-QAM 2/3 rotated). The Maps tab and the channel sounder are DVB-T's (the Channel
 and Maps tabs say so while a T2 signal is locked; the Scopes and History tabs
 show T2's channel). The channel's moving echoes at 32K are followed frame by
 frame, not within one.

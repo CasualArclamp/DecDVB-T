@@ -13,6 +13,7 @@ cargo test --workspace                  # unit tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run --release -p decdvbt-cli -- channels
 cargo run --release -p decdvbt-cli -- scan                       # HackRF: which channels carry a mux
+cargo run --release -p decdvbt-cli -- scan --amp --lna 32 --vga 8 --classify 5   # ... and say DVB-T or DVB-T2 (and the mode) for each
 cargo run --release -p decdvbt-cli -- capture C26 --record x.cs8 # level, drops, CPU; optional IQ
 cargo run --release -p decdvbt-cli -- modulate --cn 25 --profile urban  # a DVB-T test signal file
 cargo run --release -p decdvbt-cli -- sound captures/c26_514.000MHz_10Msps.cs8  # lock, offsets, paths

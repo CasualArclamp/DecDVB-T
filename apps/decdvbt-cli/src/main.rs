@@ -57,6 +57,11 @@ enum Command {
         /// Dwell on each channel, seconds.
         #[arg(long, default_value_t = 0.6)]
         dwell: f64,
+        /// Then tune each channel that looks like digital TV and say whether
+        /// it is DVB-T or DVB-T2 (and the mode), listening for this many
+        /// seconds at most (0: do not).
+        #[arg(long, default_value_t = 0.0)]
+        classify: f64,
     },
     /// Run the channel sounder: lock to a DVB-T signal and list its paths.
     Sound(Box<sound::SoundArgs>),
@@ -119,7 +124,8 @@ fn main() -> Result<()> {
             vga,
             amp,
             dwell,
-        } => scan(lna, vga, amp, dwell)?,
+            classify,
+        } => scan(lna, vga, amp, dwell, classify)?,
         Command::Capture {
             source,
             rate,
@@ -248,7 +254,7 @@ fn look(db: &[f32], rate: f64) -> ChannelLook {
     }
 }
 
-fn scan(lna: u16, vga: u16, amp: bool, dwell: f64) -> Result<()> {
+fn scan(lna: u16, vga: u16, amp: bool, dwell: f64, classify: f64) -> Result<()> {
     let first = uk_channels().next().unwrap();
     let (src, drops) = live(first, 10.0, lna, vga, amp)?;
     let rx = Rx::start(src, RxOptions::default(), drops);
@@ -283,17 +289,75 @@ fn scan(lna: u16, vga: u16, amp: bool, dwell: f64) -> Result<()> {
         let over = l.inband_db - floor;
         // Well over the floor with a step at the edges: a block of OFDM.
         let tv = over > 8.0 && l.shoulder_db > 6.0;
+        let what = if tv && classify > 0.0 {
+            classify_channel(&rx, n, classify)
+        } else if tv {
+            "<- digital TV?".to_string()
+        } else {
+            String::new()
+        };
         println!(
-            "C{n:<4} {:6.1}  {:6.1}  {:6.1}  {:7.1}  {:9.1}  {}",
+            "C{n:<4} {:6.1}  {:6.1}  {:6.1}  {:7.1}  {:9.1}  {what}",
             uhf_centre_hz(n).unwrap() / 1e6,
             l.inband_db,
             l.ripple_db,
             l.shoulder_db,
             over,
-            if tv { "<- digital TV?" } else { "" }
         );
     }
     Ok(())
+}
+
+/// Tune channel `n` and let the receiver say what the signal is: DVB-T or
+/// DVB-T2, and its mode, within `seconds`.
+fn classify_channel(rx: &Rx, n: u8, seconds: f64) -> String {
+    use decdvbt_rx::auto::Standard;
+    let centre = uhf_centre_hz(n).unwrap();
+    rx.send(RxCommand::Retune(centre));
+    std::thread::sleep(Duration::from_millis(300));
+    rx.send(RxCommand::Decode(Some(centre)));
+    let t0 = Instant::now();
+    let mut verdict = format!("digital TV? (no lock in {seconds:.0} s)");
+    while t0.elapsed().as_secs_f64() < seconds {
+        std::thread::sleep(Duration::from_millis(200));
+        let u = rx.take_decoder();
+        match u.standard {
+            Standard::Dvbt2 => {
+                if let Some(t2) = &u.t2
+                    && let (Some(m), Some(p)) = (&t2.mode, &t2.plp)
+                    && t2.decoding
+                {
+                    verdict = format!(
+                        "DVB-T2 {} {}{}, {} {} GI {}, MER {:.1} dB",
+                        p.qam.name(),
+                        p.rate,
+                        if p.rotated { " rotated" } else { "" },
+                        m.fft.name(),
+                        m.pp,
+                        m.guard,
+                        t2.snr_db
+                    );
+                    break;
+                }
+            }
+            Standard::Dvbt => {
+                if let Some(t) = u.status.tps.filter(|_| u.status.decoding) {
+                    verdict = format!(
+                        "DVB-T {} {}, {} guard {}, MER {:.1} dB",
+                        t.modulation.name(),
+                        t.rate_hp.name(),
+                        t.fft.name(),
+                        t.guard.name(),
+                        u.status.snr_db
+                    );
+                    break;
+                }
+            }
+            Standard::Searching => {}
+        }
+    }
+    rx.send(RxCommand::Decode(None));
+    verdict
 }
 
 #[cfg(feature = "hackrf")]
