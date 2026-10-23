@@ -21,6 +21,8 @@ cargo run --release -p decdvbt-cli -- capture C23 --amp --lna 32 --vga 8 --recor
 cargo run --release -p decdvbt-rx --example diag -- x.cs8   # per-symbol equaliser diagnostics (see its header)
 cargo run --release -p decdvbt-gui                               # the GUI
 cargo run --release -p decdvbt-gui -- captures/c23_490.000MHz_10Msps_amp.cs8 --decode --screenshot out/x.png
+# the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|none, --window ts|epg,
+# --service ID (select), --play ID, --http 127.0.0.1:8001, --udp 127.0.0.1:1234, --record
 ```
 
 Captures live in `captures/` and are named by their tuning

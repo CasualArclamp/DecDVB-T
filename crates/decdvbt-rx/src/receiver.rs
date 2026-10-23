@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use decdvbt_core::Iq;
 use decdvbt_core::dvbt::{Alpha, Bandwidth, FftSize, Guard, Modulation, Rate};
 use decdvbt_fec::viterbi::Viterbi;
-use decdvbt_ofdm::pilots::prbs;
+use decdvbt_ofdm::pilots::{SymbolPlan, prbs};
 use decdvbt_ofdm::tps::TpsFrame;
 
 use crate::chest::Equalizer;
@@ -33,6 +33,7 @@ use crate::demap::Demapper;
 use crate::interp::Interpolator;
 use crate::lock::{ACQ_NATIVE, Failure, lock_on};
 use crate::outer::{OuterDecoder, OuterStats};
+use crate::scope::{self, MeasureState, Measurements, Scopes};
 use crate::symbol::{PAD, SymbolReader};
 use crate::tps_rx::TpsReceiver;
 use crate::window::Window;
@@ -168,6 +169,13 @@ pub struct Receiver {
     next_attempt: u64,
     ts: Vec<u8>,
     carriers: Vec<Iq>,
+    /// The display's asks: the next symbol's cells wanted, the ones made,
+    /// the carriers as read (kept when wanted) and what making them needs.
+    scope_wanted: bool,
+    scopes: Option<Scopes>,
+    raw: Vec<Iq>,
+    plan: Option<SymbolPlan>,
+    measure_state: MeasureState,
 }
 
 impl Receiver {
@@ -184,11 +192,45 @@ impl Receiver {
             next_attempt: 0,
             ts: Vec::new(),
             carriers: Vec::new(),
+            scope_wanted: false,
+            scopes: None,
+            raw: Vec::new(),
+            plan: None,
+            measure_state: MeasureState::default(),
         }
     }
 
     pub fn status(&self) -> &ReceiverStatus {
         &self.status
+    }
+
+    /// Ask for the cells of the next symbol (for [`take_scopes`](Self::take_scopes)):
+    /// nothing is copied or made until this is called, and then only once.
+    pub fn request_scopes(&mut self) {
+        self.scope_wanted = true;
+    }
+
+    /// The cells asked for, once the next symbol has come.
+    pub fn take_scopes(&mut self) -> Option<Scopes> {
+        self.scopes.take()
+    }
+
+    /// The channel as the last symbol's estimate has it (the gain and the
+    /// signal-to-noise ratio across the band, the impulse response and its
+    /// echoes), or `None` with no lock or before the estimate is whole.
+    pub fn measure(&mut self) -> Option<Measurements> {
+        let t = self.track.as_ref().filter(|t| t.eq.ready())?;
+        let fft = t.reader.fft;
+        let guard_us = (fft.n() as f64 / t.guard.divisor() as f64 / self.fs_native * 1e6) as f32;
+        Some(scope::measure(
+            &mut self.measure_state,
+            fft,
+            self.fs_native,
+            guard_us,
+            t.eq.channel(),
+            &t.eq.w,
+            &t.eq.noise,
+        ))
     }
 
     /// Forget the lock and the stretch wanted: the stream has jumped.
@@ -342,6 +384,10 @@ impl Receiver {
             return;
         }
         let t1 = Instant::now();
+        if self.scope_wanted {
+            self.raw.clear();
+            self.raw.extend_from_slice(&carriers);
+        }
         t.eq.process(&mut carriers, t.phase);
         t.reader.correct(f64::from(t.eq.timing_error()));
         let t2 = Instant::now();
@@ -368,6 +414,24 @@ impl Receiver {
             0
         };
         self.carriers = carriers;
+
+        if self.scope_wanted {
+            self.scope_wanted = false;
+            let fft = t.reader.fft;
+            if self.plan.as_ref().is_none_or(|p| p.fft != fft) {
+                self.plan = Some(SymbolPlan::new(fft));
+            }
+            if let Some(plan) = &self.plan {
+                self.scopes = Some(scope::snapshot(
+                    plan,
+                    t.phase,
+                    &self.raw,
+                    &t.eq.z,
+                    self.status.tps.map(|i| i.modulation),
+                    t.symbols,
+                ));
+            }
+        }
 
         let phase_now = t.phase;
         t.phase = (t.phase + 1) % 4;
@@ -570,6 +634,59 @@ mod tests {
                 "{fs}: {n} packets, {consecutive} in a row"
             );
         }
+    }
+
+    #[test]
+    fn the_scopes_and_measurements_show_the_signal_and_its_echo() {
+        let opts = SimOptions {
+            mode: Mode::parse("64qam-2/3-8k-1/32").unwrap(),
+            cell_id: None,
+            ts_file: None,
+            seconds: 1.2,
+            out_rate_hz: Some(10e6),
+            level_dbfs: -20.0,
+            channel: Channel {
+                paths: vec![Path::echo(0.0, 0.0), Path::echo(3.0, -10.0)],
+                cn_db: Some(30.0),
+                ..Default::default()
+            },
+        };
+        let mut x = Vec::new();
+        generate(&opts, |b| {
+            x.extend_from_slice(b);
+            Ok(())
+        })
+        .unwrap();
+        let mut rx = Receiver::new(ReceiverConfig::new(10e6, 0.0));
+        let mut scopes = None;
+        let mut at = 0;
+        while at < x.len() {
+            let n = 100_003.min(x.len() - at);
+            if rx.status().decoding {
+                rx.request_scopes();
+            }
+            rx.push(&x[at..at + n], at as u64);
+            scopes = rx.take_scopes().or(scopes);
+            at += n;
+        }
+        let s = scopes.expect("scopes");
+        assert_eq!(s.modulation, Some(Modulation::Qam64));
+        assert!(s.raw.len() <= 3000 && s.raw.len() > 1000);
+        assert_eq!(s.tps.len(), 68);
+        // Pilots at ±4/3 on the real axis, the TPS cells at ±1, the data at
+        // unit mean power (30 dB of noise leaves them near their points).
+        let mean = |v: &[Iq], f: fn(&Iq) -> f32| v.iter().map(f).sum::<f32>() / v.len() as f32;
+        assert!((mean(&s.pilots, |c| c.re.abs()) - 4.0 / 3.0).abs() < 0.05);
+        assert!(mean(&s.pilots, |c| c.im.abs()) < 0.1);
+        assert!((mean(&s.tps, |c| c.norm()) - 1.0).abs() < 0.1);
+        assert!((mean(&s.data, |c| c.norm_sqr()) - 1.0).abs() < 0.1);
+
+        let m = rx.measure().expect("measurements");
+        assert!(m.mean_snr_db > 20.0, "{}", m.mean_snr_db);
+        assert!((m.guard_us - 28.0).abs() < 0.01, "{}", m.guard_us);
+        let e = m.echoes.iter().find(|e| e.db > -14.0).expect("an echo");
+        assert!((e.delay_us.abs() - 3.0).abs() < 0.3, "{e:?}");
+        assert!((e.db + 10.0).abs() < 2.0, "{e:?}");
     }
 
     #[test]

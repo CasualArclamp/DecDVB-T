@@ -620,6 +620,7 @@ dependencies = [
  "decdvbt-io",
  "decdvbt-mod",
  "decdvbt-rx",
+ "decdvbt-ts",
  "rustfft",
  "tracing",
  "windows-sys 0.61.2",
@@ -639,10 +640,13 @@ name = "decdvbt-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "decdvbt-audio",
  "decdvbt-core",
  "decdvbt-engine",
  "decdvbt-io",
  "decdvbt-rx",
+ "decdvbt-ts",
+ "decdvbt-video",
  "eframe",
  "image",
  "rfd",

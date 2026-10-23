@@ -11,6 +11,7 @@
 //! - [`udp`]: transport packets carried in UDP, found in an IP stream.
 
 pub mod backlog;
+pub mod epg;
 pub mod psi;
 pub mod section;
 pub mod serve;
@@ -32,9 +33,10 @@ pub fn null_packet() -> [u8; TS_LEN] {
     p
 }
 
+pub use epg::{Epg, EpgEvent, LocalTime, genre_name};
 pub use psi::{
-    EsInfo, Event, NetworkInfo, PidRow, PidStats, Programme, Transponder, TsAnalyser, TsReport,
-    ca_system_name, service_type_name, stream_type_name,
+    EsInfo, Event, NetworkInfo, PidRow, PidStats, Programme, Terrestrial, Transponder, TsAnalyser,
+    TsReport, ca_system_name, service_type_name, stream_type_name,
 };
 pub use sink::{TcpSink, TsFile, TsTap, UdpSink};
 pub use udp::{UdpTs, UdpTsFinder};

@@ -232,6 +232,12 @@ impl Equalizer {
         self.fft
     }
 
+    /// The last symbol's channel estimate on every carrier, as real and
+    /// imaginary arrays.
+    pub fn channel(&self) -> (&[f32], &[f32]) {
+        (&self.hr, &self.hi)
+    }
+
     fn detect() -> bool {
         #[cfg(target_arch = "x86_64")]
         {

@@ -17,6 +17,7 @@ pub mod interp;
 pub mod lock;
 pub mod outer;
 pub mod receiver;
+pub mod scope;
 pub mod sounder;
 pub mod symbol;
 pub mod tps_rx;

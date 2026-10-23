@@ -72,7 +72,14 @@ ring overflow on one DVB-T mux). Every design choice is weighed against this:
   (EN 300 743), and **radio services** (no video).
 - PSI/SI viewer: NIT/SDT/EIT now/next, PMT tree, bitrate per PID.
 - Measurements: MER per carrier, channel frequency and impulse response, echo
-  profile, pre- and post-FEC BER, LDPC iterations.
+  profile, pre- and post-FEC BER, LDPC iterations. (Pre-FEC here is the BER
+  into the Reed–Solomon code; a BER before the Viterbi decoder would need the
+  decoded bits re-encoded and was left out for the CPU it costs.)
+- Transport stream plumbing: the receive thread hands decoded packets to a
+  thread of its own (`decdvbt-engine::hub`) that runs the analyser and feeds
+  the outputs and the player's tap, so none of it can make a HackRF read late.
+  The GUI polls its view; the guide is copied out only while its window is
+  open.
 
 ## 4. What carries over from DecSAT
 
@@ -102,7 +109,9 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
 - **M3b** — the rest of the DVB-T receiver: equaliser, TPS, demapping, inner
   deinterleavers, Viterbi, RS → TS. Live Freeview DVB-T. *(done, 2026-10-23;
   five muxes decode from the HackRF with the RF amp on, two error-free)*
-- **M4** — player, PSI/SI, service panel, scopes, measurements.
+- **M4** — player, PSI/SI, service panel, scopes, measurements. *(done,
+  2026-10-23; the in-app player is untested here for want of ffmpeg, see
+  STATUS.md)*
 - **M5** — DVB-T2 modulator.
 - **M6** — DVB-T2 receiver: P1, P2/L1, LDPC/BCH, TI, rotated QAM → TS.
   Live Freeview HD.

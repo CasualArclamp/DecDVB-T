@@ -69,6 +69,8 @@ pub struct Selection {
     pub pids: Vec<u16>,
     pub video: Option<u16>,
     pub audio: Option<u16>,
+    /// A DVB subtitle PID to draw over the picture.
+    pub subs: Option<u16>,
     /// How interlaced pictures are deinterlaced (bob ×2 by default).
     pub deint: Deinterlace,
     /// Decode the video on the GPU (ffmpeg `-hwaccel auto`; software when
@@ -235,7 +237,7 @@ impl VideoPlayer {
         let (s, exe, args) = (
             sh.clone(),
             exe.to_path_buf(),
-            ffmpeg::args(sel.video, sel.audio, sel.deint, sel.gpu),
+            ffmpeg::args(sel.video, sel.audio, sel.subs, sel.deint, sel.gpu),
         );
         threads.push(
             std::thread::Builder::new()
@@ -729,6 +731,7 @@ mod tests {
             pids: vec![0, 0x1000, 0x100, 0x101],
             video: Some(0x100),
             audio: audio.then_some(0x101),
+            subs: None,
             deint: Deinterlace::default(),
             gpu: false,
         };

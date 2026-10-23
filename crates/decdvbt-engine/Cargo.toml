@@ -12,6 +12,7 @@ rust-version.workspace = true
 decdvbt-core = { path = "../decdvbt-core" }
 decdvbt-io = { path = "../decdvbt-io" }
 decdvbt-rx = { path = "../decdvbt-rx" }
+decdvbt-ts = { path = "../decdvbt-ts" }
 rustfft.workspace = true
 tracing.workspace = true
 

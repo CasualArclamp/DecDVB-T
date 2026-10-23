@@ -1,27 +1,37 @@
 // made by CasualArclamp
 //! DecDVB-T desktop GUI.
 //!
-//! M1: a HackRF (or an IQ file) in, the spectrum and waterfall over the UHF
-//! band, tuning by channel, an IQ recorder, and the cost of it all in the
-//! status bar. The receiver, the constellation scopes and the services
-//! panel's contents arrive with M3/M4; the right-hand panel and the bottom
-//! one are laid out now so they do not move later.
+//! A HackRF (or an IQ file) in, the spectrum and waterfall over the UHF band,
+//! tuning by channel, an IQ recorder and the cost of it all in the status
+//! bar; the receiver's services list, transport stream analyser, programme
+//! guide and player; and, at the bottom, the constellation scopes and
+//! channel measurements (or the channel sounder's fading and delay–Doppler
+//! panels).
 
 mod band;
 mod card;
 mod channel_view;
+mod epg_view;
+mod external;
+mod player;
+mod prefs;
+mod scopes;
+mod services;
 mod source;
+mod ts_viewer;
 mod waterfall;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_channels};
 use decdvbt_core::dvbt::Mode;
-use decdvbt_engine::{Command, CpuGauge, Row, Stats, spectral_cn_db};
+use decdvbt_engine::{Command, CpuGauge, Outputs, Row, Stats, TsView, spectral_cn_db};
 use decdvbt_io::name_hint;
 use decdvbt_rx::receiver::ReceiverStatus;
 use decdvbt_rx::sounder::Geometry;
+use decdvbt_ts::{Epg, TsTap};
 use eframe::egui::{self, Color32, RichText};
 use source::{Gains, Session, Spec};
 use waterfall::{History, RingImage};
@@ -30,8 +40,10 @@ const AMBER: Color32 = Color32::from_rgb(255, 176, 40);
 const RED: Color32 = Color32::from_rgb(255, 90, 80);
 const GREEN: Color32 = Color32::from_rgb(110, 220, 130);
 
-/// Height of the channel panels (fading waterfall, delay-Doppler map).
+/// Height of the channel panels (fading waterfall, delay-Doppler map) and of
+/// the scopes.
 const CHANNEL_PANEL_H: f32 = 270.0;
+const SCOPES_PANEL_H: f32 = 250.0;
 /// HackRF sample rates with the least clock jitter that hold a channel.
 const RATES_MSPS: [f64; 4] = [10.0, 12.5, 16.0, 20.0];
 /// Half a channel plus a margin: a channel is received without retuning only
@@ -49,10 +61,31 @@ struct Options {
     fps: f64,
     /// A mode to hold the C/N against, until the receiver reads the TPS.
     assume: Option<Mode>,
-    /// Start with the channel panels closed.
-    no_channel: bool,
+    /// What the bottom panel starts as.
+    bottom: Bottom,
     /// Start with the receiver decoding (on unless `--no-decode`).
     decode: bool,
+    /// Open a window at the start (for screenshots): "ts" or "epg".
+    window: Option<String>,
+    /// Select this service at the start (its number).
+    service: Option<u16>,
+    /// Play this service as soon as the receiver has read its tables.
+    play: Option<u16>,
+    /// Outputs on from the start: an HTTP server and a UDP target
+    /// (`127.0.0.1:8001`), and a `.ts` recording.
+    http: Option<String>,
+    udp: Option<String>,
+    record: bool,
+}
+
+/// What the bottom panel shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bottom {
+    /// The constellation scopes and the channel measurements.
+    Scopes,
+    /// The sounder's fading waterfall and delay–Doppler map.
+    Channel,
+    Hidden,
 }
 
 impl Options {
@@ -65,8 +98,14 @@ impl Options {
             after: 4.0,
             fps: 15.0,
             assume: None,
-            no_channel: false,
+            bottom: Bottom::Scopes,
             decode: true,
+            window: None,
+            service: None,
+            play: None,
+            http: None,
+            udp: None,
+            record: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -84,7 +123,29 @@ impl Options {
                     let v = value("a mode, e.g. 64qam-2/3-8k-1/32")?;
                     o.assume = Some(Mode::parse(&v)?);
                 }
-                "--no-channel" => o.no_channel = true,
+                "--no-channel" => o.bottom = Bottom::Hidden,
+                "--bottom" => {
+                    o.bottom = match value("scopes, channel or none")?.as_str() {
+                        "scopes" => Bottom::Scopes,
+                        "channel" => Bottom::Channel,
+                        "none" => Bottom::Hidden,
+                        v => return Err(format!("--bottom: not scopes, channel or none: {v}")),
+                    };
+                }
+                "--window" => o.window = Some(value("ts or epg")?),
+                "--http" => o.http = Some(value("an address, e.g. 127.0.0.1:8001")?),
+                "--udp" => o.udp = Some(value("an address, e.g. 127.0.0.1:1234")?),
+                "--record" => o.record = true,
+                "--play" => {
+                    o.play = Some(value("a service id")?.parse().map_err(|_| "bad --play")?)
+                }
+                "--service" => {
+                    o.service = Some(
+                        value("a service id")?
+                            .parse()
+                            .map_err(|_| "bad --service")?,
+                    )
+                }
                 "--decode" => o.decode = true,
                 "--no-decode" => o.decode = false,
                 "--fps" => o.fps = value("frames a second")?.parse().map_err(|_| "bad --fps")?,
@@ -109,7 +170,8 @@ fn main() -> eframe::Result {
             eprintln!("decdvbt-gui: {e}");
             eprintln!(
                 "usage: decdvbt-gui [capture.cs8] [--channel C26] [--rate MSPS] \
-                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] [--no-channel] [--no-decode]"
+                 [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] \
+                 [--bottom scopes|channel|none] [--window ts|epg] [--service ID] [--play ID]                  [--http ADDR] [--udp ADDR] [--record] [--no-decode]"
             );
             std::process::exit(2);
         }
@@ -144,10 +206,31 @@ enum SourceKind {
 
 struct App {
     opts: Options,
-    /// The channel panels (fading waterfall, delay-Doppler map), shown or
-    /// not: the sounder runs only while they are.
-    show_channel: bool,
+    /// The bottom panel. The sounder runs only while it shows the channel
+    /// panels, and the scopes and measurements are made only while it shows
+    /// them.
+    bottom: Bottom,
     chan_view: channel_view::ChannelView,
+    scope: scopes::ScopeView,
+    /// What was last sent for the scopes and measurements.
+    scopes_sent: bool,
+    /// The transport stream as the hub reports it (polled four times a
+    /// second), the programme guide (once a second, while its window is
+    /// open), and the service picked in the list.
+    ts: TsView,
+    ts_at: Instant,
+    epg: Arc<Epg>,
+    epg_at: Instant,
+    selected: Option<u16>,
+    ts_window: ts_viewer::TsViewer,
+    epg_window: epg_view::EpgView,
+    tv: player::TvWindow,
+    /// The player's tap, and the outputs as last sent to the hub.
+    tap: Option<TsTap>,
+    outputs_ui: services::OutputsUi,
+    outputs_sent: Option<Outputs>,
+    /// VLC is to be opened on this service once the HTTP output is up.
+    pending_vlc: Option<u16>,
     /// The RF frequency the sounder was last asked to look at (`Some(None)`:
     /// asked to stop); `None`: not asked since the source began.
     sounder_sent: Option<Option<f64>>,
@@ -237,8 +320,32 @@ impl App {
             ring: RingImage::default(),
             cn_db: None,
             cn_misses: 0,
-            show_channel: !opts.no_channel,
+            bottom: opts.bottom,
             chan_view: channel_view::ChannelView::default(),
+            scope: scopes::ScopeView::default(),
+            scopes_sent: false,
+            ts: TsView::default(),
+            ts_at: Instant::now(),
+            epg: Arc::new(Epg::new()),
+            epg_at: Instant::now(),
+            selected: opts.service,
+            ts_window: ts_viewer::TsViewer::new(opts.window.as_deref() == Some("ts")),
+            epg_window: epg_view::EpgView::new(opts.window.as_deref() == Some("epg")),
+            tv: player::TvWindow::default(),
+            tap: None,
+            outputs_ui: {
+                let mut o = services::OutputsUi::default();
+                if let Some(a) = &opts.http {
+                    (o.http_on, o.http) = (true, a.clone());
+                }
+                if let Some(a) = &opts.udp {
+                    (o.udp_on, o.udp) = (true, a.clone());
+                }
+                o.record = opts.record;
+                o
+            },
+            outputs_sent: None,
+            pending_vlc: None,
             sounder_sent: None,
             decode: opts.decode,
             decoder_sent: None,
@@ -304,6 +411,8 @@ impl App {
                 self.dec = ReceiverStatus::default();
                 self.dec_packets = 0;
                 self.dec_rate = None;
+                self.reset_stream();
+                self.outputs_sent = None;
                 self.vfo_hz = vfo;
                 self.reset_view();
                 self.note.clear();
@@ -340,6 +449,22 @@ impl App {
         self.smooth.clear();
         self.span_hz = 0.0;
         self.chan_view.reset();
+        self.scope.reset();
+    }
+
+    /// A different multiplex (or none): the services, the guide and the
+    /// player's stream are no longer this one's.
+    fn reset_stream(&mut self) {
+        self.ts = TsView::default();
+        self.epg = Arc::new(Epg::new());
+        self.selected = None;
+        self.pending_vlc = None;
+        self.tv.close();
+        self.tap = None;
+    }
+
+    fn show_channel(&self) -> bool {
+        self.bottom == Bottom::Channel
     }
 
     /// Ask the engine to run the sounder on the signal under the VFO while
@@ -348,7 +473,7 @@ impl App {
     fn sync_sounder(&mut self) {
         let Some(s) = &self.session else { return };
         let want = self
-            .show_channel
+            .show_channel()
             .then(|| {
                 self.vfo_hz
                     .or((self.centre_hz > 0.0).then_some(self.centre_hz))
@@ -381,6 +506,114 @@ impl App {
                 self.dec = ReceiverStatus::default();
                 self.dec_packets = 0;
                 self.dec_rate = None;
+                self.reset_stream();
+            }
+        }
+    }
+
+    /// Ask the engine for the scopes' cells and the measurements while the
+    /// scopes are shown and the receiver is decoding, and to stop when not.
+    fn sync_scopes(&mut self) {
+        let Some(s) = &self.session else { return };
+        let want = self.bottom == Bottom::Scopes && self.decode;
+        if want != self.scopes_sent {
+            s.rx.send(Command::Scopes(want));
+            s.rx.send(Command::Measure(want));
+            self.scopes_sent = want;
+            if !want {
+                self.scope.reset();
+            }
+        }
+    }
+
+    /// Tell the hub where the stream goes, when that has changed.
+    fn sync_outputs(&mut self) {
+        let Some(s) = &self.session else { return };
+        let name = self
+            .vfo_hz
+            .and_then(uhf_channel_at)
+            .map_or_else(|| format!("C{}", self.channel), |c| format!("C{c}"));
+        let o = self
+            .outputs_ui
+            .outputs(&name, self.tap.clone(), self.pending_vlc.is_some());
+        if self.outputs_sent.as_ref() != Some(&o) {
+            s.rx.set_outputs(o.clone());
+            self.outputs_sent = Some(o);
+        }
+    }
+
+    /// The transport stream's view and the guide, from the hub.
+    fn poll_stream(&mut self) {
+        let Some(s) = &self.session else { return };
+        if !self.decode {
+            return;
+        }
+        if self.ts_at.elapsed() >= Duration::from_millis(250) {
+            self.ts_at = Instant::now();
+            self.ts = s.rx.ts_view();
+        }
+        if self.epg_window.open && self.epg_at.elapsed() >= Duration::from_secs(1) {
+            self.epg_at = Instant::now();
+            self.epg = s.rx.epg();
+        }
+        // A service asked for on the command line plays once its streams are
+        // known.
+        if let Some(sid) = self.opts.play
+            && self
+                .ts
+                .report
+                .programmes
+                .iter()
+                .any(|p| p.number == sid && !p.streams.is_empty())
+        {
+            self.opts.play = None;
+            self.play(sid, None, None);
+        }
+        // VLC waits for the HTTP server to be up.
+        if let Some(sid) = self.pending_vlc
+            && let Some((addr, _)) = &self.ts.tcp
+        {
+            self.pending_vlc = None;
+            if let Err(e) = external::vlc(&external::http_url(*addr), sid) {
+                self.note = e;
+            }
+        }
+    }
+
+    /// Play service `sid` in the app, with this sound and these subtitles.
+    fn play(&mut self, sid: u16, audio: Option<u16>, subs: Option<u16>) {
+        let report = Arc::clone(&self.ts.report);
+        let Some(p) = report.programmes.iter().find(|p| p.number == sid) else {
+            return;
+        };
+        let (tap, rx) = TsTap::new(2048);
+        self.tap = Some(tap.for_video(player::video_pid(p)));
+        self.selected = Some(sid);
+        self.tv.start(p, audio, subs, rx);
+        self.sync_outputs();
+    }
+
+    fn open_vlc(&mut self, sid: u16) {
+        self.selected = Some(sid);
+        self.outputs_ui.http_on = true;
+        self.pending_vlc = Some(sid);
+        // If the server is already up, the next poll opens it.
+        if let Some((addr, _)) = &self.ts.tcp {
+            self.pending_vlc = None;
+            if let Err(e) = external::vlc(&external::http_url(*addr), sid) {
+                self.note = e;
+            }
+        }
+    }
+
+    fn do_action(&mut self, a: services::Action) {
+        match a {
+            services::Action::Play(sid) => self.play(sid, None, None),
+            services::Action::Vlc(sid) => self.open_vlc(sid),
+            services::Action::OpenTs => self.ts_window.open = true,
+            services::Action::OpenEpg => {
+                self.epg_window.open = true;
+                self.epg_at = Instant::now() - Duration::from_secs(2);
             }
         }
     }
@@ -406,12 +639,16 @@ impl App {
                 s.rx.send(Command::Retune(fc));
                 self.centre_hz = fc;
                 self.reset_view();
+                self.reset_stream();
                 self.vfo_hz = Some(fc);
             }
             Some(s) if !s.live && !fits => {
                 self.note = format!("C{n} is outside this capture");
             }
-            _ => self.vfo_hz = Some(fc),
+            _ => {
+                self.vfo_hz = Some(fc);
+                self.reset_stream();
+            }
         }
     }
 
@@ -473,15 +710,16 @@ impl App {
         // them every frame would be waste.
         let new_stats =
             (self.stats_at.elapsed() >= Duration::from_millis(250)).then(|| s.rx.stats());
-        if self.show_channel {
+        if self.bottom == Bottom::Channel {
             self.chan_view.update(s.rx.take_sounder());
         }
         if self.decode {
-            // The transport stream itself goes nowhere yet (M4: the player,
-            // the viewers and the outputs); what is kept is its rate.
+            // The stream itself is the hub's; what is kept here is its rate,
+            // the receiver's status and the scopes' cells.
             let u = s.rx.take_decoder();
             self.dec = u.status;
             self.dec_packets = u.packets;
+            self.scope.update(u.scopes, u.measurements);
             let now = Instant::now();
             match &mut self.dec_rate {
                 Some((at, t, rate)) if t.elapsed() >= Duration::from_secs(1) => {
@@ -807,9 +1045,12 @@ impl App {
                 ui.label(RichText::new("weak: raise the gain").color(AMBER));
             }
             ui.separator();
-            ui.checkbox(&mut self.show_channel, "channel");
             ui.checkbox(&mut self.decode, "decode");
-            if self.show_channel {
+            ui.label("panel");
+            ui.selectable_value(&mut self.bottom, Bottom::Scopes, "scopes");
+            ui.selectable_value(&mut self.bottom, Bottom::Channel, "channel");
+            ui.selectable_value(&mut self.bottom, Bottom::Hidden, "none");
+            if self.show_channel() {
                 egui::ComboBox::from_id_salt("doppler")
                     .selected_text(format!("±{} Hz", self.chan_view.doppler_view))
                     .width(80.0)
@@ -908,7 +1149,7 @@ impl App {
                     // a live radio is mostly waiting for the USB buffer.
                     for (stage, p) in decdvbt_engine::Stage::ALL.iter().zip(s.load.percent) {
                         if (*stage == decdvbt_engine::Stage::Record && s.recording.is_none())
-                            || (*stage == decdvbt_engine::Stage::Sounder && !self.show_channel)
+                            || (*stage == decdvbt_engine::Stage::Sounder && !self.show_channel())
                             || (*stage == decdvbt_engine::Stage::Decoder && !self.decode)
                         {
                             continue;
@@ -919,6 +1160,11 @@ impl App {
                         } else {
                             format!("{p:.1} %")
                         });
+                        ui.end_row();
+                    }
+                    if self.decode && self.ts.packets > 0 {
+                        ui.label(RichText::new("  transport stream").weak());
+                        ui.label(format!("{:.1} %", self.ts.load_percent));
                         ui.end_row();
                     }
                     if let Some(r) = &s.recording {
@@ -935,15 +1181,32 @@ impl App {
         ui.add_space(6.0);
         card::show(ui, &self.card());
         ui.add_space(10.0);
-        ui.label(RichText::new("Services").strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Services").strong());
+            if self.ts.packets > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {:.2} Mbit/s",
+                        self.ts.report.programmes.len(),
+                        self.ts.rate_bps / 1e6
+                    ))
+                    .weak(),
+                );
+            }
+        });
         ui.separator();
-        ui.label(
-            RichText::new(
-                "No transport stream yet. The DVB-T receiver (M3) fills this list with the \
-                 mux's services, their bitrates and now/next, and plays the one you click.",
-            )
-            .weak(),
-        );
+        let mut action = services::list(ui, &self.ts, &mut self.selected);
+        ui.add_space(4.0);
+        action = services::buttons(ui, self.selected).or(action);
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new("Outputs")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.outputs_ui.show(ui, &self.ts);
+            });
+        if let Some(a) = action {
+            self.do_action(a);
+        }
     }
 }
 
@@ -964,6 +1227,9 @@ impl eframe::App for App {
         self.take_rows();
         self.sync_sounder();
         self.sync_decoder();
+        self.sync_scopes();
+        self.poll_stream();
+        self.sync_outputs();
         self.cpu_percent = self.cpu.poll();
         self.handle_screenshot(ctx);
         if self.session.is_some() || self.opts.screenshot.is_some() {
@@ -978,14 +1244,25 @@ impl eframe::App for App {
         self.frames += 1;
         egui::Panel::top("controls").show(ui, |ui| self.control_bar(ui));
         egui::Panel::bottom("receiver").show(ui, |ui| self.status_panel(ui));
-        if self.show_channel {
-            egui::Panel::bottom("channel")
-                .resizable(false)
-                .show(ui, |ui| {
-                    // The panel is as tall as its content asks.
-                    ui.set_min_height(CHANNEL_PANEL_H);
-                    self.chan_view.show(ui);
-                });
+        match self.bottom {
+            Bottom::Channel => {
+                egui::Panel::bottom("channel")
+                    .resizable(false)
+                    .show(ui, |ui| {
+                        // The panel is as tall as its content asks.
+                        ui.set_min_height(CHANNEL_PANEL_H);
+                        self.chan_view.show(ui);
+                    });
+            }
+            Bottom::Scopes => {
+                egui::Panel::bottom("scopes")
+                    .resizable(false)
+                    .show(ui, |ui| {
+                        ui.set_min_height(SCOPES_PANEL_H);
+                        self.scope.show(ui, &self.dec);
+                    });
+            }
+            Bottom::Hidden => {}
         }
         egui::Panel::right("services")
             .resizable(true)
@@ -1010,6 +1287,18 @@ impl eframe::App for App {
                     tune = Some(n);
                 }
             });
+        let ctx = ui.ctx().clone();
+        self.ts_window.show(&ctx, &self.ts);
+        self.epg_window.show(&ctx, &self.epg, &self.ts.report);
+        let report = Arc::clone(&self.ts.report);
+        let list = services::ordered(&report);
+        match self.tv.show(&ctx, &list, self.ts.tap_dropped) {
+            Some(player::Request::Play(sid, audio, subs)) => self.play(sid, audio, subs),
+            Some(player::Request::Close) => {
+                self.tap = None;
+            }
+            None => {}
+        }
         if let Some(n) = tune {
             if self.session.is_none() && self.kind == SourceKind::HackRf {
                 self.channel = n;

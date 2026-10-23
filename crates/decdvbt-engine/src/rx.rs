@@ -1,11 +1,11 @@
 // made by CasualArclamp
 //! The receive thread: reads an [`IqSource`], builds waterfall rows and level
-//! readings, and writes a recording when asked.
+//! readings, runs the receiver and writes a recording when asked.
 //!
 //! One thread, one pass over each block, nothing allocated in the loop. The
 //! GUI never touches the source: it sends [`Command`]s and takes rows and
-//! [`Stats`] from [`Rx`]. M3 adds the OFDM receiver to this loop; the
-//! spectrum then comes from its own samples at no extra read.
+//! [`Stats`] from [`Rx`]. The transport stream the receiver makes goes to the
+//! [`TsHub`](crate::hub::TsHub), a thread of its own.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -20,8 +20,11 @@ use decdvbt_io::{IqFileWriter, IqSource};
 
 use decdvbt_rx::delay_doppler::DelayDoppler;
 use decdvbt_rx::receiver::{Receiver as OfdmReceiver, ReceiverConfig, ReceiverStatus};
+use decdvbt_rx::scope::{Measurements, Scopes};
 use decdvbt_rx::sounder::{Sounder, SounderConfig, Status as SounderStatus};
+use decdvbt_ts::Epg;
 
+use crate::hub::{Feeder, Outputs, TsHub, TsView};
 use crate::meter::{Stage, StageLoad, StageMeter};
 use crate::spectrum::RowBuilder;
 
@@ -93,6 +96,11 @@ pub enum Command {
     /// Run the receiver on the signal at this RF frequency, Hz (lock, equalise,
     /// decode to a transport stream), or stop it with `None`.
     Decode(Option<f64>),
+    /// Make the constellation scopes' cells (ten times a second) while on:
+    /// they cost nothing otherwise.
+    Scopes(bool),
+    /// Make the channel measurements (four times a second) while on.
+    Measure(bool),
     /// Start recording to this file (cs8), or stop with `None`.
     Record(Option<PathBuf>),
 }
@@ -120,20 +128,22 @@ pub struct SounderUpdate {
 #[derive(Default)]
 struct DecoderOut {
     status: ReceiverStatus,
-    /// Transport packets (188 bytes each) not yet taken.
-    ts: Vec<u8>,
-    /// Packets made since the receiver was started, taken or not.
+    /// Packets made since the receiver was started.
     packets: u64,
+    scopes: Option<Arc<Scopes>>,
+    measurements: Option<Arc<Measurements>>,
 }
 
 /// What [`Rx::take_decoder`] hands over.
 #[derive(Default)]
 pub struct DecoderUpdate {
     pub status: ReceiverStatus,
-    /// Transport packets decoded since the last call (188 bytes each).
-    pub ts: Vec<u8>,
-    /// Packets decoded since the receiver was started.
+    /// Transport packets decoded since the receiver was started.
     pub packets: u64,
+    /// The scopes' cells and the measurements, if new ones have been made
+    /// since the last call.
+    pub scopes: Option<Arc<Scopes>>,
+    pub measurements: Option<Arc<Measurements>>,
 }
 
 struct Shared {
@@ -144,11 +154,6 @@ struct Shared {
     stop: AtomicBool,
 }
 
-/// Transport stream kept for a consumer that is slow to collect it: about
-/// 2 MB, a second of a UK mux. What the consumer does not take in time is
-/// dropped, oldest first, and counted by the packet continuity it breaks.
-const MAX_QUEUED_TS: usize = 188 * 11_000;
-
 /// Rows kept for a GUI that is slow to collect them.
 const MAX_QUEUED_ROWS: usize = 100;
 
@@ -157,6 +162,8 @@ pub struct Rx {
     cmd: Sender<Command>,
     shared: Arc<Shared>,
     join: Option<JoinHandle<()>>,
+    /// Dropped after the thread has ended (it holds a feeder).
+    hub: TsHub,
 }
 
 /// Reads the source's own drop counter (a HackRF's USB overflows).
@@ -178,15 +185,33 @@ impl Rx {
         });
         let (cmd, cmd_rx) = mpsc::channel();
         let sh = Arc::clone(&shared);
+        let hub = TsHub::start();
+        let feeder = hub.feeder();
         let join = std::thread::Builder::new()
             .name("decdvbt-rx".into())
-            .spawn(move || run(source, opts, drops, cmd_rx, sh))
+            .spawn(move || run(source, opts, drops, cmd_rx, sh, feeder))
             .expect("cannot start the receive thread");
         Rx {
             cmd,
             shared,
             join: Some(join),
+            hub,
         }
+    }
+
+    /// Where the transport stream goes (a file, UDP, HTTP, the player).
+    pub fn set_outputs(&self, o: Outputs) {
+        self.hub.set_outputs(o);
+    }
+
+    /// What the transport stream carries and where it goes.
+    pub fn ts_view(&self) -> TsView {
+        self.hub.view()
+    }
+
+    /// The programme guide.
+    pub fn epg(&self) -> Arc<Epg> {
+        self.hub.epg()
     }
 
     pub fn send(&self, c: Command) {
@@ -222,8 +247,9 @@ impl Rx {
         let mut o = self.shared.decoder.lock().unwrap();
         DecoderUpdate {
             status: o.status.clone(),
-            ts: std::mem::take(&mut o.ts),
             packets: o.packets,
+            scopes: o.scopes.take(),
+            measurements: o.measurements.take(),
         }
     }
 
@@ -274,6 +300,7 @@ fn run(
     drops: Option<DropProbe>,
     cmds: Receiver<Command>,
     sh: Arc<Shared>,
+    feeder: Feeder,
 ) {
     let rate = source.sample_rate();
     let live = source.is_live();
@@ -291,6 +318,9 @@ fn run(
     let mut decoder: Option<(OfdmReceiver, f64)> = None;
     let mut decoder_pub = Instant::now();
     let mut ts_scratch: Vec<u8> = Vec::new();
+    // The display's scopes and measurements, and when each was last made.
+    let (mut scopes_on, mut measure_on) = (false, false);
+    let (mut scopes_at, mut measure_at) = (Instant::now(), Instant::now());
     let mut map_at = Instant::now();
     let started = Instant::now();
     let set_error = |e: String| sh.stats.lock().unwrap().error = Some(e);
@@ -315,7 +345,11 @@ fn run(
                 Ok(Command::Decode(vfo)) => {
                     decoder = vfo.map(|v| (new_decoder(v, source.center_freq(), rate), v));
                     *sh.decoder.lock().unwrap() = DecoderOut::default();
+                    ts_scratch.clear();
+                    feeder.reset();
                 }
+                Ok(Command::Scopes(on)) => scopes_on = on,
+                Ok(Command::Measure(on)) => measure_on = on,
                 Ok(Command::Retune(hz)) => match source.retune(hz) {
                     Ok(true) => {
                         tuning += 1;
@@ -325,6 +359,8 @@ fn run(
                         }
                         if let Some((d, v)) = &mut decoder {
                             *d = new_decoder(*v, source.center_freq(), rate);
+                            ts_scratch.clear();
+                            feeder.reset();
                         }
                     }
                     Ok(false) => {}
@@ -401,18 +437,31 @@ fn run(
 
         if let Some((d, _)) = &mut decoder {
             meter.time(Stage::Decoder, || {
+                if scopes_on && scopes_at.elapsed() >= Duration::from_millis(100) {
+                    scopes_at = Instant::now();
+                    d.request_scopes();
+                }
                 d.push(&block, at);
                 d.take_ts(&mut ts_scratch);
             });
             if decoder_pub.elapsed() >= Duration::from_millis(100) {
                 decoder_pub = Instant::now();
+                let packets = (ts_scratch.len() / 188) as u64;
+                feeder.feed(std::mem::take(&mut ts_scratch));
+                let measured = (measure_on && measure_at.elapsed() >= Duration::from_millis(250))
+                    .then(|| {
+                        measure_at = Instant::now();
+                        meter.time(Stage::Decoder, || d.measure())
+                    });
                 let mut o = sh.decoder.lock().unwrap();
                 o.status = d.status().clone();
-                o.packets += (ts_scratch.len() / 188) as u64;
-                o.ts.append(&mut ts_scratch);
-                // A consumer that stops collecting does not make this grow.
-                let extra = o.ts.len().saturating_sub(MAX_QUEUED_TS) / 188 * 188;
-                o.ts.drain(..extra);
+                o.packets += packets;
+                if let Some(s) = d.take_scopes() {
+                    o.scopes = Some(Arc::new(s));
+                }
+                if let Some(Some(m)) = measured {
+                    o.measurements = Some(Arc::new(m));
+                }
             }
         }
 
@@ -670,20 +719,33 @@ mod tests {
             .unwrap()
             .with_center_freq(546e6);
         let rx = Rx::start(Box::new(src), RxOptions::default(), None);
+        let (tap, tap_rx) = decdvbt_ts::TsTap::new(4096);
+        rx.set_outputs(Outputs {
+            tap: Some(tap),
+            ..Default::default()
+        });
         rx.send(Command::Decode(Some(546e6)));
+        rx.send(Command::Scopes(true));
+        rx.send(Command::Measure(true));
         let t0 = Instant::now();
         let (mut ts, mut status) = (Vec::new(), None);
+        let (mut scopes, mut measurements) = (None, None);
         // Until a few thousand packets are in, before the file ends and the
         // engine plays it again from the start (the counters would restart).
         while t0.elapsed() < Duration::from_secs(5) && ts.len() < 188 * 3000 {
             std::thread::sleep(Duration::from_millis(50));
             let u = rx.take_decoder();
-            ts.extend(u.ts);
+            for batch in tap_rx.try_iter() {
+                for p in &batch {
+                    ts.extend_from_slice(p);
+                }
+            }
             status = Some(u.status);
+            scopes = u.scopes.or(scopes);
+            measurements = u.measurements.or(measurements);
         }
-        let u = rx.take_decoder();
-        ts.extend(u.ts);
-        let packets = u.packets;
+        let packets = rx.take_decoder().packets;
+        let view = rx.ts_view();
         drop(rx);
         let _ = std::fs::remove_file(&path);
         let st = status.expect("a status");
@@ -704,5 +766,14 @@ mod tests {
             counters.len()
         );
         assert!(counters.windows(2).all(|w| w[1] == w[0] + 1));
+        // The scopes and the measurements came too, and the hub counted the
+        // packets.
+        let scopes = scopes.expect("scopes");
+        assert!(!scopes.data.is_empty() && !scopes.pilots.is_empty());
+        let m = measurements.expect("measurements");
+        assert!(m.mean_snr_db > 15.0, "{}", m.mean_snr_db);
+        let e = m.echoes.iter().find(|e| e.db > -12.0).expect("an echo");
+        assert!((e.delay_us.abs() - 3.0).abs() < 0.5, "{e:?}");
+        assert!(view.packets > 0 && view.dropped == 0, "{view:?}");
     }
 }

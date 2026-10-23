@@ -438,3 +438,79 @@ a lot of bookkeeping). Then the demapper's scalar gather of the cells in
 deinterleaver order, reading (the FFT, the copy and the carrier ramp), the
 equaliser's grid update, the byte deinterleaver. A second thread for the
 Viterbi + outer would cut latency, not CPU.
+
+## M4 — the player, PSI/SI and guide, service panel, scopes (2026-10-23)
+
+Asked for: "the player, PSI/SI and EPG viewer, service panel and scopes."
+Everything below runs in the GUI on the five live captures; the player needs
+ffmpeg, which is not on this PC, so **the in-app player has not been run**
+(its argument lists and the service selection are unit-tested; the same code
+played a test stream through ffmpeg on DecSAT). Open in VLC (through the HTTP
+output) is the way to watch until ffmpeg is installed.
+
+**Scopes and measurements** (`decdvbt-rx::scope`, `apps/decdvbt-gui/src/scopes.rs`).
+`Receiver::request_scopes` copies the carriers before the equaliser touches
+them (only when asked, once) and takes the TPS, pilot and data cells from the
+equalised symbol; `Receiver::measure` turns the equaliser's channel estimate
+into the gain and the per-carrier signal-to-noise ratio across the band
+(groups of carriers, at most 1024 points) and the impulse response (an inverse
+transform of the estimate under a Hann window, the window from half a guard
+before to a guard and a half after the strongest path, echoes as its local
+maxima within 35 dB). The engine makes the cells at 10 Hz and the
+measurements at 4 Hz, only while the bottom panel shows them. On the C23
+capture: four scopes (64-QAM clean at 21.6 dB MER), gain, SNR and an
+impulse response with its echoes at −1.8 to +0.7 µs. The receiver test puts
+an echo of 3 µs and −10 dB in and finds it at 3.0 µs and −10 dB.
+
+**The scopes cost 1 % of a core, not 9 %.** The first version drew every cell
+as a rectangle in an egui mesh (31 000 cells a frame): 9 % of a core, more than
+the equaliser. Now each scope is a 160×160 phosphor grid (intensities that
+fade with each symbol) sent to the graphics card as a texture only when
+cells come, 10 times a second; a frame draws four quads. The traces are cut
+to two points a pixel column (min and max of each stretch, so notches
+survive).
+
+**The transport stream hub** (`decdvbt-engine::hub`). The receive thread
+hands 100 ms batches of packets to a thread that runs the DecSAT analyser and
+the backlog and feeds the outputs: a `.ts` file, UDP (7 packets a datagram),
+an HTTP/TCP server (VLC, PotPlayer) and the player's tap. Verified on C23:
+the HTTP output gives 62 301 packets with no bad sync byte and the PAT; UDP
+2216 datagrams a second (23.3 Mbit/s); the file is written. The hub's own load is
+0.3 % of a core (shown in the status panel). The whole GUI on the C23 capture
+costs 40–41 % of a core with the scopes off and about the same with them on,
+against 39–40 % before M4.
+
+**SI the analyser did not read** (`decdvbt-ts`, from DecSAT's satellite
+analyser): the terrestrial delivery descriptor (centre frequency, mode,
+constellation, rate, guard), the service list, the UK logical channel numbers
+(descriptor 0x83) that order the services, the TOT's local time offset (so
+BST shows), and the whole guide: `epg.rs` keeps the events of the EIT
+present/following and schedule tables by service with their times as seconds
+since 1970, text (short and extended), genre and age rating, and forgets what
+ended an hour ago. C23 gives 26 services in the regional network, BBC One
+and Two with what is on, and 800 guide events in 14 s.
+
+**The GUI.** The right panel lists the services by channel number with type
+(TV, HD, radio, data), bitrate, a lock for scrambled ones and the event now
+on; double-click or Play to watch, VLC to open it in VLC (through the HTTP
+output, with `--program` for the service), outputs (file, UDP, HTTP) in a
+collapsible section. Windows: the **transport stream analyser** (services
+and their streams, PIDs with rates and continuity errors, the tables heard,
+the NIT's multiplexes with their services and channel numbers, stream clock
+and local time) and the **programme guide** (services down, time across,
+colour by genre, click for the description). The **player** window: service,
+sound and subtitle choice, bob ×2, GPU decode, volume; a radio service shows
+its name, what is on and the sound's levels. DVB subtitles are an ffmpeg
+filter graph (`[0:i:V] … [v]; [0:i:S] scale … [s]; [v][s] overlay`) — unrun.
+The bottom panel is now a choice of scopes, the channel sounder's panels or
+none (`--bottom`); scopes are the default.
+
+**Not done / to check**
+- The player against real ffmpeg: video, E-AC-3 / AC-3 (ffmpeg decodes both;
+  nothing here converts them), subtitles (the canvas size ffmpeg gives HD
+  subtitles may need `-canvas_size`).
+- A BER before the Viterbi decoder.
+- LCN uses descriptor 0x83 only (the UK's); Nordig's 0x87 and the HD
+  simulcast descriptor 0x88 are not read.
+- DVB text uses Latin-1 for tables other than UTF-8; ISO 6937's accents in the
+  default table are not translated.

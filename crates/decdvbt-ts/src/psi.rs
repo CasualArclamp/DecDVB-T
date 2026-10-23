@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use decdvbt_core::crc::crc32_mpeg2;
 
 use crate::TS_LEN;
+use crate::epg::{Epg, LocalTime, mjd_unix};
 use crate::section::SectionAssembler;
 
 pub const PID_PAT: u16 = 0x0000;
@@ -151,10 +152,53 @@ pub struct Programme {
     pub free_ca: bool,
     pub now: Option<Event>,
     pub next: Option<Event>,
+    /// The logical channel number the NIT gives it (UK Freeview's 1–999).
+    pub lcn: Option<u16>,
 }
 
-/// A transport stream the NIT lists, with its satellite delivery
-/// parameters when given.
+/// A terrestrial delivery system descriptor (EN 300 468 §6.2.13.4): how a
+/// DVB-T multiplex is transmitted.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Terrestrial {
+    pub centre_hz: u64,
+    pub bandwidth_mhz: u8,
+    pub constellation: &'static str,
+    pub hierarchy: &'static str,
+    pub rate_hp: &'static str,
+    pub rate_lp: &'static str,
+    pub guard: &'static str,
+    pub mode: &'static str,
+}
+
+impl Terrestrial {
+    /// "64-QAM 2/3 8k 1/32", for a table.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.constellation, self.rate_hp, self.mode, self.guard
+        )
+    }
+
+    fn parse(d: &[u8]) -> Option<Terrestrial> {
+        if d.len() < 11 {
+            return None;
+        }
+        let rate = |v: u8| ["1/2", "2/3", "3/4", "5/6", "7/8", "?", "?", "?"][(v & 7) as usize];
+        Some(Terrestrial {
+            centre_hz: u64::from(u32::from_be_bytes([d[0], d[1], d[2], d[3]])) * 10,
+            bandwidth_mhz: [8, 7, 6, 5, 0, 0, 0, 0][(d[4] >> 5) as usize],
+            constellation: ["QPSK", "16-QAM", "64-QAM", "?"][(d[5] >> 6) as usize],
+            hierarchy: ["none", "α=1", "α=2", "α=4"][((d[5] >> 3) & 3) as usize],
+            rate_hp: rate(d[5]),
+            rate_lp: rate(d[6] >> 5),
+            guard: ["1/32", "1/16", "1/8", "1/4"][((d[6] >> 3) & 3) as usize],
+            mode: ["2k", "8k", "4k", "?"][((d[6] >> 1) & 3) as usize],
+        })
+    }
+}
+
+/// A transport stream the NIT lists, with its delivery parameters when
+/// given.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Transponder {
     pub ts_id: u16,
@@ -166,6 +210,12 @@ pub struct Transponder {
     pub symbol_rate_msps: Option<f64>,
     /// "DVB-S" or "DVB-S2".
     pub system: Option<&'static str>,
+    /// A terrestrial (DVB-T) multiplex.
+    pub terrestrial: Option<Terrestrial>,
+    /// Its services: (service id, service type).
+    pub services: Vec<(u16, u8)>,
+    /// Its logical channel numbers: (service id, number, visible).
+    pub lcns: Vec<(u16, u16, bool)>,
 }
 
 /// What the NIT says.
@@ -226,6 +276,10 @@ pub struct TsReport {
     pub tables: Vec<(u16, u8, u64)>,
     /// The stream's clock from the TDT/TOT, UTC.
     pub utc: Option<String>,
+    /// The same, seconds since 1970.
+    pub utc_unix: Option<i64>,
+    /// The offset from UTC the TOT gives for the stream's region.
+    pub local_time: Option<LocalTime>,
     pub bad_sections: u64,
 }
 
@@ -246,6 +300,10 @@ pub struct TsAnalyser {
     pub network: NetworkInfo,
     tables: BTreeMap<(u16, u8), u64>,
     pub utc: Option<String>,
+    pub utc_unix: Option<i64>,
+    pub local_time: Option<LocalTime>,
+    /// The programme guide: present/following and the schedule.
+    pub epg: Epg,
     pub packets: u64,
     /// The transport stream id, from the PAT.
     pub ts_id: Option<u16>,
@@ -321,6 +379,11 @@ impl TsAnalyser {
         }
     }
 
+    /// Bits per second over the last second or so of signal.
+    pub fn rate_bps(&self) -> f64 {
+        self.rate_bps
+    }
+
     /// Packet `pid` just looked at had been descrambled.
     pub fn note_descrambled(&mut self, pid: u16) {
         if let Some(st) = self.pids.get_mut(&pid) {
@@ -364,7 +427,7 @@ impl TsAnalyser {
         if tid == 0x70 {
             // TDT: just the UTC time, no CRC.
             if s.len() >= 8 {
-                self.utc = Some(mjd_utc(&s[3..8], true));
+                self.set_time(&s[3..8]);
             }
             return;
         }
@@ -390,11 +453,30 @@ impl TsAnalyser {
             (p, 0x02) if self.pmt_pids.contains_key(&p) => self.pmt(p, ext, body),
             (PID_SDT, 0x42) => self.sdt(body),
             (PID_NIT, 0x40) => self.nit(ext, body),
-            (PID_EIT, 0x4E) => self.eit(ext, section_number, body),
+            (PID_EIT, 0x4E) => {
+                self.eit(ext, section_number, body);
+                self.epg.section(ext, body);
+            }
+            (PID_EIT, 0x50..=0x5F) => self.epg.section(ext, body),
             // TOT: the time, then descriptors and a CRC.
-            (PID_TDT, 0x73) => self.utc = Some(mjd_utc(&s[3..8], true)),
+            (PID_TDT, 0x73) => {
+                self.set_time(&s[3..8]);
+                // UTC (5 bytes), the loop length (2), then the descriptors.
+                if let Some(d) = s.get(10..len - 4)
+                    && let Some(lt) = LocalTime::from_descriptors(d)
+                {
+                    self.local_time = Some(lt);
+                }
+            }
             _ => {}
         }
+    }
+
+    fn set_time(&mut self, b: &[u8]) {
+        self.utc = Some(mjd_utc(b, true));
+        let t = mjd_unix(b);
+        self.utc_unix = Some(t);
+        self.epg.now = Some(t);
     }
 
     fn pat(&mut self, ts_id: u16, body: &[u8]) {
@@ -523,6 +605,27 @@ impl TsAnalyser {
             let dl = u16::from_be_bytes([body[at + 4] & 0x0F, body[at + 5]]) as usize;
             let desc = &body[(at + 6).min(body.len())..(at + 6 + dl).min(body.len())];
             for (tag, d) in descriptors(desc) {
+                match tag {
+                    0x5A => t.terrestrial = Terrestrial::parse(d),
+                    // service_list_descriptor: (service id, type) pairs.
+                    0x41 => t.services.extend(
+                        d.as_chunks::<3>()
+                            .0
+                            .iter()
+                            .map(|e| (u16::from_be_bytes([e[0], e[1]]), e[2])),
+                    ),
+                    // The UK's logical channel descriptor (D-Book, private
+                    // data specifier 0x233A): service id, visible flag and
+                    // a 10-bit number.
+                    0x83 => t.lcns.extend(d.as_chunks::<4>().0.iter().map(|e| {
+                        (
+                            u16::from_be_bytes([e[0], e[1]]),
+                            u16::from_be_bytes([e[2] & 0x03, e[3]]),
+                            e[2] & 0x80 != 0,
+                        )
+                    })),
+                    _ => {}
+                }
                 if tag == 0x43 && d.len() >= 11 {
                     // satellite_delivery_system_descriptor (EN 300 468 §6.2.13.2).
                     t.frequency_ghz = Some(bcd(&d[0..4]) as f64 / 1e5);
@@ -648,22 +751,40 @@ impl TsAnalyser {
                 }
             })
             .collect();
+        let lcn = |sid: u16| {
+            // The entry in this stream's own transponder first.
+            let own = self
+                .network
+                .transponders
+                .iter()
+                .filter(|t| Some(t.ts_id) == self.ts_id);
+            own.chain(self.network.transponders.iter())
+                .flat_map(|t| t.lcns.iter())
+                .find(|l| l.0 == sid)
+                .map(|l| l.1)
+        };
+        let mut programmes: Vec<Programme> = self.programmes.values().cloned().collect();
+        for p in &mut programmes {
+            p.lcn = lcn(p.number);
+        }
         TsReport {
             ts_id: self.ts_id,
             packets: self.packets,
             rate_bps: self.rate_bps,
-            programmes: self.programmes.values().cloned().collect(),
+            programmes,
             pids,
             network: self.network.clone(),
             tables: self.tables.iter().map(|(&(p, t), &n)| (p, t, n)).collect(),
             utc: self.utc.clone(),
+            utc_unix: self.utc_unix,
+            local_time: self.local_time,
             bad_sections: self.bad_sections,
         }
     }
 }
 
 /// Iterate (tag, contents) over a descriptor loop, stopping at a truncation.
-fn descriptors(mut d: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+pub(crate) fn descriptors(mut d: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
     std::iter::from_fn(move || {
         if d.len() < 2 || d.len() < 2 + d[1] as usize {
             return None;
@@ -676,7 +797,7 @@ fn descriptors(mut d: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
 }
 
 /// Packed BCD digits as a number.
-fn bcd(b: &[u8]) -> u64 {
+pub(crate) fn bcd(b: &[u8]) -> u64 {
     b.iter().fold(0u64, |n, &x| {
         n * 100 + ((x >> 4) as u64) * 10 + (x & 0x0F) as u64
     })
@@ -967,6 +1088,38 @@ mod tests {
                 .iter()
                 .any(|&(pid, tid, _)| pid == 0x12 && tid == 0x4E)
         );
+    }
+
+    #[test]
+    fn a_terrestrial_nit_gives_the_multiplex_its_services_and_channel_numbers() {
+        let mut d = Vec::new();
+        let mut t = (490_000_000u32 / 10).to_be_bytes().to_vec();
+        t.extend_from_slice(&[0x00, 0x81, 0x02, 0xFF, 0xFF, 0xFF, 0xFF]);
+        d.extend(desc(0x5A, &t));
+        d.extend(desc(0x41, &[0x10, 0x01, 0x01, 0x10, 0x02, 0x02]));
+        // 0x1001 is channel 1 (visible), 0x1002 channel 105 (hidden).
+        d.extend(desc(
+            0x83,
+            &[0x10, 0x01, 0xFC, 0x01, 0x10, 0x02, 0x7C, 0x69],
+        ));
+        let mut nit = vec![0xF0, 0x00]; // no network descriptors
+        let tsl = 6 + d.len();
+        nit.extend_from_slice(&[0xF0 | (tsl >> 8) as u8, tsl as u8]);
+        nit.extend_from_slice(&[0x40, 0x6D, 0x23, 0xDC]); // ts id, onid
+        nit.extend_from_slice(&[0xF0 | (d.len() >> 8) as u8, d.len() as u8]);
+        nit.extend_from_slice(&d);
+        let mut a = TsAnalyser::new();
+        a.packet(&section_packet(PID_NIT, 0, &section(0x40, 0x233A, 0, &nit)));
+        let t = &a.network.transponders[0];
+        let ter = t.terrestrial.unwrap();
+        assert_eq!(ter.centre_hz, 490_000_000);
+        assert_eq!(ter.describe(), "64-QAM 2/3 8k 1/32");
+        assert_eq!(ter.bandwidth_mhz, 8);
+        assert_eq!(t.services, [(0x1001, 1), (0x1002, 2)]);
+        assert_eq!(t.lcns, [(0x1001, 1, true), (0x1002, 105, false)]);
+        a.programmes.entry(0x1002).or_default().number = 0x1002;
+        let r = a.report();
+        assert_eq!(r.programmes[0].lcn, Some(105));
     }
 
     #[test]

@@ -82,10 +82,19 @@ impl Deinterlace {
 }
 
 /// ffmpeg's arguments for a programme whose video is PID `video` and the
-/// audio to play PID `audio` (either may be absent). With `gpu`, the video
+/// audio to play PID `audio` (either may be absent). With `subs` (a DVB
+/// subtitle PID) and video, the subtitles are drawn over the picture: the
+/// bitmap subtitle stream is scaled to the frame and overlaid, so they come
+/// out on the full frame as the broadcaster placed them. With `gpu`, the video
 /// is decoded by the graphics card's decoder (NVDEC / D3D11VA / VAAPI,
 /// whichever ffmpeg finds), which leaves the CPU to the demodulator and FEC.
-pub fn args(video: Option<u16>, audio: Option<u16>, deint: Deinterlace, gpu: bool) -> Vec<String> {
+pub fn args(
+    video: Option<u16>,
+    audio: Option<u16>,
+    subs: Option<u16>,
+    deint: Deinterlace,
+    gpu: bool,
+) -> Vec<String> {
     let mut a: Vec<String> = [
         "-hide_banner",
         "-nostdin",
@@ -110,11 +119,40 @@ pub fn args(video: Option<u16>, audio: Option<u16>, deint: Deinterlace, gpu: boo
     a.extend(["-f", "mpegts", "-i", "pipe:0"].map(String::from));
     // By PID (`i:` matches an MPEG-TS stream's PID); `?`: no such stream is
     // not an error.
-    for pid in [video, audio].into_iter().flatten() {
+    let subs = subs.filter(|_| video.is_some());
+    // With subtitles the picture comes out of a filter graph, mapped by its
+    // label; otherwise the streams are mapped as they are.
+    for pid in [video.filter(|_| subs.is_none()), audio]
+        .into_iter()
+        .flatten()
+    {
         a.push("-map".into());
         a.push(format!("0:i:{pid}?"));
     }
-    if video.is_some() {
+    if let (Some(v), Some(s)) = (video, subs) {
+        let (w, h) = (WIDTH, HEIGHT);
+        let fit = format!(
+            "scale=w='trunc(if(gt(dar,{w}/{h}),{w},{h}*dar)/2)*2':\
+             h='trunc(if(gt(dar,{w}/{h}),{w}/dar,{h})/2)*2'"
+        );
+        a.extend([
+            "-filter_complex".to_string(),
+            format!(
+                "[0:i:{v}]yadif=mode={}:deint=interlaced,{fit},setsar=1,pad={w}:{h}:-1:-1[v];\
+                 [0:i:{s}]scale={w}:{h},format=rgba[s];\
+                 [v][s]overlay=0:0:eof_action=pass[o]",
+                deint.yadif_mode()
+            ),
+            "-map".into(),
+            "[o]".into(),
+            "-c:v".into(),
+            "rawvideo".into(),
+            "-pix_fmt".into(),
+            "rgba".into(),
+            "-fps_mode".into(),
+            "passthrough".into(),
+        ]);
+    } else if video.is_some() {
         let (w, h) = (WIDTH, HEIGHT);
         // Fit by the display aspect ratio, even sizes, then pad to the
         // frame. The quotes keep the commas inside if() from splitting the
@@ -230,7 +268,7 @@ mod tests {
 
     #[test]
     fn maps_by_pid_and_fits_the_picture() {
-        let a = args(Some(0x21), Some(0x22), Deinterlace::Frame, false);
+        let a = args(Some(0x21), Some(0x22), None, Deinterlace::Frame, false);
         assert!(!a.iter().any(|x| x == "-hwaccel"));
         let maps: Vec<&String> = a
             .iter()
@@ -244,7 +282,7 @@ mod tests {
         assert!(vf.contains("pad=960:540"));
         assert!(a.ends_with(&["pipe:1".to_string()]));
         // Radio: no video options.
-        let r = args(None, Some(0x22), Deinterlace::Frame, true);
+        let r = args(None, Some(0x22), None, Deinterlace::Frame, true);
         assert!(!r.iter().any(|x| x == "-vf"));
         assert!(r.iter().any(|x| x == "pcm_f32le"));
         // Radio has nothing to decode on the GPU.
@@ -252,8 +290,29 @@ mod tests {
     }
 
     #[test]
+    fn subtitles_are_overlaid_by_a_filter_graph() {
+        let a = args(Some(0x21), Some(0x22), Some(0x30), Deinterlace::Bob, false);
+        let fc = &a[a.iter().position(|x| x == "-filter_complex").unwrap() + 1];
+        assert!(fc.starts_with("[0:i:33]yadif"));
+        assert!(fc.contains("[0:i:48]scale=960:540"));
+        assert!(fc.ends_with("overlay=0:0:eof_action=pass[o]"));
+        let maps: Vec<&String> = a
+            .iter()
+            .zip(a.iter().skip(1))
+            .filter(|(k, _)| *k == "-map")
+            .map(|(_, v)| v)
+            .collect();
+        // The sound by PID, the picture by the graph's label; no `-vf`.
+        assert_eq!(maps, ["0:i:34?", "[o]"]);
+        assert!(!a.iter().any(|x| x == "-vf"));
+        // Radio has nothing to overlay on.
+        let r = args(None, Some(0x22), Some(0x30), Deinterlace::Bob, false);
+        assert!(!r.iter().any(|x| x == "-filter_complex"));
+    }
+
+    #[test]
     fn gpu_decode_is_an_input_option() {
-        let a = args(Some(0x21), None, Deinterlace::Bob, true);
+        let a = args(Some(0x21), None, None, Deinterlace::Bob, true);
         let hw = a.iter().position(|x| x == "-hwaccel").unwrap();
         assert_eq!(a[hw + 1], "auto");
         assert!(hw < a.iter().position(|x| x == "-i").unwrap());
@@ -262,7 +321,7 @@ mod tests {
     #[test]
     fn bob_sends_each_field() {
         let vf = |d| {
-            let a = args(Some(0x21), None, d, false);
+            let a = args(Some(0x21), None, None, d, false);
             a[a.iter().position(|x| x == "-vf").unwrap() + 1].clone()
         };
         assert!(vf(Deinterlace::Bob).starts_with("yadif=mode=send_field:deint=interlaced,"));
