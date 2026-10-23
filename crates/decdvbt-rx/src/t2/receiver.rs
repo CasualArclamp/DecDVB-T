@@ -38,6 +38,9 @@ const ACQ_NATIVE: usize = 2_500_000;
 const RETRY_S: f64 = 0.2;
 /// Frames in a row in which no P1 symbol, or no L1, was found, that end a lock.
 const MAX_MISSES: u32 = 3;
+/// Radio samples the window keeps behind the latest block: two margins, the
+/// interpolator's reach and room for a rate up to 20 MS/s.
+const HISTORY: usize = 32 * 1024;
 /// The search for a P1's whole carrier spacings either side (8.9 kHz each).
 const P1_BINS: isize = 64;
 
@@ -203,7 +206,9 @@ impl T2Receiver {
             cfg,
             rho: cfg.fs_in / FS_NATIVE,
             interp: Interpolator::new(),
-            win: Window::new(),
+            // The next frame's stretch starts a little before the end of this
+            // one's: keep what went by.
+            win: Window::with_history(HISTORY),
             track: None,
             status: T2Status::default(),
             next_attempt: 0,
@@ -620,6 +625,10 @@ impl T2Receiver {
             .filter(|h| h.metric > 0.4)
             .map(|h| h.start + lo as f64)
         else {
+            self.status.debug = format!(
+                "frame lost: no P1 symbol (best metric {:.2})",
+                hits.iter().map(|h| h.metric).fold(0.0, f32::max)
+            );
             self.status.frames_bad += 1;
             t.misses += 1;
             // Aim again at the next frame (the one seen is lost).
@@ -631,6 +640,7 @@ impl T2Receiver {
         let timing = t.demod.timing(&self.y, p1 + P1_SAMPLES as f64);
         self.status.profile.timing += t_timing.elapsed();
         let Some(timing) = timing else {
+            self.status.debug = "frame lost: the symbols' timing could not be found".into();
             self.status.frames_bad += 1;
             t.misses += 1;
             t.next_p1 += t.geo.frame_samples() as f64 * t.step;
@@ -687,6 +697,10 @@ impl T2Receiver {
             }
         }
         let Some(post) = post else {
+            self.status.debug = format!(
+                "frame lost: L1 not read ({})",
+                if pre.is_some() { "post" } else { "pre" }
+            );
             self.status.frames_bad += 1;
             self.status.l1_ok = false;
             t.misses += 1;
@@ -706,6 +720,7 @@ impl T2Receiver {
             (p.fft, p.align, p.channel, p.cells) = (d.fft, d.align, d.channel, d.cells);
         }
         let Some(data) = data else {
+            self.status.debug = "frame lost: no equalised cells".into();
             self.status.frames_bad += 1;
             t.misses += 1;
             self.advance(&mut t, p1, &timing, 0.0);

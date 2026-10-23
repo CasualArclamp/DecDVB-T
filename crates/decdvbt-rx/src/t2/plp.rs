@@ -71,7 +71,7 @@ impl PlpParams {
 }
 
 /// What decoding a frame's blocks did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrameStats {
     pub blocks: usize,
     pub ok: usize,
@@ -81,6 +81,8 @@ pub struct FrameStats {
     /// Wall time (summed over the threads) of the stages.
     pub deinterleave: Duration,
     pub blocks_time: DecodeTimes,
+    /// The blocks (by number in the frame) that did not decode.
+    pub failed: Vec<u16>,
 }
 
 pub struct PlpDecoder {
@@ -154,8 +156,7 @@ impl PlpDecoder {
                             &rx[b * cs..(b + 1) * cs],
                             &rxv[b * cs..(b + 1) * cs],
                             &mut bb,
-                        ) && st.ldpc.converged
-                        {
+                        ) {
                             *slot = Some((bb, st));
                         }
                     }
@@ -171,7 +172,10 @@ impl PlpDecoder {
             stats.blocks_time += w.take_times();
         }
         let before = out.len();
-        for f in frames {
+        for (b, f) in frames.into_iter().enumerate() {
+            if f.is_none() {
+                stats.failed.push(b as u16);
+            }
             match f {
                 Some((bb, st)) => {
                     stats.ok += 1;

@@ -101,13 +101,17 @@ pub struct DemodProfile {
     pub cells: Duration,
 }
 
+/// Most sightings of a node that make its value at a symbol.
+const MAX_TAPS: usize = 12;
+
 /// Which sightings of a node make its value at a symbol, and their weights:
-/// the sighting itself, or a cubic (Lagrange) through the nearest four.
+/// a polynomial in time fitted through the nearest few by least squares
+/// (which averages their noise as well as joining them).
 #[derive(Debug, Clone, Copy, Default)]
 struct TimeTap {
     start: u8,
     len: u8,
-    w: [f32; 4],
+    w: [f32; MAX_TAPS],
 }
 
 /// The pilots and carriers of a mode, and the machinery to read frames.
@@ -236,6 +240,7 @@ impl Demod {
         let mut pattern_of = Vec::with_capacity(nodes.len());
         let mut pattern_ids: std::collections::HashMap<Vec<u16>, u16> = Default::default();
         let mut patterns: Vec<Vec<TimeTap>> = Vec::new();
+        let (window, degree) = smoothing();
         for (m, &k) in nodes.iter().enumerate() {
             let ts: Vec<u16> = seen[m]
                 .iter()
@@ -251,7 +256,7 @@ impl Demod {
             let id = *pattern_ids.entry(ts.clone()).or_insert_with(|| {
                 patterns.push(
                     (geo.n_p2..last_data)
-                        .map(|j| time_tap(&ts, j as u16))
+                        .map(|j| time_tap(&ts, j as u16, window, degree))
                         .collect(),
                 );
                 (patterns.len() - 1) as u16
@@ -762,40 +767,87 @@ impl Demod {
     }
 }
 
+/// The least-squares fit's window and polynomial degree: four sightings and
+/// a cubic, which passes through them (interpolation). Wider windows and
+/// lower degrees average more noise (the MER the pilots show rises by up to
+/// 2 dB) but follow a changing channel less well, and on the off-air UK
+/// signal lost two or three times as many blocks.
+fn smoothing() -> (usize, usize) {
+    (4, 3)
+}
+
 /// How a node's value at symbol `j` is made from its sightings `ts` (sorted
-/// symbols): the sighting there if there is one, else a cubic (Lagrange)
-/// through the four nearest.
-fn time_tap(ts: &[u16], j: u16) -> TimeTap {
+/// symbols): a polynomial of `degree` fitted by least squares through the
+/// `window` sightings nearest `j` and read at `j`. The weights are those of
+/// the fit: `(AᵀA)⁻¹Aᵀ`'s first row, for the sightings' times taken from `j`.
+fn time_tap(ts: &[u16], j: u16, window: usize, degree: usize) -> TimeTap {
     let after = ts.partition_point(|t| *t < j);
-    if after < ts.len() && ts[after] == j {
-        return TimeTap {
-            start: after as u8,
-            len: 1,
-            w: [1.0, 0.0, 0.0, 0.0],
-        };
+    // Beyond the first or last sighting a cubic would extrapolate, with
+    // weights that amplify the noise many times over: a straight line through
+    // the nearest six does it with less than the noise of one sighting.
+    let outside = ts.first().is_none_or(|t| j < *t) || ts.last().is_none_or(|t| j > *t);
+    let (window, degree) = if outside { (6, 1) } else { (window, degree) };
+    let w_len = window.min(ts.len()).min(MAX_TAPS);
+    let mut tap = TimeTap::default();
+    if w_len == 0 {
+        return tap;
     }
-    let lo = after.saturating_sub(2);
-    let hi = (after + 2).min(ts.len());
-    let pts = &ts[lo..hi];
-    let mut tap = TimeTap {
-        start: lo as u8,
-        len: pts.len() as u8,
-        w: [0.0; 4],
-    };
-    match pts.len() {
-        0 => {}
-        1 => tap.w[0] = 1.0,
-        _ => {
-            for (i, ti) in pts.iter().enumerate() {
-                let mut w = 1.0f32;
-                for (m, tm) in pts.iter().enumerate() {
-                    if m != i {
-                        w *= (f32::from(j) - f32::from(*tm)) / (f32::from(*ti) - f32::from(*tm));
-                    }
-                }
-                tap.w[i] = w;
+    // The window centred on `j` as far as the sightings reach.
+    let lo = after.saturating_sub(w_len / 2).min(ts.len() - w_len);
+    tap.start = lo as u8;
+    tap.len = w_len as u8;
+    let pts = &ts[lo..lo + w_len];
+    let d = degree.min(w_len - 1);
+    // Normal equations of the fit in x = t − j.
+    let n = d + 1;
+    let mut m = [[0f64; 6]; 6];
+    for t in pts {
+        let x = f64::from(*t) - f64::from(j);
+        let pw: Vec<f64> = (0..2 * n).map(|p| x.powi(p as i32)).collect();
+        for r in 0..n {
+            for c in 0..n {
+                m[r][c] += pw[r + c];
             }
         }
+    }
+    // First row of the inverse: solve (AᵀA)·u = e₀ by Gauss-Jordan.
+    let mut aug = [[0f64; 7]; 6];
+    for r in 0..n {
+        aug[r][..n].copy_from_slice(&m[r][..n]);
+        aug[r][n] = if r == 0 { 1.0 } else { 0.0 };
+    }
+    for c in 0..n {
+        let piv = (c..n)
+            .max_by(|&a, &b| aug[a][c].abs().total_cmp(&aug[b][c].abs()))
+            .unwrap();
+        aug.swap(c, piv);
+        let div = aug[c][c];
+        if div.abs() < 1e-12 {
+            // Degenerate: take the nearest sighting.
+            tap.w = [0.0; MAX_TAPS];
+            let near = (0..w_len)
+                .min_by_key(|&i| (i32::from(pts[i]) - i32::from(j)).abs())
+                .unwrap();
+            tap.w[near] = 1.0;
+            return tap;
+        }
+        for v in aug[c][..=n].iter_mut() {
+            *v /= div;
+        }
+        for r in 0..n {
+            if r != c {
+                let f = aug[r][c];
+                let pivot_row = aug[c];
+                for (v, p) in aug[r][..=n].iter_mut().zip(&pivot_row) {
+                    *v -= f * p;
+                }
+            }
+        }
+    }
+    let u: Vec<f64> = (0..n).map(|r| aug[r][n]).collect();
+    for (i, t) in pts.iter().enumerate() {
+        let x = f64::from(*t) - f64::from(j);
+        tap.w[i] = (0..n).map(|p| u[p] * x.powi(p as i32)).sum::<f64>() as f32;
     }
     tap
 }

@@ -109,9 +109,10 @@ pub fn run(a: DecodeArgs) -> Result<()> {
             if rx.standard() == Standard::Dvbt2 {
                 let t2 = rx.dvbt2();
                 println!(
-                    "{secs:5.1} s: DVB-T2, L1 {}, MER {:.1} dB, LDPC blocks {} decoded / {} lost, {} packets",
+                    "{secs:5.1} s: DVB-T2, L1 {}, MER {:.1} dB, {} frames lost, LDPC blocks {} decoded / {} lost, {} packets",
                     if t2.l1_ok { "read" } else { "lost" },
                     t2.snr_db,
+                    t2.frames_bad,
                     t2.blocks_ok,
                     t2.blocks_bad,
                     packets_out
