@@ -54,6 +54,8 @@ pub struct T2Config {
     /// stage's own thread, which hands them out); the stage uses as few as
     /// keep it to about half of real time.
     pub fec_threads: usize,
+    /// The PLP to decode by its id; `None`: the first data PLP (type 1).
+    pub plp: Option<u8>,
 }
 
 impl T2Config {
@@ -65,6 +67,7 @@ impl T2Config {
             // 40 Mbit/s 256-QAM multiplex takes, with room to spare.
             fec_threads: (std::thread::available_parallelism().map_or(2, |n| n.get()) / 4)
                 .clamp(2, 4),
+            plp: None,
         }
     }
 }
@@ -147,6 +150,8 @@ pub struct T2Status {
     /// last frame took on them.
     pub fec_threads: usize,
     pub fec_load: f32,
+    /// The PLPs L1 lists: id and type (0 common, 1 and 2 data).
+    pub plp_ids: Vec<(u8, u8)>,
     /// What the last frame looked like, for a developer.
     pub debug: String,
 }
@@ -242,6 +247,12 @@ impl T2Receiver {
 
     pub fn status(&self) -> &T2Status {
         &self.status
+    }
+
+    /// Decode this PLP (by id) from the next frame on; `None` for the first
+    /// data PLP.
+    pub fn set_plp(&mut self, plp: Option<u8>) {
+        self.cfg.plp = plp;
     }
 
     /// Ask for the cells of a symbol of the next frame (for
@@ -786,12 +797,16 @@ impl T2Receiver {
 
         // The PLP: the first of type 1 (data PLP, type 1) L1 lists.
         let t_fec = Instant::now();
-        let pick = post
-            .plps
-            .iter()
-            .position(|p| p.plp_type == 1)
-            .or(Some(0))
-            .filter(|i| *i < post.plps.len());
+        self.status.plp_ids = post.plps.iter().map(|p| (p.plp_id, p.plp_type)).collect();
+        let pick = match self.cfg.plp {
+            Some(id) => post.plps.iter().position(|p| p.plp_id == id),
+            None => post
+                .plps
+                .iter()
+                .position(|p| p.plp_type == 1)
+                .or(Some(0))
+                .filter(|i| *i < post.plps.len()),
+        };
         if let Some(i) = pick {
             let params = PlpParams::from_l1(&post.plps[i]);
             self.status.plp = params;

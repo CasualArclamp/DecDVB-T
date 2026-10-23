@@ -6,6 +6,8 @@
 //! wait: if the FEC stage cannot keep up, [`FecPipe::submit`] holds the
 //! receive thread until it has caught up, which is the right thing to feel.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -52,21 +54,26 @@ pub struct FecPipe {
     rx: Receiver<Done>,
     join: Option<JoinHandle<()>>,
     in_flight: usize,
+    /// Set when the pipe is dropped: frames still queued are not decoded.
+    cancel: Arc<AtomicBool>,
 }
 
 impl FecPipe {
     pub fn new(threads: usize) -> FecPipe {
         let (tx, jobs) = channel();
         let (done_tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
         let join = std::thread::Builder::new()
             .name("decdvbt-t2-fec".into())
-            .spawn(move || worker(threads, jobs, done_tx))
+            .spawn(move || worker(threads, jobs, done_tx, &flag))
             .expect("cannot start the FEC thread");
         FecPipe {
             tx: Some(tx),
             rx,
             join: Some(join),
             in_flight: 0,
+            cancel,
         }
     }
 
@@ -129,7 +136,8 @@ impl FecPipe {
 
 impl Drop for FecPipe {
     fn drop(&mut self) {
-        // Closing the channel ends the thread's loop.
+        // Closing the channel ends the thread's loop, after the frame it is on.
+        self.cancel.store(true, Ordering::Relaxed);
         self.tx = None;
         if let Some(j) = self.join.take() {
             let _ = j.join();
@@ -150,7 +158,7 @@ fn adapt(threads: usize, max: usize, load: f32) -> usize {
     }
 }
 
-fn worker(max_threads: usize, jobs: Receiver<Msg>, out: Sender<Done>) {
+fn worker(max_threads: usize, jobs: Receiver<Msg>, out: Sender<Done>, cancel: &AtomicBool) {
     let mut decoder: Option<PlpDecoder> = None;
     let mut packets = Vec::new();
     // Two to start with.
@@ -163,6 +171,7 @@ fn worker(max_threads: usize, jobs: Receiver<Msg>, out: Sender<Done>) {
                 }
                 continue;
             }
+            Msg::Frame(_) if cancel.load(Ordering::Relaxed) => continue,
             Msg::Frame(job) => job,
         };
         if decoder.as_ref().map(|d| d.params) != Some(job.params) {

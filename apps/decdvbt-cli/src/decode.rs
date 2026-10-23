@@ -41,6 +41,9 @@ pub struct DecodeArgs {
     /// HackRF VGA gain, dB (0-62, steps of 2).
     #[arg(long, default_value_t = 8)]
     vga: u16,
+    /// The DVB-T2 PLP to decode, by id (the first data PLP if not given).
+    #[arg(long)]
+    plp: Option<u8>,
     /// Print a line a second while decoding.
     #[arg(long)]
     progress: bool,
@@ -77,6 +80,7 @@ pub fn run(a: DecodeArgs) -> Result<()> {
     };
 
     let mut rx = AutoReceiver::new(fs, a.offset + channel_centre.map_or(0.0, |c| c - centre));
+    rx.set_plp(a.plp);
     let mut analyser = TsAnalyser::new();
     let (mut abs, mut block, mut ts) = (0u64, Vec::new(), Vec::new());
     let (t0, mut in_rx, mut next_report) = (Instant::now(), Duration::ZERO, 1.0);
@@ -258,6 +262,9 @@ fn t2_report(rx: &AutoReceiver, signal_s: f64, packets: u64, output: Option<&std
             m.guard,
             m.pp
         );
+    }
+    if t2.plp_ids.len() > 1 {
+        println!("PLPs in L1 (id, type): {:?}", t2.plp_ids);
     }
     if let Some(pl) = &t2.plp {
         println!(

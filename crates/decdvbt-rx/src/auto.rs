@@ -50,6 +50,11 @@ impl AutoReceiver {
         }
     }
 
+    /// The DVB-T2 PLP to decode, by id (`None`: the first data PLP).
+    pub fn set_plp(&mut self, plp: Option<u8>) {
+        self.t2.set_plp(plp);
+    }
+
     pub fn standard(&self) -> Standard {
         self.standard
     }
