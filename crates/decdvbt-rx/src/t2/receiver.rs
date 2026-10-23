@@ -646,28 +646,23 @@ impl T2Receiver {
         let hi = (MARGIN + 2048 + P1_SAMPLES + 64).min(self.y.len());
         let hits = p1det::find(&self.y[lo..hi], FS_NATIVE);
         self.status.profile.p1 += t_p1.elapsed();
-        let Some(p1) = hits
-            .iter()
-            .max_by(|a, b| a.metric.total_cmp(&b.metric))
-            .filter(|h| h.metric > 0.4)
-            .map(|h| h.start + lo as f64)
-        else {
-            self.status.debug = format!(
-                "frame lost: no P1 symbol (best metric {:.2})",
-                hits.iter().map(|h| h.metric).fold(0.0, f32::max)
-            );
-            self.status.frames_bad += 1;
-            t.misses += 1;
-            // Aim again at the next frame (the one seen is lost).
-            t.next_p1 += t.geo.frame_samples() as f64 * t.step;
-            self.finish_frame(t);
-            return;
+        // P1 if it shows; if not (a weak moment, a gap in the samples), the
+        // place it was expected at: the symbols' cyclic prefixes say whether
+        // the frame is there at all.
+        let best = hits.iter().max_by(|a, b| a.metric.total_cmp(&b.metric));
+        let (p1, p1_seen) = match best.filter(|h| h.metric > 0.4) {
+            Some(h) => (h.start + lo as f64, true),
+            None => (MARGIN as f64, false),
         };
         let t_timing = Instant::now();
         let timing = t.demod.timing(&self.y, p1 + P1_SAMPLES as f64);
         self.status.profile.timing += t_timing.elapsed();
         let Some(timing) = timing else {
-            self.status.debug = "frame lost: the symbols' timing could not be found".into();
+            self.status.debug = format!(
+                "frame lost: the symbols' timing could not be found (P1 {}, best metric {:.2})",
+                if p1_seen { "seen" } else { "not seen" },
+                best.map_or(0.0, |h| h.metric)
+            );
             self.status.frames_bad += 1;
             t.misses += 1;
             t.next_p1 += t.geo.frame_samples() as f64 * t.step;

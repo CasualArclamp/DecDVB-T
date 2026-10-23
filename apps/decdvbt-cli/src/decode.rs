@@ -85,6 +85,7 @@ pub fn run(a: DecodeArgs) -> Result<()> {
     let (mut abs, mut block, mut ts) = (0u64, Vec::new(), Vec::new());
     let (t0, mut in_rx, mut next_report) = (Instant::now(), Duration::ZERO, 1.0);
     let mut packets_out = 0u64;
+    let mut lost_before = 0u64;
     while (abs as f64) < a.seconds * fs {
         if src.read(&mut block)? == 0 {
             break;
@@ -121,6 +122,10 @@ pub fn run(a: DecodeArgs) -> Result<()> {
                     t2.blocks_bad,
                     packets_out
                 );
+                if t2.frames_bad > lost_before {
+                    lost_before = t2.frames_bad;
+                    println!("      {}", t2.debug);
+                }
                 continue;
             }
             println!(
