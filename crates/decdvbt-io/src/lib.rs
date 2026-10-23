@@ -13,7 +13,7 @@ pub mod hackrf;
 #[cfg(feature = "hackrf")]
 pub mod hackrf_tx;
 
-pub use file::{IqFileReader, IqFileWriter, format_from_path};
+pub use file::{IqFileReader, IqFileWriter, NameHint, format_from_path, name_hint};
 pub use wav::{CaptureInfo, WavIq, probe_capture};
 
 #[cfg(feature = "hackrf")]
@@ -50,6 +50,11 @@ pub trait IqSource: Send {
     /// Start again from the beginning, for looping a capture. Returns
     /// `Ok(false)` for sources that cannot rewind (a live radio).
     fn rewind(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Retune to `hz`. `Ok(false)` for a source with no tuner (a file).
+    fn retune(&mut self, _hz: f64) -> Result<bool> {
         Ok(false)
     }
 

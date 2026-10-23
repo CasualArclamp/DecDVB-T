@@ -40,8 +40,72 @@ Left in DecSAT: engine, GUI, GSE, IP, frame, modem (except conv/rs), mod.
 CI is copied with the submodule/CMake steps removed; the release workflow
 comes with the GitHub repo.
 
-Not done in M0: the GUI app (comes with the waterfall in M1), the GitHub
-repo (needs `gh` or a manual create; private, per kickoff), no commit yet.
+Not done in M0: the GUI app (came with M1) and the GitHub repo (needs `gh` or
+a manual create; private, per kickoff). Committed locally.
 
-**Next (M1):** HackRF/Airspy/file front end into a spectrum + waterfall
-GUI, channel tuning, IQ recorder, per-stage CPU meter; first captures.
+## M1 — front end, waterfall, tuning, recorder (2026-10-23)
+
+Builds clean; 134 tests pass; clippy and rustfmt clean. Airspy is not in yet.
+
+- **`decdvbt-engine`** (new): the receive thread. One pass per block: source
+  read, optional cs8 recording, a level reading (rms, peak, clipping, from
+  every 8th sample), and waterfall rows built from a few FFT segments per
+  block (`RowBuilder`: 4096 bins, 20 rows/s, 24 segments a row; a full-scale
+  tone reads 0 dBFS). A file is paced to real time and loops. Commands in
+  (retune, record), rows and stats out. CPU meters: whole-process
+  (`GetProcessTimes` on Windows, `/proc/self/stat` elsewhere) and per stage.
+- **`decdvbt-engine::snr`**: a C/N estimate from the spectrum, for before the
+  receiver measures MER: the block's power against the quietest 100 kHz
+  window in the zones 3.9–4.9 MHz either side (a gap between neighbouring
+  muxes is empty to the noise). On the C26 and C30 captures: 25 dB and 22 dB.
+- **`decdvbt-io`**: `IqSource::retune` (HackRF implements it); a cs8 writer
+  that is bit-exact and writes a block at a time; `name_hint` reads centre and
+  rate from a capture's name (`c26_514.000MHz_10Msps_….cs8`).
+- **`decdvbt-core`**: `dvbt` (modulation, code rate, the C/N each needs for
+  QEF, EN 300 744 Table A.1: typed from memory, **check against the spec in
+  M3**).
+- **`decdvbt` CLI**: `capture` (HackRF at a channel or a file; level, drops,
+  CPU, per-stage load; `--record`), `scan` (steps C21–C48 on the HackRF and
+  flags blocks of digital TV).
+- **`decdvbt-gui`** (new): DecSAT's spectrum + waterfall (ring texture, colour
+  map), the UHF channels marked and the VFO (the received channel's 7.61 MHz)
+  bracketed, click a channel to tune (the VFO moves if the span holds the
+  channel, else the HackRF retunes), channel box with ◀ ▶, rates 10–20 MS/s,
+  LNA/VGA/amp, Start/Stop, Record, Open… / drag a file, input level meter with
+  overload and weak warnings. Right panel: the **signal card**, laid out as
+  DecSAT's DVB card (title bar in the standard's colour with MHz and channel,
+  the mode big with the margin beside it in red/amber/green, a C/N bar ticked
+  at the QEF threshold). Until the receiver (M3) reads the TPS there is no
+  mode and so no margin: the bar shows the spectral C/N. `--assume 64qam-2/3`
+  holds the C/N against a mode, for looking at the margin. Under it, a
+  services placeholder. Bottom: receiver stats and CPU. `--screenshot`,
+  `--after`, `--fps`.
+
+**Findings at this location (rooftop aerial, HackRF):**
+
+- A band scan finds six strong blocks: C22, C23, C25, C26, C28, C30
+  (482–546 MHz); nothing above C31. Input is about −22 to −26 dBFS rms at
+  LNA 24 / VGA 20, no clipping.
+- Heavy multipath: the blocks show notches 15–20 dB deep across the 7.61 MHz.
+  Channel estimation has to be good (M3).
+- C30's block sits about 0.1 MHz below the nominal channel centre (UK
+  transmitters use offsets of ±167 kHz or +333 kHz): M3 tracks the carrier
+  offset, the VFO is only nominal.
+- Captures for development are in `captures/` (not committed): C26 and C30,
+  6 s each at 10 MS/s, cs8.
+
+**CPU (the main requirement):**
+
+- Headless engine on the live HackRF at 10 MS/s: about 3–6 % of a core,
+  spectrum stage under 1 %. Recording adds about 7 % (mostly the disk).
+- The GUI is the larger part. egui's repaint timer does not tick at the
+  interval it is given (50 ms came back as 34 ms frames, vsync on or off), so
+  the GUI paces itself from the gaps it sees. Whole app, file replay at
+  10 MS/s: ~4–5 % at 10 fps, ~7 % at 15 fps (the default), 12 % at 20 fps,
+  ~12 % at 30 fps (noisy, ±3). Our own code per frame is 0.3–0.4 ms; the rest
+  is egui's tessellation and the GL driver. The "display" box sets the rate.
+
+**Next (M2):** the DVB-T modulator and channel models (multipath, Doppler,
+noise), so the receiver can be built against known signals as well as the
+captures; then M3, the DVB-T receiver.
+

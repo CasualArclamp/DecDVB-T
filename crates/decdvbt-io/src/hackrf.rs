@@ -263,6 +263,11 @@ impl IqSource for HackRfSource {
         )
     }
 
+    fn retune(&mut self, hz: f64) -> Result<bool> {
+        self.control.set_center(hz.round() as u64)?;
+        Ok(true)
+    }
+
     fn is_live(&self) -> bool {
         true
     }

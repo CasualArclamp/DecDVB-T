@@ -1,0 +1,37 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-gui"
+description = "DecDVB-T desktop GUI (egui): DVB-T / DVB-T2 receiver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# eframe/egui 0.36 need Rust 1.95, so the GUI cannot keep the workspace MSRV.
+rust-version = "1.95"
+
+[[bin]]
+name = "decdvbt-gui"
+path = "src/main.rs"
+
+[features]
+# The HackRF driver is pure Rust (no SDK, no DLLs), so it is on by default.
+default = ["hackrf"]
+hackrf = ["decdvbt-io/hackrf"]
+
+[dependencies]
+decdvbt-core = { path = "../../crates/decdvbt-core" }
+decdvbt-io = { path = "../../crates/decdvbt-io" }
+decdvbt-engine = { path = "../../crates/decdvbt-engine" }
+anyhow.workspace = true
+# The glow (OpenGL) renderer instead of eframe's default wgpu: plenty for 2-D
+# plots and a much smaller build. "x11"/"wayland" only matter on Linux.
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+# Native file dialogs (Win32 on Windows, XDG desktop portal on Linux).
+rfd = "0.17.2"
+# PNG output for --screenshot (documentation and smoke tests).
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# With eframe's defaults off, re-enable winit's (Linux only) so building needs
+# no X11/Wayland dev packages.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = "0.30.13"

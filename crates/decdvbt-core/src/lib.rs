@@ -8,11 +8,13 @@
 //! to T2's own types in M6.
 //!
 //! - [`channel`]: the UHF channel plan, for tuning by channel number.
+//! - [`dvbt`]: DVB-T modulation and code rate, and the C/N each needs.
 //!
 //! See `docs/DESIGN.md` for scope.
 
 pub mod channel;
 pub mod crc;
+pub mod dvbt;
 pub mod modcod;
 
 pub use modcod::{

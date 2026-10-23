@@ -1,0 +1,18 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-engine"
+description = "DecDVB-T engine: the receive thread, spectrum rows, level and CPU meters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvbt-core = { path = "../decdvbt-core" }
+decdvbt-io = { path = "../decdvbt-io" }
+rustfft.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

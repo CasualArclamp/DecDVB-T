@@ -12,7 +12,15 @@ cargo check --workspace --all-targets   # fast feedback
 cargo test --workspace                  # unit tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run --release -p decdvbt-cli -- channels
+cargo run --release -p decdvbt-cli -- scan                       # HackRF: which channels carry a mux
+cargo run --release -p decdvbt-cli -- capture C26 --record x.cs8 # level, drops, CPU; optional IQ
+cargo run --release -p decdvbt-gui                               # the GUI
+cargo run --release -p decdvbt-gui -- captures/c26_514.000MHz_10Msps.cs8 --screenshot out/x.png
 ```
+
+Captures live in `captures/` and are named by their tuning
+(`c26_514.000MHz_10Msps_….cs8`); the GUI and CLI read the centre and rate from
+the name. They are not committed.
 
 Rust is installed through rustup (stable MSVC). In Git Bash, `~/.cargo/bin`
 may need adding to PATH. The player needs `ffmpeg` on PATH at run time.

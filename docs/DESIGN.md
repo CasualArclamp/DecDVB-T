@@ -92,9 +92,10 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
 
 ## 5. Milestones (draft)
 
-- **M0** — workspace skeleton, copied crates renamed, CI green.
+- **M0** — workspace skeleton, copied crates renamed, CI green. *(done)*
 - **M1** — HackRF/Airspy/file front end, spectrum and waterfall, channel tuning,
-  IQ recorder; first captures of the local muxes.
+  IQ recorder; first captures of the local muxes. *(done, 2026-10-23, except
+  Airspy; the band scan CLI and the signal card came with it)*
 - **M2** — DVB-T modulator plus channel models (multipath, Doppler, noise).
 - **M3** — DVB-T receiver: time/frequency sync, TPS, channel estimation,
   demapping, inner deinterleavers, Viterbi, RS → TS. Live Freeview DVB-T.

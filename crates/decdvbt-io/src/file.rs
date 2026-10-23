@@ -30,6 +30,38 @@ pub fn format_from_path(path: &Path) -> Option<SampleFormat> {
     }
 }
 
+/// What a capture's file name says about it. Raw IQ files carry no header, so
+/// DecDVB-T's recorder puts the tuning in the name: `c26_514.000MHz_10Msps_…`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NameHint {
+    pub center_hz: Option<f64>,
+    pub sample_rate: Option<f64>,
+}
+
+/// Find a centre frequency ("514.000MHz") and a sample rate ("10Msps",
+/// "2500ksps") among a file name's `_`-separated parts.
+pub fn name_hint(path: &Path) -> NameHint {
+    let mut hint = NameHint::default();
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return hint;
+    };
+    let number = |t: &str, unit: &str| -> Option<f64> {
+        // `strip_suffix` wants the exact case, so compare lower-cased.
+        let t = t.to_ascii_lowercase();
+        t.strip_suffix(unit)?.parse::<f64>().ok()
+    };
+    for part in stem.split('_') {
+        if let Some(v) = number(part, "mhz") {
+            hint.center_hz = Some(v * 1e6);
+        } else if let Some(v) = number(part, "msps") {
+            hint.sample_rate = Some(v * 1e6);
+        } else if let Some(v) = number(part, "ksps") {
+            hint.sample_rate = Some(v * 1e3);
+        }
+    }
+    hint
+}
+
 /// Reads interleaved IQ from a file in fixed-size blocks.
 pub struct IqFileReader {
     inner: BufReader<File>,
@@ -152,6 +184,9 @@ impl IqSource for IqFileReader {
 pub struct IqFileWriter {
     inner: BufWriter<File>,
     fmt: SampleFormat,
+    /// A block's bytes, built here and written in one call: a `write_all`
+    /// per sample costs several times the conversion itself.
+    bytes: Vec<u8>,
 }
 
 impl IqFileWriter {
@@ -159,6 +194,7 @@ impl IqFileWriter {
         Ok(IqFileWriter {
             inner: BufWriter::with_capacity(1 << 20, File::create(path)?),
             fmt,
+            bytes: Vec::new(),
         })
     }
 
@@ -166,11 +202,18 @@ impl IqFileWriter {
     pub fn write(&mut self, samples: &[Iq]) -> Result<()> {
         match self.fmt {
             SampleFormat::Cs8 => {
-                for s in samples {
-                    let i = (s.re * 127.0).clamp(-128.0, 127.0) as i8;
-                    let q = (s.im * 127.0).clamp(-128.0, 127.0) as i8;
-                    self.inner.write_all(&[i as u8, q as u8])?;
-                }
+                self.bytes.clear();
+                self.bytes.reserve(samples.len() * 2);
+                // ×128 undoes `bytes_to_iq`'s ÷128, so a recording of a cs8
+                // source is bit-exact. `as i8` on a float saturates, so the
+                // clamp is already done for us; `as u8` keeps the bits.
+                self.bytes.extend(samples.iter().flat_map(|s| {
+                    [
+                        (s.re * 128.0).round() as i8 as u8,
+                        (s.im * 128.0).round() as i8 as u8,
+                    ]
+                }));
+                self.inner.write_all(&self.bytes)?;
             }
             SampleFormat::Cu8 => {
                 for s in samples {
@@ -217,6 +260,18 @@ mod tests {
     use decdvbt_core::Iq;
 
     #[test]
+    fn names_carry_their_tuning() {
+        let h = name_hint(Path::new(
+            "captures/c26_514.000MHz_10Msps_20261023-094512.cs8",
+        ));
+        assert_eq!(h.center_hz, Some(514e6));
+        assert_eq!(h.sample_rate, Some(10e6));
+        let h = name_hint(Path::new("x_2400ksps_482MHz.cs8"));
+        assert_eq!((h.center_hz, h.sample_rate), (Some(482e6), Some(2.4e6)));
+        assert_eq!(name_hint(Path::new("capture.cs8")), NameHint::default());
+    }
+
+    #[test]
     fn extension_guessing() {
         assert_eq!(
             format_from_path(Path::new("cap.cs8")),
@@ -249,6 +304,19 @@ mod tests {
 
         // Second read hits EOF.
         assert_eq!(r.read(&mut got).unwrap(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cs8_recording_is_bit_exact() {
+        let path = std::env::temp_dir().join("decdvbt-io-cs8-exact.cs8");
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        let mut src = Vec::new();
+        decdvbt_core::bytes_to_iq(&bytes, SampleFormat::Cs8, &mut src);
+        let mut w = IqFileWriter::create(&path, SampleFormat::Cs8).unwrap();
+        w.write(&src).unwrap();
+        w.finish().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let _ = std::fs::remove_file(&path);
     }
 
