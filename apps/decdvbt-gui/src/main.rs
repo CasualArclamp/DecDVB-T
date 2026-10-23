@@ -71,6 +71,8 @@ struct Options {
     service: Option<u16>,
     /// Play this service as soon as the receiver has read its tables.
     play: Option<u16>,
+    /// With `--play`, draw the service's first subtitle stream.
+    subs: bool,
     /// Outputs on from the start: an HTTP server and a UDP target
     /// (`127.0.0.1:8001`), and a `.ts` recording.
     http: Option<String>,
@@ -103,6 +105,7 @@ impl Options {
             window: None,
             service: None,
             play: None,
+            subs: false,
             http: None,
             udp: None,
             record: false,
@@ -136,6 +139,7 @@ impl Options {
                 "--http" => o.http = Some(value("an address, e.g. 127.0.0.1:8001")?),
                 "--udp" => o.udp = Some(value("an address, e.g. 127.0.0.1:1234")?),
                 "--record" => o.record = true,
+                "--subs" => o.subs = true,
                 "--play" => {
                     o.play = Some(value("a service id")?.parse().map_err(|_| "bad --play")?)
                 }
@@ -171,7 +175,8 @@ fn main() -> eframe::Result {
             eprintln!(
                 "usage: decdvbt-gui [capture.cs8] [--channel C26] [--rate MSPS] \
                  [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] \
-                 [--bottom scopes|channel|none] [--window ts|epg] [--service ID] [--play ID]                  [--http ADDR] [--udp ADDR] [--record] [--no-decode]"
+                 [--bottom scopes|channel|none] [--window ts|epg] [--service ID] [--play ID] [--subs] \
+                 [--http ADDR] [--udp ADDR] [--record] [--no-decode]"
             );
             std::process::exit(2);
         }
@@ -567,7 +572,16 @@ impl App {
                 .any(|p| p.number == sid && !p.streams.is_empty())
         {
             self.opts.play = None;
-            self.play(sid, None, None);
+            let subs = self
+                .ts
+                .report
+                .programmes
+                .iter()
+                .find(|p| p.number == sid)
+                .and_then(|p| player::subtitle_streams(p).next())
+                .map(|e| e.pid)
+                .filter(|_| self.opts.subs);
+            self.play(sid, None, subs);
         }
         // VLC waits for the HTTP server to be up.
         if let Some(sid) = self.pending_vlc
@@ -765,7 +779,9 @@ impl App {
     /// as 34 ms frames, on this machine and with vsync off), so the delay is
     /// steered by the frame gaps actually seen, to hold the display rate.
     fn pace(&mut self) -> Duration {
-        let target = 1000.0 / self.opts.fps.clamp(1.0, 60.0);
+        // The player's pictures set a floor under the display rate.
+        let fps = self.opts.fps.max(self.tv.wants_fps().unwrap_or(0.0));
+        let target = 1000.0 / fps.clamp(1.0, 60.0);
         let now = Instant::now();
         if let Some(prev) = self.last_frame.replace(now) {
             let gap = now.duration_since(prev).as_secs_f64() * 1e3;

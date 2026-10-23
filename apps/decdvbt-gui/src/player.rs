@@ -12,7 +12,6 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
 
 use decdvbt_ts::{Programme, TS_LEN};
 use decdvbt_video::{Deinterlace, Selection, VideoPlayer};
@@ -33,20 +32,23 @@ pub enum Request {
     Play(u16, Option<u16>, Option<u16>),
 }
 
-/// The PIDs a service needs (PAT, its PMT and PCR, its streams), its picture,
-/// its sound (`audio` if it is one of its streams, else the first) and its
-/// subtitles (`subs` if it is a stream of it).
+/// What a service needs: its picture, its sound (`audio` if it is one of its
+/// streams, else the first), its subtitles (`subs` if it is a stream of it),
+/// and of the multiplex's packets only those of the PAT, its PMT and PCR and
+/// the streams chosen. The rest (the other sound, the data carousels of a red
+/// button service, a megabit or two) would only be fed to ffmpeg to be
+/// thrown away.
 pub fn selection(p: &Programme, audio: Option<u16>, subs: Option<u16>) -> Selection {
-    let mut pids = vec![0, p.pmt_pid];
-    pids.extend(p.pcr_pid);
-    pids.extend(p.streams.iter().map(|e| e.pid));
-    pids.sort_unstable();
-    pids.dedup();
     let video = p.streams.iter().find(|e| e.is_video()).map(|e| e.pid);
     let audio = audio
         .filter(|a| p.streams.iter().any(|e| e.pid == *a))
         .or_else(|| p.streams.iter().find(|e| e.is_audio()).map(|e| e.pid));
     let subs = subs.filter(|s| subtitle_streams(p).any(|e| e.pid == *s));
+    let mut pids = vec![0, p.pmt_pid];
+    pids.extend(p.pcr_pid);
+    pids.extend([video, audio, subs].into_iter().flatten());
+    pids.sort_unstable();
+    pids.dedup();
     Selection {
         pids,
         video,
@@ -81,6 +83,8 @@ pub struct TvWindow {
     gpu: bool,
     /// Packets the hub could not hand to the player, as the last view said.
     tap_dropped: u64,
+    /// The service being played has a picture (not radio).
+    picture: bool,
 }
 
 impl Default for TvWindow {
@@ -98,6 +102,7 @@ impl Default for TvWindow {
             bob: prefs::bob(),
             gpu: prefs::gpu(),
             tap_dropped: 0,
+            picture: false,
         }
     }
 }
@@ -123,6 +128,7 @@ impl TvWindow {
         sel.gpu = self.gpu;
         self.audio = sel.audio;
         self.subs = sel.subs;
+        self.picture = sel.video.is_some();
         let configured = prefs::ffmpeg_path();
         let Some(exe) = decdvbt_video::find_ffmpeg(configured.as_deref()) else {
             self.error = Some(
@@ -154,6 +160,17 @@ impl TvWindow {
         self.texture = None;
     }
 
+    /// The display rate the pictures need while one is playing: the app's
+    /// pacing follows it (each frame shows the picture due, so the rate must
+    /// be at least theirs). `None` with no picture to show.
+    pub fn wants_fps(&self) -> Option<f64> {
+        (self.open && self.player.is_some() && self.picture).then_some(if self.bob {
+            50.0
+        } else {
+            30.0
+        })
+    }
+
     /// Draw the window; `programmes` are the services in the order of the
     /// list.
     pub fn show(
@@ -169,14 +186,11 @@ impl TvWindow {
         // The picture due now.
         if let Some(f) = self.player.as_mut().and_then(|p| p.poll()) {
             let img =
-                ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
+                ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba);
             match &mut self.texture {
                 Some(t) => t.set(img, TextureOptions::LINEAR),
                 None => self.texture = Some(ctx.load_texture("tv", img, TextureOptions::LINEAR)),
             }
-        }
-        if self.player.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(10));
         }
         let current = programmes
             .iter()
@@ -351,7 +365,11 @@ impl TvWindow {
                 let (col, text) = if st.running && (st.frames_shown > 0 || st.audio.is_some()) {
                     (
                         Color32::from_rgb(110, 220, 110),
-                        format!("playing · timed by the {}", st.clock),
+                        if self.picture {
+                            format!("playing · timed by the {}", st.clock)
+                        } else {
+                            "playing".to_string()
+                        },
                     )
                 } else if st.running {
                     (
@@ -476,14 +494,22 @@ impl TvWindow {
     fn details(&self, ui: &mut Ui) {
         let Some(p) = &self.player else { return };
         let st = p.status();
+        // The streams ffmpeg found; the ones with nothing it can decode (data
+        // carousels of a red button service) are not worth a line.
         for (pid, d) in &st.streams {
+            if d.starts_with("Unknown") || d.starts_with("Data:") {
+                continue;
+            }
             let pid = pid.map_or(String::new(), |p| format!("{p:#06x}  "));
             ui.label(RichText::new(format!("{pid}{d}")).small().weak());
         }
-        let mut bits = vec![format!(
-            "{} pictures shown, {} dropped",
-            st.frames_shown, st.frames_dropped
-        )];
+        let mut bits = Vec::new();
+        if self.picture {
+            bits.push(format!(
+                "{} pictures shown, {} dropped",
+                st.frames_shown, st.frames_dropped
+            ));
+        }
         if st.frames_skipped > 0 {
             bits.push(format!("{} skipped to catch up", st.frames_skipped));
         }
@@ -539,10 +565,12 @@ mod tests {
             ..Default::default()
         };
         let s = selection(&p, None, None);
-        assert_eq!(s.pids, [0, 0x20, 0x21, 0x22, 0x23, 0x24]);
+        // The other sound and the subtitles are left out unless chosen.
+        assert_eq!(s.pids, [0, 0x20, 0x21, 0x22]);
         assert_eq!((s.video, s.audio, s.subs), (Some(0x21), Some(0x22), None));
-        assert_eq!(selection(&p, Some(0x23), Some(0x24)).audio, Some(0x23));
-        assert_eq!(selection(&p, Some(0x23), Some(0x24)).subs, Some(0x24));
+        let s = selection(&p, Some(0x23), Some(0x24));
+        assert_eq!((s.audio, s.subs), (Some(0x23), Some(0x24)));
+        assert_eq!(s.pids, [0, 0x20, 0x21, 0x23, 0x24]);
         // Not streams of it: the first sound, no subtitles.
         let s = selection(&p, Some(0x99), Some(0x98));
         assert_eq!((s.audio, s.subs), (Some(0x22), None));

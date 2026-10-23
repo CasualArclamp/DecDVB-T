@@ -427,19 +427,23 @@ fn feed(rx: Receiver<Vec<[u8; TS_LEN]>>, pids: &[u16], sh: &Shared) {
 fn supervise(exe: &Path, args: &[String], sh: &Arc<Shared>, output: OutputKind) {
     while !sh.quit.load(Ordering::Relaxed) {
         let mut cmd = Command::new(exe);
-        cmd.args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args(args).stdin(Stdio::piped()).stderr(Stdio::piped());
         no_console(&mut cmd);
-        let mut child = match cmd.spawn() {
+        let big = output_pipe(&mut cmd);
+        let spawned = cmd.spawn();
+        // The command holds the pipe's write end until it is dropped: the
+        // reader would never see the end of ffmpeg's output.
+        drop(cmd);
+        let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 sh.status.lock().unwrap().exit = Some(format!("{}: {e}", exe.display()));
                 return;
             }
         };
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let stdout: Option<Box<dyn Read + Send>> =
+            big.or_else(|| child.stdout.take().map(|s| Box::new(s) as _));
+        let stderr = child.stderr.take();
         *sh.stdin.lock().unwrap() = child.stdin.take();
         *sh.child.lock().unwrap() = Some(child);
         sh.frames.lock().unwrap().clear();
@@ -574,6 +578,9 @@ fn read_log(err: impl Read, sh: &Shared) {
             ffmpeg::LogLine::Stream { pid, desc } if in_input => {
                 sh.status.lock().unwrap().streams.push((pid, desc));
             }
+            // A stream of the PMT that is not sent (a data carousel, the other
+            // sound) is probed for and not found: not a fault.
+            ffmpeg::LogLine::Error(e) if e.contains("Could not find codec parameters") => {}
             ffmpeg::LogLine::Error(e) => {
                 let mut st = sh.status.lock().unwrap();
                 st.errors += 1;
@@ -599,6 +606,46 @@ fn no_console(cmd: &mut Command) {
 
 #[cfg(not(windows))]
 fn no_console(_: &mut Command) {}
+
+/// Room in the pipe ffmpeg's pictures go through, bytes: two pictures.
+#[cfg(windows)]
+const PIPE_BYTES: u32 = 4 << 20;
+
+/// ffmpeg's output pipe. A pipe from `Stdio::piped()` holds 4 KB on Windows, so
+/// a 2 MB picture crosses it in 500 round trips between the two processes and
+/// a 50 Hz picture rate costs the reading thread 40 % of a core in system calls
+/// and waits. A pipe made here holds two pictures: ffmpeg writes a picture in
+/// one go and the reader takes it in a few reads. `None`: the pipe could not
+/// be made (or this is not Windows) and the command's own is used.
+#[cfg(windows)]
+fn output_pipe(cmd: &mut Command) -> Option<Box<dyn Read + Send>> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: both out-pointers are valid for a handle; no security attributes
+    // are given (the handles are not inheritable; `Stdio::from` makes the
+    // child's copy so).
+    let ok = unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), PIPE_BYTES) };
+    if ok == 0 {
+        cmd.stdout(Stdio::piped());
+        return None;
+    }
+    // SAFETY: both handles were just made and nothing else owns them.
+    let (read, write) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(read),
+            OwnedHandle::from_raw_handle(write),
+        )
+    };
+    cmd.stdout(Stdio::from(write));
+    Some(Box::new(std::fs::File::from(read)))
+}
+
+#[cfg(not(windows))]
+fn output_pipe(cmd: &mut Command) -> Option<Box<dyn Read + Send>> {
+    cmd.stdout(Stdio::piped());
+    None
+}
 
 /// Where ffmpeg is (see [`ffmpeg::find`]).
 pub fn find_ffmpeg(configured: Option<&Path>) -> Option<PathBuf> {
@@ -683,6 +730,11 @@ mod tests {
     /// A 5 s MPEG-2 + MP2 test stream made by ffmpeg, as TS packets; `None`
     /// where ffmpeg is not installed.
     fn test_stream() -> Option<(PathBuf, Vec<[u8; TS_LEN]>)> {
+        test_stream_with("mp2")
+    }
+
+    /// The same with the sound in `codec` (an ffmpeg encoder name).
+    fn test_stream_with(codec: &str) -> Option<(PathBuf, Vec<[u8; TS_LEN]>)> {
         let exe = find_ffmpeg(None)?;
         // `-fps_mode` came with ffmpeg 5.1: an older one (a CI image's) is
         // not what the player is for. Git builds ("N-…") are new.
@@ -695,7 +747,7 @@ mod tests {
             return None;
         }
         let ts = std::env::temp_dir().join(format!(
-            "decdvbt-video-test-{}-{:?}.ts",
+            "decdvbt-video-test-{}-{:?}-{codec}.ts",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -710,7 +762,7 @@ mod tests {
                 "-t",
                 "5",
             ])
-            .args(["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpegts"])
+            .args(["-c:v", "mpeg2video", "-c:a", codec, "-f", "mpegts"])
             .arg(&ts)
             .status();
         let data = std::fs::read(&ts).ok();
@@ -798,5 +850,32 @@ mod tests {
         let st = p.status();
         assert!(decoded() >= 20, "{st:?}");
         assert_eq!(st.audio.unwrap().carriage, "decoded by ffmpeg");
+    }
+
+    /// What Freeview carries besides MP2: AC-3 and E-AC-3 (HD services) and
+    /// AAC. ffmpeg decodes them all to the same PCM, so the player needs
+    /// nothing of its own; this holds it to that.
+    #[test]
+    fn ac3_eac3_and_aac_sound_is_decoded_by_ffmpeg() {
+        for codec in ["ac3", "eac3", "aac"] {
+            let Some((exe, packets)) = test_stream_with(codec) else {
+                eprintln!("ffmpeg not found: skipped");
+                return;
+            };
+            let p = play(&exe, packets, true);
+            let t0 = Instant::now();
+            let decoded = || p.status().audio.map_or(0, |a| a.decoded);
+            while decoded() < 20 && t0.elapsed() < Duration::from_secs(20) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let st = p.status();
+            assert!(decoded() >= 20, "{codec}: {st:?}");
+            assert!(
+                st.streams
+                    .iter()
+                    .any(|(pid, d)| *pid == Some(0x101) && d.to_ascii_lowercase().contains(codec)),
+                "{codec}: {st:?}"
+            );
+        }
     }
 }

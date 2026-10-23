@@ -110,7 +110,7 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
   deinterleavers, Viterbi, RS → TS. Live Freeview DVB-T. *(done, 2026-10-23;
   five muxes decode from the HackRF with the RF amp on, two error-free)*
 - **M4** — player, PSI/SI, service panel, scopes, measurements. *(done,
-  2026-10-23; the in-app player is untested here for want of ffmpeg, see
+  2026-10-23; the player runs live with sound and DVB subtitles, see
   STATUS.md)*
 - **M5** — DVB-T2 modulator.
 - **M6** — DVB-T2 receiver: P1, P2/L1, LDPC/BCH, TI, rotated QAM → TS.

@@ -66,7 +66,7 @@ fn flag(key: &str, default: bool) -> bool {
 }
 
 pub fn bob() -> bool {
-    flag("bob", true)
+    flag("bob", false)
 }
 
 pub fn set_bob(on: bool) {

@@ -41,12 +41,21 @@ pub fn find(configured: Option<&Path>) -> Option<PathBuf> {
         dirs.extend(std::env::split_paths(&path));
     }
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        dirs.push(
-            PathBuf::from(local)
-                .join("Microsoft")
-                .join("WinGet")
-                .join("Links"),
-        );
+        let winget = PathBuf::from(local).join("Microsoft").join("WinGet");
+        dirs.push(winget.join("Links"));
+        // Where `winget install Gyan.FFmpeg` unpacks it (Packages\Gyan.FFmpeg…\
+        // ffmpeg-<version>-full_build\bin), for when it has made no link and
+        // the PATH has not been refreshed yet.
+        if let Ok(packages) = std::fs::read_dir(winget.join("Packages")) {
+            for p in packages.flatten() {
+                if !p.file_name().to_string_lossy().starts_with("Gyan.FFmpeg") {
+                    continue;
+                }
+                if let Ok(inner) = std::fs::read_dir(p.path()) {
+                    dirs.extend(inner.flatten().map(|d| d.path().join("bin")));
+                }
+            }
+        }
     }
     for var in ["ProgramFiles", "ProgramW6432"] {
         if let Some(pf) = std::env::var_os(var) {

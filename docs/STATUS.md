@@ -442,11 +442,10 @@ Viterbi + outer would cut latency, not CPU.
 ## M4 — the player, PSI/SI and guide, service panel, scopes (2026-10-23)
 
 Asked for: "the player, PSI/SI and EPG viewer, service panel and scopes."
-Everything below runs in the GUI on the five live captures; the player needs
-ffmpeg, which is not on this PC, so **the in-app player has not been run**
-(its argument lists and the service selection are unit-tested; the same code
-played a test stream through ffmpeg on DecSAT). Open in VLC (through the HTTP
-output) is the way to watch until ffmpeg is installed.
+Everything below runs in the GUI on the five live captures and live on the
+HackRF. The player was first written without ffmpeg on this PC and then run
+once it was installed (`winget install Gyan.FFmpeg`, 9.0.2; the app finds it in
+winget's package folder without a PATH refresh): see "The player, run" below.
 
 **Scopes and measurements** (`decdvbt-rx::scope`, `apps/decdvbt-gui/src/scopes.rs`).
 `Receiver::request_scopes` copies the carriers before the equaliser touches
@@ -501,14 +500,50 @@ and local time) and the **programme guide** (services down, time across,
 colour by genre, click for the description). The **player** window: service,
 sound and subtitle choice, bob ×2, GPU decode, volume; a radio service shows
 its name, what is on and the sound's levels. DVB subtitles are an ffmpeg
-filter graph (`[0:i:V] … [v]; [0:i:S] scale … [s]; [v][s] overlay`) — unrun.
-The bottom panel is now a choice of scopes, the channel sounder's panels or
+filter graph (`[0:i:V] … [v]; [0:i:S] scale … [s]; [v][s] overlay`), which works
+(below). The bottom panel is now a choice of scopes, the channel sounder's panels or
 none (`--bottom`); scopes are the default.
 
+**The player, run** (live from the HackRF, C23, BBC One / BBC Radio 4):
+- Video and sound: BBC News at One, then a drama, in the player window at
+  704×576 → 960×540, "playing · timed by the sound", 0 pictures dropped, 450–560 ms
+  of sound buffered, the first 35–60 pictures skipped to reach live.
+- **DVB subtitles** (`--play 4164 --subs`): the broadcast's green speaker-coloured
+  subtitles appear over the picture ("It wouldn't be me you were letting down").
+  The overlay graph needed nothing more; HD subtitles on a 1920×1080 display
+  definition are untried (a mux with them is not receivable here).
+- **Radio** (`--play 6912`): BBC Radio 4 with the programme name and level meters.
+- **AC-3, E-AC-3 and AAC** (none are on the DVB-T muxes here; Freeview HD is T2):
+  three unit tests make an ffmpeg test stream in each and check the sound
+  reaches the audio player and ffmpeg names the codec. ffmpeg does the decoding.
+  The audio was run at 5 % volume and the picture and sound clock checked, not
+  listened to.
+
+**What the player cost, and what was fixed.** First run: the GUI process at
+138 % of a core (the receiver's own thread being 33 %), ffmpeg on top.
+- ffmpeg's output pipe was a Windows default 4 KB pipe: a 2 MB picture crossed
+  it in 500 round trips and the reading thread cost 40 % of a core in system
+  calls. The pipe is now made with `CreatePipe` holding two pictures
+  (`decdvbt-video::output_pipe`).
+- The window asked egui to repaint every 10 ms, which gave 140 frames a second;
+  the app's own pacing now takes a floor from the player (30 fps, 50 with bob),
+  which holds 30.
+- The picture is converted with `from_rgba_premultiplied` (a copy; the pictures
+  are opaque) rather than the per-pixel unmultiplied path.
+- Bob ×2 now defaults to off. Deinterlacing to 25 pictures a second halves the
+  pictures, uploads and ffmpeg's work.
+- Only the PAT, PMT, PCR and the chosen video, sound and subtitle PIDs are fed
+  to ffmpeg (the red button service's data carousels were being fed to it and
+  thrown away, and gave a log full of "could not find codec parameters").
+
+Now, playing BBC One at 25 pictures a second: the GUI at 52 % of a core
+(40 % with no player), ffmpeg at 14 %. Bob ×2: 73 % and 37 %. GPU decode
+(ffmpeg `-hwaccel auto`) on this PC's MPEG-2 SD: 59 % and 22 %, no better than
+software, so it stays off. Left: a frame buffer pool for the 2 MB pictures
+(each is allocated, zero-filled, read and header-trimmed by a memmove) and
+handing the pixels to egui without the copy; perhaps 3–4 % of a core.
+
 **Not done / to check**
-- The player against real ffmpeg: video, E-AC-3 / AC-3 (ffmpeg decodes both;
-  nothing here converts them), subtitles (the canvas size ffmpeg gives HD
-  subtitles may need `-canvas_size`).
 - A BER before the Viterbi decoder.
 - LCN uses descriptor 0x83 only (the UK's); Nordig's 0x87 and the HD
   simulcast descriptor 0x88 are not read.

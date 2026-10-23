@@ -30,7 +30,9 @@ Captures live in `captures/` and are named by their tuning
 the name. They are not committed.
 
 Rust is installed through rustup (stable MSVC). In Git Bash, `~/.cargo/bin`
-may need adding to PATH. The player needs `ffmpeg` on PATH at run time.
+may need adding to PATH. The player needs `ffmpeg` at run time: on the PATH,
+beside the exe, or installed by `winget install Gyan.FFmpeg` (found in winget's
+package folder even before the PATH is refreshed).
 
 ## House rules
 
