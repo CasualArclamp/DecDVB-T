@@ -828,21 +828,23 @@ lose two or three times as many blocks: the estimate's errors are then
 correlated, which the LDPC code likes less than independent noise.
 
 **CPU.** The first receiver ran at 0.05× real time on the C30 capture. Now the
-whole chain costs about 115 to 125 % of one core of the machine's (a Ryzen 7
+whole chain costs about 105 to 125 % of one core of the machine's (a Ryzen 7
 4800H) in real time, the engine thread 36 to 44 % of it (the OFDM work), the
 rest on the FEC stage's threads (two to three of them, 35 to 46 % of real time
-each). The GUI on top is a few percent; the whole app reads 125 to 165 %.
+each). The GUI on top is a few percent: the whole app, live on the HackRF with
+the scopes up, reads about 107 % in the GUI's own meter.
 Per stage, % of real time of one core, live: resampling 12, the symbols'
 transforms 5, the channel estimate 9, the rotated demapper 13, deinterleaving 6,
-bit deinterleaving 4, **LDPC 58 to 64**, BCH 2. Seconds of one thread for 6 s of
+bit deinterleaving 4, **LDPC 55 to 60**, BCH 2. Seconds of one thread for 6 s of
 the capture, first and now: LDPC 56 → 3.9, rotated 256-QAM demap 12 → 0.8,
 equaliser 2.2 → 0.7, deinterleave 0.75 → 0.4.
 
 What did it, in the order of the gain: the LDPC loops compile to scalar code
 (about ten cycles a lane) and a hand-written AVX2 layered min-sum kernel
-(`ldpc/avx2.rs`, 77 µs an iteration for a 64K block against 760) gives the same
-decisions bit for bit (a test compares them), with the posteriors loaded and
-read out by vector code (272 µs to 22 µs a block); normalization 15/16 and an
+(`ldpc/avx2.rs`, 58 µs an iteration for a 64K block against 760; 75 before two
+blocks at a time were taken through a layer's edges with their accumulators in
+registers) gives the same decisions bit for bit (a test compares them), with the
+posteriors loaded and read out by vector code (272 µs to 22 µs a block); normalization 15/16 and an
 LLR scale of 8 (found on the off-air signal, not on Gaussian noise) cut the
 iterations a block from 12.3 to 7.5 to 8.6 and the failed blocks tenfold; the
 rotated demapper is exact and O(G) a cell (for each level of one axis the best
@@ -856,8 +858,8 @@ a block that fits the cache; the FEC stage takes as many worker threads as it
 needs (threads running side by side slow each other, so four cost 20 % more CPU
 than two for the same frames); the radio-rate interpolator has 16 taps. Per
 stage times: `t2_decode`, `decdvbt decode` and `t2_bench`. **What is left**: the
-LDPC (about half of everything; a register-blocked kernel might take a quarter
-off it), resampling (12 % of the engine thread: skipped if the radio ran at
+LDPC (still about half of everything: 8 iterations of 58 µs a block; the
+syndrome check could be folded into the layer pass for another 8 %), resampling (12 % of the engine thread: skipped if the radio ran at
 64/7 MS/s, which the HackRF can), and the unrotated demapper (scalar: 17 ns a
 cell).
 
