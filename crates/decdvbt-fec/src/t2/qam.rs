@@ -196,13 +196,13 @@ impl Constellation {
             // SAFETY: the CPU has the feature the function was compiled for.
             return unsafe { self.demap_block_avx2(y, var, out) };
         }
-        self.demap_range(y, var, 0, y.len(), out);
+        self.demap_range::<false>(y, var, 0, y.len(), out);
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn demap_block_avx2(&self, y: &[Iq], var: &[f32], out: &mut [f32]) {
-        self.demap_range(y, var, 0, y.len(), out);
+        self.demap_range::<true>(y, var, 0, y.len(), out);
     }
 
     /// [`Self::demap_block`], quantised for the LDPC decoder: each soft bit
@@ -216,24 +216,35 @@ impl Constellation {
             // SAFETY: the CPU has the feature the function was compiled for.
             return unsafe { self.demap_block_q_avx2(y, var, scale, out) };
         }
-        self.demap_block_q_body(y, var, scale, out);
+        self.demap_block_q_body::<false>(y, var, scale, out);
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn demap_block_q_avx2(&self, y: &[Iq], var: &[f32], scale: f32, out: &mut [i8]) {
-        self.demap_block_q_body(y, var, scale, out);
+        self.demap_block_q_body::<true>(y, var, scale, out);
     }
 
     #[inline(always)]
-    fn demap_block_q_body(&self, y: &[Iq], var: &[f32], scale: f32, out: &mut [i8]) {
+    fn demap_block_q_body<const SIMD: bool>(
+        &self,
+        y: &[Iq],
+        var: &[f32],
+        scale: f32,
+        out: &mut [i8],
+    ) {
         const CHUNK: usize = 256;
         let bits = self.bits();
         let mut buf = [0f32; CHUNK * 8];
         let mut at = 0;
+        #[cfg(target_arch = "x86_64")]
+        if SIMD && self.rotated && self.qam == Qam::Qam256 {
+            // SAFETY: `SIMD` is only set inside functions compiled with AVX2.
+            at = unsafe { self.demap_q_rotated_256(y, var, scale, out) };
+        }
         while at < y.len() {
             let len = CHUNK.min(y.len() - at);
-            self.demap_range(y, var, at, len, &mut buf[..len * bits]);
+            self.demap_range::<SIMD>(y, var, at, len, &mut buf[..len * bits]);
             for (o, &l) in out[at * bits..(at + len) * bits].iter_mut().zip(&buf) {
                 *o = (l * scale).clamp(-127.0, 127.0).round_ties_even() as i8;
             }
@@ -243,18 +254,26 @@ impl Constellation {
 
     /// Cells `at..at + len` of the block, into `out` (their bits only).
     #[inline(always)]
-    fn demap_range(&self, y: &[Iq], var: &[f32], at: usize, len: usize, out: &mut [f32]) {
+    fn demap_range<const SIMD: bool>(
+        &self,
+        y: &[Iq],
+        var: &[f32],
+        at: usize,
+        len: usize,
+        out: &mut [f32],
+    ) {
         match self.qam {
-            Qam::Qpsk => self.block::<1, 2>(y, var, at, len, out),
-            Qam::Qam16 => self.block::<2, 4>(y, var, at, len, out),
-            Qam::Qam64 => self.block::<3, 8>(y, var, at, len, out),
-            Qam::Qam256 => self.block::<4, 16>(y, var, at, len, out),
+            Qam::Qpsk => self.block::<1, 2, SIMD>(y, var, at, len, out),
+            Qam::Qam16 => self.block::<2, 4, SIMD>(y, var, at, len, out),
+            Qam::Qam64 => self.block::<3, 8, SIMD>(y, var, at, len, out),
+            Qam::Qam256 => self.block::<4, 16, SIMD>(y, var, at, len, out),
         }
     }
 
-    /// `B` bits an axis, `G` = 2^B levels.
+    /// `B` bits an axis, `G` = 2^B levels. With `SIMD` (only where AVX2 is
+    /// there) the rotated constellation's cells go eight at a time.
     #[inline(always)]
-    fn block<const B: usize, const G: usize>(
+    fn block<const B: usize, const G: usize, const SIMD: bool>(
         &self,
         y: &[Iq],
         var: &[f32],
@@ -264,7 +283,38 @@ impl Constellation {
     ) {
         let n = y.len();
         let bits = 2 * B;
-        for (t, j) in (at..at + len).enumerate() {
+        let mut t = 0;
+        #[cfg(target_arch = "x86_64")]
+        if SIMD && self.rotated {
+            // Eight cells at a time while the next cell of the last one is
+            // still in the block.
+            while t + 8 <= len && at + t + 8 < n {
+                let j = at + t;
+                let (mut a, mut b, mut va, mut vb) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
+                for l in 0..8 {
+                    a[l] = y[j + l].re;
+                    b[l] = y[j + l + 1].im;
+                    va[l] = var[j + l].max(1e-9);
+                    vb[l] = var[j + l + 1].max(1e-9);
+                }
+                let mut bit_major = [[0f32; 8]; 8];
+                // SAFETY: `SIMD` is only set inside functions compiled with AVX2.
+                unsafe {
+                    let r = self.rotated_x8::<B, G>(&a, &b, &va, &vb);
+                    for (row, v) in bit_major.iter_mut().zip(r) {
+                        std::arch::x86_64::_mm256_storeu_ps(row.as_mut_ptr(), v);
+                    }
+                }
+                for l in 0..8 {
+                    for (k, row) in bit_major.iter().enumerate().take(bits) {
+                        out[(t + l) * bits + k] = row[l];
+                    }
+                }
+                t += 8;
+            }
+        }
+        for j in at + t..at + len {
+            let t = j - at;
             let o = &mut out[t * bits..(t + 1) * bits];
             if self.rotated {
                 let k = if j + 1 == n { 0 } else { j + 1 };
@@ -349,6 +399,191 @@ impl Constellation {
         }
         axis_llrs::<B, G>(&m, out, 0);
         axis_llrs::<B, G>(&n, out, 1);
+    }
+
+    /// [`Self::cell_rotated`] for eight cells at once, the cells the vector's
+    /// lanes: `a`, `b` the observed components, `va`, `vb` the noise variances;
+    /// the soft bits come back a vector to a bit (`[bit][cell]`, the rows past
+    /// the constellation's bits zero). The same arithmetic, the loop over the
+    /// levels and the minima by halving done once for all eight.
+    ///
+    /// # Safety
+    /// The CPU must have AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn rotated_x8<const B: usize, const G: usize>(
+        &self,
+        a: &[f32; 8],
+        b: &[f32; 8],
+        va: &[f32; 8],
+        vb: &[f32; 8],
+    ) -> [std::arch::x86_64::__m256; 8] {
+        use std::arch::x86_64::*;
+        let ax = self.levels_of::<G>();
+        let mut out = [_mm256_setzero_ps(); 8];
+        // SAFETY: the arrays are eight floats; AVX2 is enabled for this function.
+        unsafe {
+            let ld = |p: &[f32; 8]| _mm256_loadu_ps(p.as_ptr());
+            let (a, b) = (ld(a), ld(b));
+            let one = _mm256_set1_ps(1.0);
+            let wa = _mm256_div_ps(one, ld(va));
+            let wb = _mm256_div_ps(one, ld(vb));
+            let (c, s) = (self.cos, self.sin);
+            let mul = |x: __m256, k: f32| _mm256_mul_ps(x, _mm256_set1_ps(k));
+            let alpha = _mm256_add_ps(mul(wa, c * c), mul(wb, s * s));
+            let beta = _mm256_add_ps(mul(wa, s * s), mul(wb, c * c));
+            let kappa = mul(_mm256_sub_ps(wb, wa), 2.0 * c * s);
+            let wa_a = _mm256_mul_ps(wa, a);
+            let wb_b = _mm256_mul_ps(wb, b);
+            let lx = _mm256_add_ps(mul(wa_a, 2.0 * c), mul(wb_b, 2.0 * s));
+            let ly = _mm256_sub_ps(mul(wa_a, 2.0 * s), mul(wb_b, 2.0 * c));
+            let half = _mm256_set1_ps(0.5);
+            let inv_2a = _mm256_div_ps(half, alpha);
+            let inv_2b = _mm256_div_ps(half, beta);
+            let (norm, top) = (self.norm, (G - 1) as f32);
+            let (normv, inv_norm) = (_mm256_set1_ps(norm), _mm256_set1_ps(1.0 / norm));
+            let (top_v, neg_top) = (_mm256_set1_ps(top), _mm256_set1_ps(-top));
+            let two = _mm256_set1_ps(2.0);
+            // The level of the axis nearest `v`: 2·floor(z/2) + 1 for z = v·norm,
+            // held inside the axis.
+            let nearest = |v: __m256| {
+                let z = _mm256_mul_ps(v, normv);
+                let odd = _mm256_add_ps(
+                    _mm256_mul_ps(two, _mm256_floor_ps(_mm256_mul_ps(half, z))),
+                    one,
+                );
+                _mm256_mul_ps(_mm256_min_ps(_mm256_max_ps(odd, neg_top), top_v), inv_norm)
+            };
+            let (mut m, mut n) = ([_mm256_setzero_ps(); G], [_mm256_setzero_ps(); G]);
+            for i in 0..G {
+                let x = _mm256_set1_ps(ax[i]);
+                let kx = _mm256_mul_ps(kappa, x);
+                // The best Q level for this I level.
+                let y = nearest(_mm256_mul_ps(
+                    _mm256_sub_ps(_mm256_setzero_ps(), _mm256_add_ps(ly, kx)),
+                    inv_2b,
+                ));
+                let p = _mm256_mul_ps(_mm256_sub_ps(_mm256_mul_ps(alpha, x), lx), x);
+                let f = _mm256_mul_ps(
+                    _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(beta, y), ly), kx),
+                    y,
+                );
+                m[i] = _mm256_add_ps(p, f);
+                // The best I level for this Q level (the same levels).
+                let xn = nearest(_mm256_mul_ps(_mm256_sub_ps(lx, kx), inv_2a));
+                let q = _mm256_mul_ps(_mm256_add_ps(_mm256_mul_ps(beta, x), ly), x);
+                let g = _mm256_mul_ps(
+                    _mm256_add_ps(_mm256_sub_ps(_mm256_mul_ps(alpha, xn), lx), kx),
+                    xn,
+                );
+                n[i] = _mm256_add_ps(q, g);
+            }
+            for (first, cur) in [(0usize, &mut m), (1, &mut n)] {
+                let mut len = G;
+                for k in 0..B {
+                    let h = len / 2;
+                    let (mut d0, mut d1) = (_mm256_set1_ps(f32::MAX), _mm256_set1_ps(f32::MAX));
+                    for i in 0..h {
+                        d0 = _mm256_min_ps(d0, cur[i]);
+                        d1 = _mm256_min_ps(d1, cur[h + i]);
+                    }
+                    out[2 * k + first] = _mm256_sub_ps(d1, d0);
+                    for i in 0..h {
+                        cur[i] = _mm256_min_ps(cur[i], cur[h + i]);
+                    }
+                    len = h;
+                }
+            }
+        }
+        out
+    }
+
+    /// A rotated 256-QAM block's cells, eight at a time while the next cell
+    /// of the group's last is in the block, soft bits quantised to bytes (as
+    /// [`Self::demap_block_q`]). Returns the cells done.
+    ///
+    /// # Safety
+    /// The CPU must have AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn demap_q_rotated_256(
+        &self,
+        y: &[Iq],
+        var: &[f32],
+        scale: f32,
+        out: &mut [i8],
+    ) -> usize {
+        use std::arch::x86_64::*;
+        let n = y.len();
+        let mut j = 0;
+        // SAFETY: AVX2 is enabled; every load and store is of a whole array.
+        unsafe {
+            let scale_v = _mm256_set1_ps(scale);
+            let (lo, hi) = (_mm256_set1_ps(-127.0), _mm256_set1_ps(127.0));
+            // dwords 0 4 1 5 2 6 3 7: each cell's eight bytes in a row.
+            let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+            while j + 8 < n {
+                let (mut a, mut b, mut va, mut vb) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
+                for l in 0..8 {
+                    a[l] = y[j + l].re;
+                    b[l] = y[j + l + 1].im;
+                    va[l] = var[j + l].max(1e-9);
+                    vb[l] = var[j + l + 1].max(1e-9);
+                }
+                let r = self.rotated_x8::<4, 16>(&a, &b, &va, &vb);
+                // 8 × 8 transpose: row l becomes cell l's eight soft bits.
+                let (t0, t1) = (
+                    _mm256_unpacklo_ps(r[0], r[1]),
+                    _mm256_unpackhi_ps(r[0], r[1]),
+                );
+                let (t2, t3) = (
+                    _mm256_unpacklo_ps(r[2], r[3]),
+                    _mm256_unpackhi_ps(r[2], r[3]),
+                );
+                let (t4, t5) = (
+                    _mm256_unpacklo_ps(r[4], r[5]),
+                    _mm256_unpackhi_ps(r[4], r[5]),
+                );
+                let (t6, t7) = (
+                    _mm256_unpacklo_ps(r[6], r[7]),
+                    _mm256_unpackhi_ps(r[6], r[7]),
+                );
+                let s0 = _mm256_shuffle_ps::<0x44>(t0, t2);
+                let s1 = _mm256_shuffle_ps::<0xEE>(t0, t2);
+                let s2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+                let s3 = _mm256_shuffle_ps::<0xEE>(t1, t3);
+                let s4 = _mm256_shuffle_ps::<0x44>(t4, t6);
+                let s5 = _mm256_shuffle_ps::<0xEE>(t4, t6);
+                let s6 = _mm256_shuffle_ps::<0x44>(t5, t7);
+                let s7 = _mm256_shuffle_ps::<0xEE>(t5, t7);
+                let cells = [
+                    _mm256_permute2f128_ps::<0x20>(s0, s4),
+                    _mm256_permute2f128_ps::<0x20>(s1, s5),
+                    _mm256_permute2f128_ps::<0x20>(s2, s6),
+                    _mm256_permute2f128_ps::<0x20>(s3, s7),
+                    _mm256_permute2f128_ps::<0x31>(s0, s4),
+                    _mm256_permute2f128_ps::<0x31>(s1, s5),
+                    _mm256_permute2f128_ps::<0x31>(s2, s6),
+                    _mm256_permute2f128_ps::<0x31>(s3, s7),
+                ];
+                // Quantised (rounded to even, held to ±127) and packed to bytes.
+                let q = cells.map(|c| {
+                    _mm256_cvtps_epi32(_mm256_min_ps(
+                        _mm256_max_ps(_mm256_mul_ps(c, scale_v), lo),
+                        hi,
+                    ))
+                });
+                for half in 0..2 {
+                    let k = 4 * half;
+                    let p01 = _mm256_packs_epi32(q[k], q[k + 1]);
+                    let p23 = _mm256_packs_epi32(q[k + 2], q[k + 3]);
+                    let bytes = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(p01, p23), order);
+                    _mm256_storeu_si256(out.as_mut_ptr().add((j + k) * 8) as *mut __m256i, bytes);
+                }
+                j += 8;
+            }
+        }
+        j
     }
 
     /// The exhaustive search over the constellation's points: the reference
@@ -534,6 +769,81 @@ mod tests {
                         fast[j],
                         slow[j]
                     );
+                }
+            }
+        }
+    }
+
+    /// The eight-cells-at-a-time demapper gives what the cell-by-cell one does.
+    #[test]
+    fn the_vector_demapper_matches_the_scalar_one() {
+        let mut seed = 31u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for q in Qam::ALL {
+            let c = Constellation::new(q, true);
+            let bits = q.bits();
+            let n = 203;
+            let y: Vec<Iq> = (0..n)
+                .map(|_| Iq::new(1.6 * rnd() - 0.8, 1.6 * rnd() - 0.8))
+                .collect();
+            let var: Vec<f32> = (0..n).map(|_| 0.001 + 0.2 * rnd()).collect();
+            let mut fast = vec![0f32; n * bits];
+            c.demap_block(&y, &var, &mut fast);
+            for j in 0..n {
+                let k = (j + 1) % n;
+                let mut slow = [0f32; 8];
+                match q {
+                    Qam::Qpsk => {
+                        c.cell_rotated::<1, 2>(y[j].re, y[k].im, var[j], var[k], &mut slow)
+                    }
+                    Qam::Qam16 => {
+                        c.cell_rotated::<2, 4>(y[j].re, y[k].im, var[j], var[k], &mut slow)
+                    }
+                    Qam::Qam64 => {
+                        c.cell_rotated::<3, 8>(y[j].re, y[k].im, var[j], var[k], &mut slow)
+                    }
+                    Qam::Qam256 => {
+                        c.cell_rotated::<4, 16>(y[j].re, y[k].im, var[j], var[k], &mut slow)
+                    }
+                }
+                for t in 0..bits {
+                    let (f, s) = (fast[j * bits + t], slow[t]);
+                    assert!(
+                        (f - s).abs() <= 1e-3 * s.abs().max(1.0),
+                        "{q:?} cell {j} bit {t}: {f} against {s}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The quantised demapper is the float one's bits scaled, rounded and held,
+    /// for every constellation and a block that is not a multiple of eight.
+    #[test]
+    fn the_quantised_demapper_matches_the_float_one() {
+        let mut seed = 5u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for q in Qam::ALL {
+            for rotated in [false, true] {
+                let c = Constellation::new(q, rotated);
+                let bits = q.bits();
+                let n = 203;
+                let y: Vec<Iq> = (0..n)
+                    .map(|_| Iq::new(1.6 * rnd() - 0.8, 1.6 * rnd() - 0.8))
+                    .collect();
+                let var: Vec<f32> = (0..n).map(|_| 0.001 + 0.2 * rnd()).collect();
+                let (mut f, mut qd) = (vec![0f32; n * bits], vec![0i8; n * bits]);
+                c.demap_block(&y, &var, &mut f);
+                c.demap_block_q(&y, &var, 8.0, &mut qd);
+                for (i, (&x, &d)) in f.iter().zip(&qd).enumerate() {
+                    let want = (x * 8.0).clamp(-127.0, 127.0).round_ties_even() as i8;
+                    assert_eq!(d, want, "{q:?} rotated {rotated}: bit {i} of {x}");
                 }
             }
         }

@@ -62,10 +62,10 @@ fn main() {
 
     let n = 20;
     let cst = Constellation::new(qam, rotated);
-    let mut llr = vec![0f32; noisy.len() * qam.bits()];
+    let mut llr = vec![0i8; noisy.len() * qam.bits()];
     let t = Instant::now();
     for _ in 0..n {
-        cst.demap_block(&noisy, &var, &mut llr);
+        cst.demap_block_q(&noisy, &var, 8.0, &mut llr);
         std::hint::black_box(&llr);
     }
     let demap = t.elapsed().as_secs_f64() / n as f64;
