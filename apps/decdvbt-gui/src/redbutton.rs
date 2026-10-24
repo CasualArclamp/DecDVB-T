@@ -1,0 +1,338 @@
+// made by CasualArclamp
+//! The Red Button: the playing service's MHEG-5 application
+//! (`decdvbt_mheg`), its 720x576 canvas drawn over the picture, and the
+//! remote's keys.
+//!
+//! The red key (R, or the button under the picture) starts it: the hub begins
+//! receiving the service's object carousel (`decdvbt_engine::CarouselLink`),
+//! the engine boots the application once the carousel's root has come, and
+//! the red key is handed to the application once it has a scene (the BBC's
+//! starts on its "press red" trigger and opens its menu on red). Keys while
+//! it runs: the arrows, Enter (select), Backspace or Esc (back), 0–9, R G Y
+//! B for the colour keys and T for Text. The button stops it.
+//!
+//! For screenshots and tests, `DECDVBT_REDBUTTON=100,wait,15` (UK key codes,
+//! `wait` a second) starts it on the playing service and presses the keys
+//! one a second once the application has a scene (the red key that starts it
+//! is pressed for you, so the list need not begin with 100).
+//!
+//! Cost: nothing at all until it is started; while it runs the engine is
+//! ticked with each frame (at least ten a second; a few compares when
+//! nothing happens), the hub hands the carousel only the service's DSM-CC
+//! packets, and the canvas is redrawn and uploaded only when the application
+//! changed it. On the C30 BBC One HD test signal, playing with the BBC News
+//! page open costs 59.4 % CPU against 57.4 % without it.
+
+use std::time::{Duration, Instant};
+
+use decdvbt_engine::CarouselLink;
+use decdvbt_mheg::{Engine, Renderer, Request, Service, key};
+use eframe::egui::{
+    self, Color32, ColorImage, Key, Modifiers, Rect, TextureHandle, TextureOptions, pos2,
+};
+
+/// The canvas (D-Book 7 §13.10.1).
+const W: f32 = 720.0;
+const H: f32 = 576.0;
+
+#[derive(Default)]
+pub struct RedButton {
+    link: Option<CarouselLink>,
+    engine: Option<Engine>,
+    renderer: Option<Renderer>,
+    texture: Option<TextureHandle>,
+    t0: Option<Instant>,
+    /// The red key, to give the application once it has a scene.
+    pending_red: bool,
+    /// Where the application wants the picture, on its canvas (`None`: full
+    /// screen).
+    video: Option<(i32, i32, i32, i32)>,
+    pub status: String,
+    /// `DECDVBT_REDBUTTON`'s keys still to press, and when the last was.
+    script: Option<Vec<String>>,
+    script_read: bool,
+    script_at: Option<Instant>,
+}
+
+impl RedButton {
+    pub fn active(&self) -> bool {
+        self.link.is_some()
+    }
+
+    pub fn service(&self) -> Option<u16> {
+        self.link.as_ref().map(|l| l.service)
+    }
+
+    /// What the hub should receive (put in its outputs).
+    pub fn link(&self) -> Option<CarouselLink> {
+        self.link.clone()
+    }
+
+    /// Start service `sid`'s application.
+    pub fn start(&mut self, sid: u16) {
+        self.stop();
+        self.link = Some(CarouselLink::new(sid));
+        self.t0 = Some(Instant::now());
+        self.pending_red = true;
+        self.status = "waiting for the carousel".into();
+        if self.renderer.is_none() {
+            self.renderer = Some(Renderer::new());
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.link = None;
+        self.engine = None;
+        self.texture = None;
+        self.video = None;
+        self.pending_red = false;
+        self.status.clear();
+    }
+
+    /// Where the picture goes within `rect` (the whole picture's place):
+    /// where the application scaled it to, else all of it.
+    pub fn video_rect(&self, rect: Rect) -> Rect {
+        match self.video {
+            Some((x, y, w, h)) if self.active() => {
+                let sx = rect.width() / W;
+                let sy = rect.height() / H;
+                Rect::from_min_size(
+                    rect.min + egui::vec2(x as f32 * sx, y as f32 * sy),
+                    egui::vec2(w as f32 * sx, h as f32 * sy),
+                )
+            }
+            _ => rect,
+        }
+    }
+
+    /// Run the engine for this frame and upload its canvas if it changed.
+    pub fn update(&mut self, ctx: &egui::Context) {
+        let Some(link) = self.link.clone() else {
+            return;
+        };
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let now_ms = self.t0.map_or(0, |t| t.elapsed().as_millis() as u64);
+        let st = link.state.lock().unwrap();
+        let Some(oc) = st.carousel.as_ref() else {
+            if st.absent {
+                self.status = "this service has no interactive application".into();
+            }
+            return;
+        };
+        let engine = match &mut self.engine {
+            Some(e) => e,
+            None => {
+                if !oc.has_gateway() {
+                    let (done, all) = oc.progress();
+                    self.status = format!("receiving the carousel ({done}/{all} modules)");
+                    return;
+                }
+                let mut e = Engine::new();
+                e.boot(oc);
+                self.status.clear();
+                self.engine.insert(e)
+            }
+        };
+        engine.service = Service {
+            original_network_id: st.original_network_id.unwrap_or(0),
+            transport_stream_id: st.ts_id.unwrap_or(0),
+            service_id: link.service,
+            services: Vec::new(),
+        };
+        engine.clock_unix = st.utc.map(|(t, at)| t + at.elapsed().as_secs() as i64);
+        engine.local_offset_s = st.offset_min as i64 * 60;
+        if self.pending_red && engine.has_scene() {
+            self.pending_red = false;
+            engine.key(key::RED);
+        }
+        let changed = engine.tick(now_ms, oc);
+        for r in engine.requests.drain(..) {
+            if let Request::Video(v) = r {
+                self.video = v;
+            }
+        }
+        if let Some(e) = &engine.error {
+            self.status = e.clone();
+        } else if !engine.has_scene() {
+            let (done, all) = oc.progress();
+            self.status = format!("starting ({done}/{all} modules in)");
+        } else {
+            self.status.clear();
+        }
+        drop(st);
+        if changed || self.texture.is_none() {
+            let (Some(r), Some(e)) = (self.renderer.as_mut(), self.engine.as_ref()) else {
+                return;
+            };
+            r.render(e);
+            let img = ColorImage::from_rgba_unmultiplied([W as usize, H as usize], &r.rgba);
+            match &mut self.texture {
+                Some(t) => t.set(img, TextureOptions::LINEAR),
+                None => self.texture = Some(ctx.load_texture("mheg", img, TextureOptions::LINEAR)),
+            }
+        }
+    }
+
+    /// Draw the canvas over the picture's `rect`.
+    pub fn paint(&self, p: &egui::Painter, rect: Rect) {
+        if !self.active() {
+            return;
+        }
+        if let Some(t) = &self.texture {
+            p.image(
+                t.id(),
+                rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        if !self.status.is_empty() {
+            p.text(
+                rect.left_bottom() + egui::vec2(8.0, -8.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("Red Button: {}", self.status),
+                egui::FontId::proportional(13.0),
+                Color32::from_rgb(230, 230, 230),
+            );
+        }
+    }
+
+    /// A key on the remote (UK codes): to the application, if it runs.
+    pub fn key(&mut self, code: i32) {
+        if let Some(e) = &mut self.engine {
+            e.key(code);
+        }
+    }
+
+    /// The keyboard as a remote, while the application runs and no text box
+    /// has the focus. R starts it when it is not running and `sid` plays.
+    pub fn keyboard(&mut self, ctx: &egui::Context, sid: Option<u16>) {
+        self.run_script(sid);
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        if !self.active() {
+            if let Some(s) = sid
+                && pressed(Key::R)
+            {
+                self.start(s);
+            }
+            return;
+        }
+        const MAP: [(Key, i32); 21] = [
+            (Key::ArrowUp, key::UP),
+            (Key::ArrowDown, key::DOWN),
+            (Key::ArrowLeft, key::LEFT),
+            (Key::ArrowRight, key::RIGHT),
+            (Key::Enter, key::SELECT),
+            (Key::Backspace, key::CANCEL),
+            (Key::Escape, key::CANCEL),
+            (Key::R, key::RED),
+            (Key::G, key::GREEN),
+            (Key::Y, key::YELLOW),
+            (Key::B, key::BLUE),
+            (Key::T, key::TEXT),
+            (Key::Num0, key::DIGIT0),
+            (Key::Num1, key::DIGIT0 + 1),
+            (Key::Num2, key::DIGIT0 + 2),
+            (Key::Num3, key::DIGIT0 + 3),
+            (Key::Num4, key::DIGIT0 + 4),
+            (Key::Num5, key::DIGIT0 + 5),
+            (Key::Num6, key::DIGIT0 + 6),
+            (Key::Num7, key::DIGIT0 + 7),
+            (Key::Num8, key::DIGIT0 + 8),
+        ];
+        for (k, code) in MAP {
+            if pressed(k) {
+                self.key(code);
+            }
+        }
+        if pressed(Key::Num9) {
+            self.key(key::DIGIT0 + 9);
+        }
+    }
+
+    /// `DECDVBT_REDBUTTON`: start, then a key a second.
+    fn run_script(&mut self, sid: Option<u16>) {
+        if !self.script_read {
+            self.script_read = true;
+            self.script = std::env::var("DECDVBT_REDBUTTON")
+                .ok()
+                .map(|s| s.split(',').map(|k| k.trim().to_string()).collect());
+        }
+        if self.script.is_none() {
+            return;
+        }
+        if !self.active() {
+            if let Some(s) = sid {
+                self.start(s);
+            }
+            return;
+        }
+        let ready = self.engine.as_ref().is_some_and(|e| e.has_scene()) && !self.pending_red;
+        if !ready
+            || self
+                .script_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.script_at = Some(Instant::now());
+        let Some(k) = self
+            .script
+            .as_mut()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.remove(0))
+        else {
+            return;
+        };
+        if let Ok(code) = k.parse() {
+            self.key(code);
+        }
+    }
+
+    /// The remote's buttons, under the picture.
+    pub fn remote(&mut self, ui: &mut egui::Ui, sid: Option<u16>) {
+        ui.horizontal_wrapped(|ui| {
+            let red = Color32::from_rgb(200, 30, 30);
+            let label = if self.active() { "■ Red Button" } else { "● Red Button" };
+            if ui
+                .add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(red))
+                .on_hover_text("The service's interactive application (keys: R starts it; arrows, Enter, Backspace, 0-9, R G Y B, T)")
+                .clicked()
+            {
+                if self.active() {
+                    self.stop();
+                } else if let Some(s) = sid {
+                    self.start(s);
+                }
+            }
+            if !self.active() {
+                return;
+            }
+            let colour = |ui: &mut egui::Ui, c: Color32, code: i32, me: &mut Self| {
+                if ui.add(egui::Button::new("    ").fill(c)).clicked() {
+                    me.key(code);
+                }
+            };
+            colour(ui, red, key::RED, self);
+            colour(ui, Color32::from_rgb(30, 160, 60), key::GREEN, self);
+            colour(ui, Color32::from_rgb(230, 190, 30), key::YELLOW, self);
+            colour(ui, Color32::from_rgb(40, 90, 220), key::BLUE, self);
+            for (t, code) in [
+                ("◀", key::LEFT),
+                ("▲", key::UP),
+                ("▼", key::DOWN),
+                ("▶", key::RIGHT),
+                ("OK", key::SELECT),
+                ("Back", key::CANCEL),
+                ("Text", key::TEXT),
+            ] {
+                if ui.button(t).clicked() {
+                    self.key(code);
+                }
+            }
+        });
+    }
+}

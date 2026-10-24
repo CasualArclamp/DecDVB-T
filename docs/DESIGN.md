@@ -76,6 +76,12 @@ ring overflow on one DVB-T mux). Every design choice is weighed against this:
   **E-AC-3 / AC-3**, HE-AAC and MPEG-1 L2 audio, **DVB bitmap subtitles**
   (EN 300 743), and **radio services** (no video).
 - PSI/SI viewer: NIT/SDT/EIT now/next, PMT tree, bitrate per PID.
+- **Red Button** (added 2026-10-24): the UK's MHEG-5 interactive services
+  (UK Engine Profile, ETSI ES 202 184 / D-Book 7) from the service's DSM-CC
+  object carousel (`decdvbt-ts::dsmcc`), run by `decdvbt-mheg` and drawn over
+  the player's picture. The carousel is received only while the application
+  is open. Not in it: MPEG-2 I-frame bitmaps, the interaction channel (IP),
+  stream events to the application, HD graphics.
 - Measurements: MER per carrier, channel frequency and impulse response, echo
   profile, pre- and post-FEC BER, LDPC iterations. (Pre-FEC here is the BER
   into the Reed–Solomon code; a BER before the Viterbi decoder would need the

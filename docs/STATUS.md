@@ -1055,3 +1055,36 @@ What is left, largest first: LDPC (~43 %), demapping (~12 %), resampling
 (~8 %), the channel estimate (~6 %, of which the frequency interpolation is
 the most), deinterleaving (~6 %), the FFTs (~5 %).
 
+
+**Stage 3, the GUI.** The player window has a Red Button row under its
+controls (the red button starts and stops it; the colour keys, the arrows,
+OK, Back and Text are the remote), and the keyboard works as the remote
+while it runs (R starts it; arrows, Enter, Backspace/Esc, 0–9, R G Y B, T).
+`apps/decdvbt-gui/src/redbutton.rs` runs the engine on the GUI thread and
+draws its canvas over the picture, stretched to it as a TV does; when the
+application scales the video (the BBC's quarter-screen window) the picture
+is drawn into that rectangle. The hub (`decdvbt-engine::hub`) receives the
+service's carousel only while it is asked for, through a `CarouselLink` in
+its outputs (so `rx.rs` did not change): it makes the carousel from the PMT,
+hands it the service's DSM-CC packets a batch at a time under one lock, and
+shares the stream's time, local offset and ids with the engine (the BBC's
+clock then shows the broadcast's time). `DECDVBT_REDBUTTON=wait,15` starts it
+on the playing service and presses keys, for screenshots.
+
+**Test signal.** No capture had enough of a carousel for the GUI (it replays
+IQ files, and the 8 s C30 capture holds 18 of 73 modules), so
+`captures/sim_rb_c30_546.000MHz_10Msps.cs8` was made: the live C30 stream cut
+to BBC One HD and the SI (padded with null packets to keep its pace at DVB-T's
+24.13 Mbit/s), modulated as 64-QAM 2/3 8k at 32 dB. `decdvbt-gui
+captures/sim_rb_c30_546.000MHz_10Msps.cs8 --decode --play 17536` with
+`DECDVBT_REDBUTTON=wait,wait,wait,15` shows BBC One HD with the BBC News page
+over it and the picture in the BBC's window. CPU: 59.4 % against 57.4 %
+without the Red Button (a 40 ms repaint request first cost 9 points by adding
+frames; the engine now asks for 100 ms).
+
+**Not done.** A live C23 tune (the HackRF read -44 dBFS today), so the C23
+pages themselves were only seen as far as the 71 modules of the short
+captures allow (`/a` boots to the trigger scene). MPEG-2 I-frame bitmaps,
+stream events to the application, the interaction channel, ListGroup's item
+actions, sliders and entry-field editing are not done; the font is a
+squeezed Segoe UI, not Tiresias.

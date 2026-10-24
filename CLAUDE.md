@@ -18,6 +18,8 @@ cargo run --release -p decdvbt-cli -- capture C26 --record x.cs8 # level, drops,
 cargo run --release -p decdvbt-cli -- modulate --cn 25 --profile urban  # a DVB-T test signal file
 cargo run --release -p decdvbt-cli -- sound captures/c26_514.000MHz_10Msps.cs8  # lock, offsets, paths
 cargo run --release -p decdvbt-cli -- decode captures/c23_490.000MHz_10Msps_amp.cs8 -o out/c23.ts  # a transport stream, the services, RS and CPU stats
+cargo run --release -p decdvbt-cli -- decode out/c23.ts --carousel 4416 out/rb   # a .ts as it is; service 4416's DSM-CC carousel (Red Button) to a folder
+cargo run --release -p decdvbt-mheg --example redbutton -- out/live_c30.ts --sid 17536 --keys wait,100,wait,15 --png out/rb.png   # a service's MHEG-5 app, headless (--trace)
 cargo run --release -p decdvbt-cli -- capture C23 --amp --lna 32 --vga 8 --record x.cs8  # the RF amp must be on for DVB-T
 cargo run --release -p decdvbt-rx --example diag -- x.cs8   # per-symbol equaliser diagnostics (see its header)
 cargo run --release -p decdvbt-cli -- decode C30 --amp --lna 32 --vga 8 -o out/c30.ts   # live DVB-T2 (or T) from the HackRF; --progress prints a line a second
@@ -32,7 +34,8 @@ cargo run --release -p decdvbt-gui --example retune_soak -- C23 C26 C28 --rounds
 cargo run --release -p decdvbt-rx --example splice -- A.cs8 B.cs8 24            # offline: the old channel's samples then the new one's; ACQSCAN=1 for first-attempt acquisition
 # the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|maps|history|none,
 # --window ts|epg|sdr, --service ID (select), --play ID, --http 127.0.0.1:8001,
-# --udp 127.0.0.1:1234, --record, --fps 60 (smooth), --optimise (live: run the gain optimiser
+# --udp 127.0.0.1:1234, --record, --fps 60 (smooth), env DECDVBT_REDBUTTON=wait,15 (start the playing
+# service's Red Button and press keys, one a second), --optimise (live: run the gain optimiser
 # after the lock; it changes the radio's gains and writes learned offsets to
 # %APPDATA%\DecDVB-T\prefs.txt)
 ```

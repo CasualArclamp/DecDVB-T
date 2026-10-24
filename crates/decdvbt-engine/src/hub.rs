@@ -1,7 +1,8 @@
 // made by CasualArclamp
 //! The transport stream after the receiver: the analyser behind the service
 //! panel and the TS viewer, the outputs (a `.ts` file, UDP, an HTTP/TCP
-//! server) and the tap the in-app player reads.
+//! server), the tap the in-app player reads, and the DSM-CC object carousel
+//! of one service while its interactive application (Red Button) is open.
 //!
 //! It runs on a thread of its own and the receive thread only hands it
 //! batches of packets, so none of it can make the receive thread late (a
@@ -17,7 +18,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use decdvbt_ts::backlog::Backlog;
-use decdvbt_ts::{Epg, TS_LEN, TcpSink, TsAnalyser, TsFile, TsReport, TsTap, UdpSink};
+use decdvbt_ts::{
+    Epg, ObjectCarousel, TS_LEN, TcpSink, TsAnalyser, TsFile, TsReport, TsTap, UdpSink,
+};
 
 /// Bytes waiting for the thread: about four seconds of a UK multiplex.
 const MAX_QUEUED: usize = 12 * 1024 * 1024;
@@ -40,6 +43,54 @@ pub struct Outputs {
     /// The in-app player's copy; it is handed the stream from the last
     /// keyframe of its video PID first.
     pub tap: Option<TsTap>,
+    /// A service whose object carousel to receive (for its MHEG-5
+    /// application); none is received otherwise.
+    pub carousel: Option<CarouselLink>,
+}
+
+/// What the hub shares with the MHEG engine: the carousel being received
+/// and where the stream is.
+#[derive(Default)]
+pub struct CarouselState {
+    /// Made once the service's PMT is in; `None` before, or if the service
+    /// has none.
+    pub carousel: Option<ObjectCarousel>,
+    /// The PMT has come and names no carousel.
+    pub absent: bool,
+    /// The stream's last time (TDT/TOT, Unix seconds) and when it came.
+    pub utc: Option<(i64, Instant)>,
+    /// Local time's offset from UTC now, minutes (TOT).
+    pub offset_min: i32,
+    pub original_network_id: Option<u16>,
+    pub ts_id: Option<u16>,
+}
+
+/// The GUI's request for a service's carousel, and where the hub puts it.
+#[derive(Clone)]
+pub struct CarouselLink {
+    pub service: u16,
+    pub state: Arc<Mutex<CarouselState>>,
+}
+
+impl CarouselLink {
+    pub fn new(service: u16) -> Self {
+        CarouselLink {
+            service,
+            state: Arc::new(Mutex::new(CarouselState::default())),
+        }
+    }
+}
+
+impl PartialEq for CarouselLink {
+    fn eq(&self, other: &Self) -> bool {
+        self.service == other.service && Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl std::fmt::Debug for CarouselLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CarouselLink({})", self.service)
+    }
 }
 
 /// What the hub tells the GUI.
@@ -193,6 +244,11 @@ struct Stage {
     report_at: Instant,
     epg_at: Instant,
     epg_version: u64,
+    /// The carousel asked for, and its PIDs once its PMT is in.
+    carousel: Option<CarouselLink>,
+    carousel_pids: Vec<u16>,
+    /// Its packets in this batch (kept to save allocating).
+    carousel_batch: Vec<[u8; TS_LEN]>,
 }
 
 impl Stage {
@@ -214,6 +270,9 @@ impl Stage {
             report_at: now - REPORT_EVERY,
             epg_at: now - EPG_EVERY,
             epg_version: u64::MAX,
+            carousel: None,
+            carousel_pids: Vec::new(),
+            carousel_batch: Vec::new(),
         }
     }
 
@@ -226,10 +285,23 @@ impl Stage {
         self.report = Arc::new(TsReport::default());
         self.report_at = Instant::now() - REPORT_EVERY;
         self.epg_version = u64::MAX;
+        self.restart_carousel();
+    }
+
+    /// The carousel starts over (a new multiplex, or a new request).
+    fn restart_carousel(&mut self) {
+        self.carousel_pids.clear();
+        if let Some(l) = &self.carousel {
+            *l.state.lock().unwrap() = CarouselState::default();
+        }
     }
 
     /// Open, close or move the outputs to match `o`.
     fn follow(&mut self, o: &Outputs) {
+        if self.carousel != o.carousel {
+            self.carousel = o.carousel.clone();
+            self.restart_carousel();
+        }
         if self.tap != o.tap {
             self.tap = o.tap.clone();
             // A player starting: the stream from its last keyframe first,
@@ -290,6 +362,9 @@ impl Stage {
             self.backlog.push(p);
         }
         self.packets += pkts.len() as u64;
+        if self.carousel.is_some() {
+            self.carousel_packets(pkts);
+        }
         if let Some(f) = &mut self.file
             && let Err(e) = f.write(pkts)
         {
@@ -307,7 +382,58 @@ impl Stage {
         }
     }
 
+    /// Hand the carousel its packets: one lock a batch, and only for the
+    /// service's DSM-CC PIDs. Until its PMT is in, look for it.
+    fn carousel_packets(&mut self, pkts: &[[u8; TS_LEN]]) {
+        let Some(link) = &self.carousel else { return };
+        if self.carousel_pids.is_empty() {
+            let Some(prog) = self.analyser.programmes.get(&link.service) else {
+                return;
+            };
+            if prog.streams.is_empty() {
+                return;
+            }
+            let mut st = link.state.lock().unwrap();
+            if st.carousel.is_none() && !st.absent {
+                st.carousel = ObjectCarousel::for_programme(prog);
+                st.absent = st.carousel.is_none();
+                if let Some(oc) = &st.carousel {
+                    self.carousel_pids = oc.pids().collect();
+                }
+            }
+            return;
+        }
+        self.carousel_batch.clear();
+        self.carousel_batch.extend(pkts.iter().filter(|p| {
+            let pid = u16::from_be_bytes([p[1] & 0x1F, p[2]]);
+            self.carousel_pids.contains(&pid)
+        }));
+        if self.carousel_batch.is_empty() {
+            return;
+        }
+        if let Some(oc) = link.state.lock().unwrap().carousel.as_mut() {
+            for p in &self.carousel_batch {
+                oc.packet(p);
+            }
+        }
+    }
+
     fn publish(&mut self, sh: &Shared) {
+        if let Some(link) = &self.carousel {
+            let a = &self.analyser;
+            let mut st = link.state.lock().unwrap();
+            if let Some(t) = a.utc_unix
+                && st.utc.is_none_or(|u| u.0 != t)
+            {
+                st.utc = Some((t, Instant::now()));
+            }
+            st.offset_min = a
+                .local_time
+                .as_ref()
+                .map_or(0, |lt| lt.offset_at(a.utc_unix.unwrap_or(0)));
+            st.original_network_id = a.original_network_id;
+            st.ts_id = a.ts_id;
+        }
         let (view_seen, epg_seen) = *sh.watched.lock().unwrap();
         if view_seen.elapsed() < WATCH_FOR && self.report_at.elapsed() >= REPORT_EVERY {
             self.report = Arc::new(self.analyser.report());

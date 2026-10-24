@@ -17,7 +17,7 @@ pub mod snr;
 pub mod spectrum;
 
 pub use frontend::{FrontEndReading, FrontEndSettings};
-pub use hub::{Outputs, TsHub, TsView};
+pub use hub::{CarouselLink, CarouselState, Outputs, TsHub, TsView};
 pub use meter::{CpuGauge, Stage, StageLoad, StageMeter, process_cpu_seconds};
 pub use rx::{
     Command, DecoderUpdate, DropProbe, Recording, Row, Rx, RxOptions, SounderUpdate, Stats,

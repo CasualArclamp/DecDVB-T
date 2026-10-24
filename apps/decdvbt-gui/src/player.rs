@@ -6,7 +6,8 @@
 //! makes the tap and starts the player ([`TvWindow::start`]), and gives the
 //! tap up when the window closes. A service with no picture (radio) shows its
 //! name, what is playing and the sound's levels. DVB subtitles are drawn over
-//! the picture when a subtitle stream is chosen.
+//! the picture when a subtitle stream is chosen. The service's Red Button
+//! application ([`crate::redbutton`]) draws over the picture.
 //!
 //! Format after DecSAT's player window.
 
@@ -21,6 +22,7 @@ use eframe::egui::{
 };
 
 use crate::prefs;
+use crate::redbutton::RedButton;
 use crate::services::Kind;
 
 /// What the window asks of the app.
@@ -85,6 +87,8 @@ pub struct TvWindow {
     tap_dropped: u64,
     /// The service being played has a picture (not radio).
     picture: bool,
+    /// The service's interactive application.
+    pub red: RedButton,
 }
 
 impl Default for TvWindow {
@@ -103,6 +107,7 @@ impl Default for TvWindow {
             gpu: prefs::gpu(),
             tap_dropped: 0,
             picture: false,
+            red: RedButton::default(),
         }
     }
 }
@@ -118,6 +123,9 @@ impl TvWindow {
     ) {
         self.stop();
         self.open = true;
+        if self.red.service().is_some_and(|s| s != p.number) {
+            self.red.stop();
+        }
         self.service = Some(p.number);
         let mut sel = selection(p, audio, subs);
         sel.deint = if self.bob {
@@ -160,6 +168,7 @@ impl TvWindow {
 
     pub fn close(&mut self) {
         self.stop();
+        self.red.stop();
         self.open = false;
         self.service = None;
         self.texture = None;
@@ -188,6 +197,9 @@ impl TvWindow {
             return None;
         }
         self.tap_dropped = tap_dropped;
+        self.red.update(ctx);
+        let playing = self.service.filter(|_| self.player.is_some());
+        self.red.keyboard(ctx, playing);
         // The picture due now.
         if let Some(f) = self.player.as_mut().and_then(|p| p.poll()) {
             let img =
@@ -213,7 +225,8 @@ impl TvWindow {
             .resizable(true)
             .show(ctx, |ui| {
                 self.controls(ui, programmes, current, &mut req);
-                if current.is_some_and(|p| Kind::of(p) == Kind::Radio) {
+                self.red.remote(ui, playing);
+                if current.is_some_and(|p| Kind::of(p) == Kind::Radio) && !self.red.active() {
                     self.radio(ui, current);
                 } else {
                     self.picture(ui);
@@ -430,14 +443,15 @@ impl TvWindow {
         let p = ui.painter();
         p.rect_filled(rect, 0.0, Color32::BLACK);
         match &self.texture {
-            Some(t) if self.player.is_some() => {
+            Some(t) if self.player.is_some() && self.picture => {
                 p.image(
                     t.id(),
-                    rect,
+                    self.red.video_rect(rect),
                     Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
             }
+            _ if self.red.active() => {}
             _ => {
                 p.text(
                     rect.center(),
@@ -448,6 +462,7 @@ impl TvWindow {
                 );
             }
         }
+        self.red.paint(p, rect);
     }
 
     /// A radio service: its name, what is on and the levels of the sound.

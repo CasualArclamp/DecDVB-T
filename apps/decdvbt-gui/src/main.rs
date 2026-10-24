@@ -22,6 +22,7 @@ mod freq_display;
 mod heatmaps;
 mod player;
 mod prefs;
+mod redbutton;
 mod remember;
 mod scopes;
 mod sdr;
@@ -871,9 +872,10 @@ impl App {
             .vfo_hz
             .and_then(uhf_channel_at)
             .map_or_else(|| format!("C{}", self.channel), |c| format!("C{c}"));
-        let o = self
+        let mut o = self
             .outputs_ui
             .outputs(&name, self.tap.clone(), self.pending_vlc.is_some());
+        o.carousel = self.tv.red.link();
         if self.outputs_sent.as_ref() != Some(&o) {
             s.rx.set_outputs(o.clone());
             self.outputs_sent = Some(o);

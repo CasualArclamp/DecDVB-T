@@ -644,6 +644,7 @@ dependencies = [
  "decdvbt-core",
  "decdvbt-engine",
  "decdvbt-io",
+ "decdvbt-mheg",
  "decdvbt-rx",
  "decdvbt-ts",
  "decdvbt-video",

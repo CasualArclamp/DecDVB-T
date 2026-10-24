@@ -313,6 +313,7 @@ impl OutputsUi {
             udp,
             tcp,
             tap,
+            carousel: None,
         }
     }
 }

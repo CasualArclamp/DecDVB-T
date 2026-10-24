@@ -24,6 +24,7 @@ decdvbt-io = { path = "../../crates/decdvbt-io" }
 decdvbt-engine = { path = "../../crates/decdvbt-engine" }
 decdvbt-rx = { path = "../../crates/decdvbt-rx" }
 decdvbt-ts = { path = "../../crates/decdvbt-ts" }
+decdvbt-mheg = { path = "../../crates/decdvbt-mheg" }
 decdvbt-video = { path = "../../crates/decdvbt-video" }
 decdvbt-audio = { path = "../../crates/decdvbt-audio" }
 anyhow.workspace = true
