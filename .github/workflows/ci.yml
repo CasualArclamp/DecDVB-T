@@ -3,10 +3,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
+    tags: ["v*"]
     paths-ignore: ["**/*.md", "docs/**"]
   pull_request:
     paths-ignore: ["**/*.md", "docs/**"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,10 +44,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # The HackRF front end is feature-gated and loads libhackrf at run time,
-      # so it must still compile on a runner with no SDR SDK installed.
-      - name: Build with the hackrf feature
-        run: cargo build -p decdvbt-cli --features hackrf
+      # The HackRF front end is pure Rust over USB (nusb), on by default:
+      # it must build on a runner with no SDR software, and so must the CLI
+      # without it.
+      - name: Build the CLI without the hackrf feature
+        run: cargo build -p decdvbt-cli --no-default-features
 
   clippy:
     runs-on: ubuntu-latest

@@ -11,8 +11,10 @@ use decdvbt_core::channel::parse_channel;
 use decdvbt_core::channel::uhf_centre_hz;
 use decdvbt_io::{IqFileReader, IqSource, format_from_path, name_hint};
 
-/// The HackRF's gains: the RF amplifier (+14 dB), LNA and VGA, dB.
+/// The HackRF's gains: the RF amplifier (+14 dB), LNA and VGA, dB (read
+/// only by a build with the radio).
 #[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "hackrf"), allow(dead_code))]
 pub struct Gains {
     pub amp: bool,
     pub lna: u16,
@@ -38,7 +40,10 @@ pub fn open(source: &str, file_rate_msps: f64, gains: Option<Gains>) -> Result<B
             })?))
         }
         #[cfg(not(feature = "hackrf"))]
-        Some(_) => anyhow::bail!("built without the hackrf feature"),
+        Some(_) => {
+            let _ = gains;
+            anyhow::bail!("built without the hackrf feature")
+        }
         None => {
             let path = PathBuf::from(source);
             let fmt = format_from_path(&path).unwrap_or(SampleFormat::Cs8);
