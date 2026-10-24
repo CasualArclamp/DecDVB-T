@@ -29,26 +29,26 @@ const SNR: Color32 = Color32::from_rgb(110, 220, 130);
 /// The scopes' half-range in cell units: a 64-QAM corner is at 1.08, a pilot
 /// at 1.33.
 const RANGE: f32 = 1.5;
-/// A scope's picture, pixels a side.
-const TEX: usize = 160;
-/// How much of the glow is left after the next symbol's cells are in, and how
-/// much a cell adds.
-const DECAY: f32 = 0.72;
-const GLOW: f32 = 0.45;
+/// Cells a scope shows: the newest, each at full brightness until a newer
+/// one pushes it out (no fading), about two DVB-T 8k symbols' data cells.
+const KEEP: usize = 12_000;
 /// Symbols' worth of cells waiting for the next draw, at most.
 const MAX_PENDING: usize = 8;
 
-/// A scope's picture with a phosphor's memory: each symbol's cells are added
-/// to a grid of intensities that fades with the next, and the grid is sent
-/// to the graphics card as a texture only when cells have come (ten times a
-/// second), not every frame. Drawing a scope is then one quad; drawing every
-/// cell as a shape costs more CPU than the receiver's equaliser.
+/// A scope's picture: the newest [`KEEP`] cells as dots (brighter where they
+/// crowd), drawn into a
+/// texture as big as the scope is on the screen (in physical pixels, sampled
+/// without smoothing, so the dots stay sharp), and sent to the graphics card
+/// only when cells have come (ten times a second), not every frame. Drawing a
+/// scope is then one quad; drawing every cell as a shape costs more CPU than
+/// the receiver's equaliser.
 struct Phosphor {
-    glow: Vec<f32>,
+    cells: std::collections::VecDeque<Iq>,
     tex: Option<TextureHandle>,
-    /// Cells have been added since the texture was made.
+    /// The texture's side, pixels, and whether it is older than the cells.
+    side: usize,
     dirty: bool,
-    /// The half-range of the last picture, cell units.
+    /// The half-range of the picture, cell units.
     range: f32,
     name: &'static str,
 }
@@ -56,17 +56,18 @@ struct Phosphor {
 impl Phosphor {
     fn new(name: &'static str) -> Phosphor {
         Phosphor {
-            glow: vec![0.0; TEX * TEX],
+            cells: std::collections::VecDeque::new(),
             tex: None,
+            side: 0,
             dirty: true,
             range: RANGE,
             name,
         }
     }
 
-    /// Fade the glow and add `cells`. `fixed`: the half-range as a multiple of
-    /// [`RANGE`]; `None` fits the cells' rms radius at 0.55 of the half-side
-    /// (smoothed, so the picture does not breathe).
+    /// Add `cells`, dropping the oldest past [`KEEP`]. `fixed`: the half-range
+    /// as a multiple of [`RANGE`]; `None` fits the cells' rms radius at 0.55
+    /// of the half-side (smoothed, so the picture does not breathe).
     fn add(&mut self, cells: &[Iq], fixed: Option<f32>) {
         let target = match fixed {
             Some(r) => RANGE * r,
@@ -82,41 +83,57 @@ impl Phosphor {
             }
         };
         self.range = target;
-        for g in &mut self.glow {
-            *g *= DECAY;
-        }
-        let half = TEX as f32 / 2.0;
-        let k = half / self.range;
-        for c in cells {
-            let (x, y) = ((half + c.re * k) as isize, (half - c.im * k) as isize);
-            // A cell is two pixels square, so a sparse scope is still seen.
-            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let (x, y) = (x + dx, y + dy);
-                if (0..TEX as isize).contains(&x) && (0..TEX as isize).contains(&y) {
-                    let g = &mut self.glow[y as usize * TEX + x as usize];
-                    *g = (*g + GLOW).min(1.0);
-                }
-            }
-        }
+        self.cells.extend(cells.iter().copied());
+        let extra = self.cells.len().saturating_sub(KEEP);
+        self.cells.drain(..extra);
         self.dirty = true;
     }
 
-    /// The picture, sent again if cells have come since it was made.
-    fn texture(&mut self, ctx: &egui::Context) -> &TextureHandle {
-        if self.dirty || self.tex.is_none() {
-            let px = self
-                .glow
+    /// The picture at `side` pixels, made again if cells have come or the
+    /// size has changed.
+    fn texture(&mut self, ctx: &egui::Context, side: usize) -> &TextureHandle {
+        let side = side.clamp(32, 1024);
+        if self.dirty || self.tex.is_none() || side != self.side {
+            self.side = side;
+            // How many cells fall on each pixel: a lone cell is seen, a
+            // crowded pixel is brighter, so the clusters keep their shape
+            // without the picture fading with time.
+            let mut hits = vec![0u16; side * side];
+            let half = side as f32 / 2.0;
+            let k = half / self.range;
+            // One pixel a cell; two on a big scope (a high-density screen).
+            let dot = if side >= 360 { 2 } else { 1 };
+            for c in &self.cells {
+                let x0 = (half + c.re * k) as isize;
+                let y0 = (half - c.im * k) as isize;
+                for y in y0..y0 + dot {
+                    for x in x0..x0 + dot {
+                        if (0..side as isize).contains(&x) && (0..side as isize).contains(&y) {
+                            let h = &mut hits[y as usize * side + x as usize];
+                            *h = h.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            let px: Vec<Color32> = hits
                 .iter()
-                .map(|&g| Color32::from_rgba_unmultiplied(110, 220, 130, (g.sqrt() * 255.0) as u8))
+                .map(|&n| {
+                    if n == 0 {
+                        Color32::TRANSPARENT
+                    } else {
+                        let a = (0.45 + 0.2 * f32::from(n)).min(1.0);
+                        Color32::from_rgba_unmultiplied(120, 235, 150, (a * 255.0) as u8)
+                    }
+                })
                 .collect();
-            let img = ColorImage::new([TEX, TEX], px);
+            let img = ColorImage::new([side, side], px);
             match &mut self.tex {
-                Some(t) => t.set(img, TextureOptions::LINEAR),
+                Some(t) => t.set(img, TextureOptions::NEAREST),
                 None => {
                     self.tex = Some(ctx.load_texture(
                         format!("scope_{}", self.name),
                         img,
-                        TextureOptions::LINEAR,
+                        TextureOptions::NEAREST,
                     ));
                 }
             }
@@ -323,7 +340,18 @@ fn scope(ui: &mut Ui, size: egui::Vec2, ph: &mut Phosphor, seen: bool, marks: &[
         return;
     }
     let range = ph.range;
-    let tex = ph.texture(ui.ctx());
+    // The square snapped to whole physical pixels, and a texture of exactly
+    // that many: one texel to a pixel.
+    let ppp = ui.ctx().pixels_per_point();
+    let px_side = (side * ppp).round();
+    let sq = Rect::from_min_size(
+        pos2(
+            (sq.left() * ppp).round() / ppp,
+            (sq.top() * ppp).round() / ppp,
+        ),
+        vec2(px_side / ppp, px_side / ppp),
+    );
+    let tex = ph.texture(ui.ctx(), px_side as usize);
     p.image(
         tex.id(),
         sq,
@@ -649,15 +677,16 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_glows_where_it_is_and_fades_with_the_next_symbol() {
+    fn cells_stay_until_newer_ones_push_them_out() {
         let mut ph = Phosphor::new("data");
         ph.add(&[Iq::new(0.0, 0.0)], Some(1.0));
-        let centre = TEX / 2 * TEX + TEX / 2;
-        assert!(ph.glow[centre] >= GLOW - 1e-6);
-        let first = ph.glow[centre];
+        // No fading: the cell is still there after an empty update.
         ph.add(&[], Some(1.0));
-        assert!((ph.glow[centre] - first * DECAY).abs() < 1e-6);
-        // A cell off the scope is not drawn (and does not panic).
+        assert_eq!(ph.cells.len(), 1);
+        ph.add(&vec![Iq::new(0.5, 0.5); KEEP], Some(1.0));
+        assert_eq!(ph.cells.len(), KEEP);
+        assert_eq!(ph.cells.front().copied(), Some(Iq::new(0.5, 0.5)));
+        // A cell off the scope is kept but not drawn (and does not panic).
         ph.add(&[Iq::new(100.0, -100.0)], Some(1.0));
     }
 
