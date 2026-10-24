@@ -26,8 +26,8 @@ use crate::t2::p1det;
 use crate::t2::pipe::{Done, FecPipe, Job};
 use crate::t2::plp::{PlpParams, first_block_points};
 use crate::t2::sounding::{FrameRows, T2Sounder};
-use decdvbt_fec::t2::timeint::CellInterleaver;
 use crate::window::Window;
+use decdvbt_fec::t2::timeint::CellInterleaver;
 
 /// The signal's sample rate for 8 MHz channels, Hz.
 pub const FS_NATIVE: f64 = 64e6 / 7.0;
@@ -208,6 +208,8 @@ pub struct T2Receiver {
     /// The cell interleaver of the PLP the scopes' cells were last read
     /// from (made again if its coding changes).
     scope_ci: Option<(PlpParams, CellInterleaver)>,
+    /// Frames' cell buffers back from the FEC stage, for the next frames.
+    pool: Vec<(Vec<Iq>, Vec<f32>)>,
 }
 
 /// A frame's channel estimate at its middle symbol, for the display.
@@ -259,6 +261,7 @@ impl T2Receiver {
             heat: Vec::new(),
             sounder: None,
             scope_ci: None,
+            pool: Vec::new(),
         }
     }
 
@@ -387,6 +390,9 @@ impl T2Receiver {
         self.status.fec_load = d.load;
         self.ts.extend_from_slice(&d.ts);
         self.account(d.stats, d.resyncs);
+        if self.pool.len() < 4 {
+            self.pool.push(d.buffers);
+        }
     }
 
     /// Hand over a block of the radio's samples, whose first is the stream's
@@ -777,7 +783,16 @@ impl T2Receiver {
 
         let scope = std::mem::take(&mut self.scope_wanted);
         t.demod.sounding = self.sounder.is_some();
-        let data = t.demod.data_cells(&mut carriers, scope);
+        // The frame's cells: P2's (all of them logical), then the data
+        // symbols', in a buffer an earlier frame has used.
+        let (mut cells, mut var) = self.pool.pop().unwrap_or_default();
+        cells.clear();
+        var.clear();
+        cells.extend_from_slice(&logical);
+        var.extend_from_slice(&lvar);
+        let data = t
+            .demod
+            .data_cells_into(&mut carriers, scope, &mut cells, &mut var);
         self.status.profile.equalise += t_eq.elapsed();
         {
             let d = &t.demod.prof;
@@ -808,10 +823,11 @@ impl T2Receiver {
                 clock_ppm: (t.step / self.rho - 1.0) * 1e6,
             });
         }
-        let mid_symbol = (data.cells.len() / c_data.max(1)) / 2;
+        let data_cells = &cells[logical.len()..];
+        let mid_symbol = (data_cells.len() / c_data.max(1)) / 2;
         if scope && let Some(plp) = self.status.plp {
-            let cells = data.cells
-                [mid_symbol * c_data..((mid_symbol + 1) * c_data).min(data.cells.len())]
+            let cells = data_cells
+                [mid_symbol * c_data..((mid_symbol + 1) * c_data).min(data_cells.len())]
                 .iter()
                 .copied();
             self.scopes = Some(Scopes {
@@ -866,10 +882,6 @@ impl T2Receiver {
             if let (Some(params), Some(dynamic)) = (params, dynamic) {
                 // The cells of the frame: P2's (all of them logical), then
                 // the data symbols'.
-                let mut cells = logical;
-                let mut var = lvar;
-                cells.extend_from_slice(&data.cells);
-                var.extend_from_slice(&data.var);
                 let start = PRE_CELLS + t.l1pre.l1_post_size as usize + dynamic.plp_start as usize;
                 // A rotated constellation's cells are spread over stripes:
                 // the scopes show one FEC block's points instead, each put

@@ -56,6 +56,10 @@ const STALL_ITERATIONS: usize = 5;
 /// (172B's ACM outbound live, every 16APSK 8/9 frame below threshold and
 /// spending the full budget: 72 % of frames dropped).
 const HOPELESS_AFTER: usize = 10;
+
+/// Unsatisfied checks, as counted during an iteration's layers, below which
+/// the exact count is made (see `decode_budget_body`).
+const EXACT_BELOW: usize = 64;
 const HOPELESS_PATIENCE: usize = 8;
 
 /// What a decode achieved.
@@ -234,16 +238,16 @@ impl LdpcDecoder {
         }
     }
 
-    /// One layer, by the kernel `AVX2` names.
+    /// One layer, by the kernel `AVX2` names; its checks unsatisfied by the
+    /// posteriors as it read them.
     #[inline(always)]
-    fn sweep_layer<const AVX2: bool>(&mut self, layer: usize) {
+    fn sweep_layer<const AVX2: bool>(&mut self, layer: usize) -> u32 {
         #[cfg(target_arch = "x86_64")]
         if AVX2 {
             // SAFETY: only instantiated inside functions compiled with AVX2.
-            unsafe { super::avx2::layer(self, layer) };
-            return;
+            return unsafe { super::avx2::layer(self, layer) };
         }
-        self.layer(layer);
+        self.layer(layer)
     }
 
     #[inline(always)]
@@ -304,11 +308,22 @@ impl LdpcDecoder {
         // The fewest unsatisfied checks so far, and iterations since.
         let (mut best, mut since_best) = (unsatisfied, 0);
         while !outcome.converged && outcome.iterations < max_iterations {
+            // Each layer counts its checks as the posteriors stood when it
+            // read them: near the exact count, which the posteriors have
+            // moved on from. A large one stands in for the exact count (in
+            // the plateau test), saving a pass over every edge an iteration;
+            // a small one is counted exactly, so that a decode stops on the
+            // iteration it converges in and the stall test sees the truth.
+            let mut in_pass = 0;
             for layer in 0..q {
-                self.sweep_layer::<AVX2>(layer);
+                in_pass += self.sweep_layer::<AVX2>(layer) as usize;
             }
             outcome.iterations += 1;
-            let now = self.count_unsatisfied::<AVX2>();
+            let now = if in_pass <= EXACT_BELOW {
+                self.count_unsatisfied::<AVX2>()
+            } else {
+                in_pass
+            };
             self.history.push(now as u32);
             stalled = if now == outcome.unsatisfied && now <= STALL_CHECKS {
                 stalled + 1
@@ -329,6 +344,11 @@ impl LdpcDecoder {
             {
                 break;
             }
+        }
+        if !outcome.converged && outcome.iterations > 0 {
+            // What is reported is the exact count.
+            outcome.unsatisfied = self.count_unsatisfied::<AVX2>();
+            outcome.converged = outcome.unsatisfied == 0;
         }
 
         info.fill(0);
@@ -359,9 +379,10 @@ impl LdpcDecoder {
             .collect()
     }
 
-    /// One layer of min-sum.
+    /// One layer of min-sum; returns its checks unsatisfied by the
+    /// posteriors as it read them.
     #[inline(always)]
-    fn layer(&mut self, layer: usize) {
+    fn layer(&mut self, layer: usize) -> u32 {
         let (start, end) = (
             self.code.layer_start[layer],
             self.code.layer_start[layer + 1],
@@ -374,14 +395,23 @@ impl LdpcDecoder {
         let mut min1 = [MSG_MAX; LANES];
         let mut min2 = [MSG_MAX; LANES];
         let mut arg = [0u8; LANES];
-        // Sign product: the XOR of the values' sign bits.
+        // Sign product: the XOR of the values' sign bits; and of the
+        // posteriors' own (the checks' parity).
         let mut sign = [0i16; LANES];
+        let mut parity = [0i16; LANES];
 
         for e in 0..deg {
             let edge = self.code.edges[start + e];
             let base = edge.group as usize * GROUP_STRIDE;
             let t = &mut self.t[e];
             rotate_in(&self.v[base..base + LANES], edge.shift as usize, t);
+            for c in 0..LANES {
+                parity[c] ^= t[c];
+            }
+            if corner && e == deg - 1 {
+                // Check 0 has no corner bit.
+                parity[0] ^= t[0];
+            }
             let old = &self.r[(start + e) * LANES..(start + e + 1) * LANES];
             for c in 0..LANES {
                 t[c] -= old[c] as i16;
@@ -423,6 +453,7 @@ impl LdpcDecoder {
             let base = edge.group as usize * GROUP_STRIDE;
             add_rotated(&delta, edge.shift as usize, &mut self.v[base..base + LANES]);
         }
+        parity.iter().filter(|&&p| p < 0).count() as u32
     }
 
     /// How many parity checks the hard decisions leave unsatisfied.

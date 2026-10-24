@@ -41,6 +41,9 @@ pub struct Done {
     /// as a share of its period.
     pub threads: usize,
     pub load: f32,
+    /// The job's cells and variances, to be used for a later frame (see
+    /// [`crate::t2::frame::Demod::data_cells_into`]).
+    pub buffers: (Vec<Iq>, Vec<f32>),
 }
 
 enum Msg {
@@ -208,6 +211,7 @@ fn worker(max_threads: usize, jobs: Receiver<Msg>, out: Sender<Done>, cancel: &A
                     resyncs: d.resyncs(),
                     threads: used,
                     load,
+                    buffers: (job.cells, job.var),
                 }
             }
             None => Done {
@@ -216,6 +220,7 @@ fn worker(max_threads: usize, jobs: Receiver<Msg>, out: Sender<Done>, cancel: &A
                 resyncs: 0,
                 threads,
                 load: 0.0,
+                buffers: (job.cells, job.var),
             },
         };
         if out.send(done).is_err() {

@@ -58,8 +58,11 @@ unsafe fn dot2_avx2(c: &[f32; TAPS], re: &[f32; TAPS], im: &[f32; TAPS]) -> (f32
     }
 }
 
-/// `resample_planar`'s loop with AVX2 and FMA enabled, so the dot product
-/// inlines into it.
+/// `resample_planar`'s loop with AVX2 and FMA. Four outputs at a time: each
+/// one's taps against its 16 samples in two fused multiply-adds per part, and
+/// then the eight sums reduced together by a tree of horizontal adds that
+/// leaves them as the four outputs' (re, im) pairs, in the order they are
+/// stored. Reducing each output alone cost more than its multiplies.
 ///
 /// # Safety
 /// The CPU must have AVX2 and FMA.
@@ -73,8 +76,42 @@ unsafe fn resample_avx2(
     n: usize,
     out: &mut Vec<Iq>,
 ) {
+    use std::arch::x86_64::*;
     out.reserve(n);
-    for j in 0..n {
+    let quads = n / 4;
+    // SAFETY: the CPU has AVX2 and FMA (the caller's promise); each read is
+    // `TAPS` samples from `first`, checked against the arrays' length; the
+    // stores go to the `n` reserved places, which are then made the vector's.
+    unsafe {
+        let dst = out.as_mut_ptr().add(out.len()) as *mut f32;
+        for qd in 0..quads {
+            let mut sums = [_mm256_setzero_ps(); 8];
+            for k in 0..4 {
+                let (first, ph) = it.locate(start + (4 * qd + k) as f64 * step);
+                assert!(first + TAPS <= x.re.len() && first + TAPS <= x.im.len());
+                let c = it.table[ph].as_ptr();
+                let (re, im) = (x.re.as_ptr().add(first), x.im.as_ptr().add(first));
+                let (c0, c1) = (_mm256_loadu_ps(c), _mm256_loadu_ps(c.add(8)));
+                let a = _mm256_mul_ps(c0, _mm256_loadu_ps(re));
+                sums[2 * k] = _mm256_fmadd_ps(c1, _mm256_loadu_ps(re.add(8)), a);
+                let b = _mm256_mul_ps(c0, _mm256_loadu_ps(im));
+                sums[2 * k + 1] = _mm256_fmadd_ps(c1, _mm256_loadu_ps(im.add(8)), b);
+            }
+            // [re0, im0, re1, im1 | the same of the upper halves], and so for
+            // outputs 2 and 3; the halves added.
+            let h0 = _mm256_hadd_ps(sums[0], sums[1]);
+            let h1 = _mm256_hadd_ps(sums[2], sums[3]);
+            let h2 = _mm256_hadd_ps(sums[4], sums[5]);
+            let h3 = _mm256_hadd_ps(sums[6], sums[7]);
+            let g0 = _mm256_hadd_ps(h0, h1);
+            let g1 = _mm256_hadd_ps(h2, h3);
+            let lo = _mm_add_ps(_mm256_castps256_ps128(g0), _mm256_extractf128_ps(g0, 1));
+            let hi = _mm_add_ps(_mm256_castps256_ps128(g1), _mm256_extractf128_ps(g1, 1));
+            _mm256_storeu_ps(dst.add(8 * qd), _mm256_set_m128(hi, lo));
+        }
+        out.set_len(out.len() + 4 * quads);
+    }
+    for j in 4 * quads..n {
         let (first, ph) = it.locate(start + j as f64 * step);
         let taps = &it.table[ph];
         let re: &[f32; TAPS] = x.re[first..first + TAPS].try_into().unwrap();
@@ -267,8 +304,9 @@ mod tests {
         let mut p = Planar::default();
         p.set(&x);
         let (mut a, mut b) = (Vec::new(), Vec::new());
-        fast.resample_planar(&p, 40.0, 1.09375, 2500, &mut a);
-        plain.resample_planar(&p, 40.0, 1.09375, 2500, &mut b);
+        // Not a multiple of four: the batched loop and its tail both.
+        fast.resample_planar(&p, 40.0, 1.09375, 2503, &mut a);
+        plain.resample_planar(&p, 40.0, 1.09375, 2503, &mut b);
         assert_eq!(a.len(), b.len());
         assert!(a.iter().zip(&b).all(|(u, v)| (u - v).norm() < 1e-5));
     }

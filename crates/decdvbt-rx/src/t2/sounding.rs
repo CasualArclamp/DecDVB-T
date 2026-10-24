@@ -204,8 +204,11 @@ impl T2Sounder {
                 Some((tp, last)) => {
                     while self.next_t <= t {
                         let w = ((self.next_t - tp) / (t - tp).max(1.0)) as f32;
-                        let lerp: Vec<Iq> =
-                            last.iter().zip(&row).map(|(a, b)| a + (b - a) * w).collect();
+                        let lerp: Vec<Iq> = last
+                            .iter()
+                            .zip(&row)
+                            .map(|(a, b)| a + (b - a) * w)
+                            .collect();
                         self.emit(&lerp);
                         self.next_t += row_samples;
                     }
@@ -273,11 +276,7 @@ impl Sounding for T2Sounder {
 /// phase differences, then the phase of what is left.
 fn continuation(last: &[Iq], next: &[Iq]) -> Vec<Iq> {
     let d: Vec<Iq> = next.iter().zip(last).map(|(n, l)| n * l.conj()).collect();
-    let slope = d
-        .windows(2)
-        .map(|w| w[1] * w[0].conj())
-        .sum::<Iq>()
-        .arg();
+    let slope = d.windows(2).map(|w| w[1] * w[0].conj()).sum::<Iq>().arg();
     let mid = (d.len() / 2) as f32;
     let phi = d
         .iter()

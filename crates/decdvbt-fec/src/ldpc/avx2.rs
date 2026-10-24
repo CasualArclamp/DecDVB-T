@@ -81,7 +81,10 @@ fn rotated_offset(c0: usize, s: usize) -> usize {
 /// One chunk of `NB` 16-lane blocks (b0, ...) of a layer: the extrinsics of
 /// every edge, the two smallest magnitudes, where the smallest is and the sign
 /// product (kept in registers across the edges), then each edge's new message
-/// and the change it makes to its group, which goes to `dm`.
+/// and the change it makes to its group, which goes to `dm`. Returns how many
+/// of the chunk's checks the posteriors as read leave unsatisfied (the sign
+/// product of the values themselves, which costs one XOR an edge here and a
+/// pass over every edge after the iteration otherwise).
 ///
 /// # Safety
 /// The CPU must have AVX2; the pointers are the decoder's (`v` the
@@ -99,13 +102,14 @@ unsafe fn chunk<const NB: usize>(
     corner: bool,
     b0: usize,
     shift: __m128i,
-) {
+) -> u32 {
     let deg = edges.len();
     unsafe {
         let msg_max = _mm256_set1_epi16(MSG_MAX);
         let zero = _mm256_setzero_si256();
         let (mut m1, mut m2) = ([msg_max; NB], [msg_max; NB]);
         let (mut ar, mut sg) = ([zero; NB], [zero; NB]);
+        let mut par = [zero; NB];
         for (e, edge) in edges.iter().enumerate() {
             let s = edge.shift as usize;
             let vg = v.add(edge.group as usize * GROUP_STRIDE);
@@ -118,6 +122,15 @@ unsafe fn chunk<const NB: usize>(
                 let x = ld(vg.add(rotated_offset(c0, s)));
                 let old = _mm256_cvtepi8_epi16(_mm_loadu_si128(rp.add(c0) as *const __m128i));
                 let mut tv = _mm256_sub_epi16(x, old);
+                // Check 0 has no corner bit: its lane leaves the parity.
+                par[j] = _mm256_xor_si256(
+                    par[j],
+                    if patch && b0 + j == 0 {
+                        _mm256_insert_epi16::<0>(x, 0)
+                    } else {
+                        x
+                    },
+                );
                 if patch && b0 + j == 0 {
                     // A certain 0: changes neither the sign product nor the
                     // minima.
@@ -131,6 +144,17 @@ unsafe fn chunk<const NB: usize>(
                 ar[j] = _mm256_blendv_epi8(ar[j], ev, below1);
                 sg[j] = _mm256_xor_si256(sg[j], tv);
             }
+        }
+        // The sign bit of each i16 lane is the odd byte's top bit; the
+        // half-real block counts its 8 real lanes.
+        let mut unsatisfied = 0;
+        for (j, p) in par.iter().enumerate() {
+            let real = if b0 + j + 1 < BLOCKS {
+                0xAAAA_AAAA
+            } else {
+                0xAAAA
+            };
+            unsatisfied += (_mm256_movemask_epi8(*p) as u32 & real).count_ones();
         }
         // Normalized min-sum, in integers: m − m/2^norm_shift.
         for j in 0..NB {
@@ -172,15 +196,17 @@ unsafe fn chunk<const NB: usize>(
                 }
             }
         }
+        unsatisfied
     }
 }
 
-/// One layer of normalized min-sum, as `LdpcDecoder::layer`.
+/// One layer of normalized min-sum, as `LdpcDecoder::layer`, and its checks
+/// the posteriors left unsatisfied as they were read.
 ///
 /// # Safety
 /// The CPU must have AVX2.
 #[target_feature(enable = "avx2,popcnt")]
-pub(super) unsafe fn layer(d: &mut LdpcDecoder, layer: usize) {
+pub(super) unsafe fn layer(d: &mut LdpcDecoder, layer: usize) -> u32 {
     let (start, end) = (d.code.layer_start[layer], d.code.layer_start[layer + 1]);
     // Layer 0's last edge links p_(j−1) as group q−1 shifted by one; lane 0
     // (check 0) has no such bit.
@@ -195,13 +221,13 @@ pub(super) unsafe fn layer(d: &mut LdpcDecoder, layer: usize) {
         // at a time: all of the layer's extrinsics are gathered before any
         // posterior is changed.
         let shift = _mm_cvtsi32_si128(d.norm_shift as i32);
-        let mut b = 0;
+        let (mut b, mut unsatisfied) = (0, 0);
         while b + CHUNK < BLOCKS {
-            chunk::<CHUNK>(edges, v, r, t, dm, start, corner, b, shift);
+            unsatisfied += chunk::<CHUNK>(edges, v, r, t, dm, start, corner, b, shift);
             b += CHUNK;
         }
         while b < BLOCKS {
-            chunk::<1>(edges, v, r, t, dm, start, corner, b, shift);
+            unsatisfied += chunk::<1>(edges, v, r, t, dm, start, corner, b, shift);
             b += 1;
         }
 
@@ -232,6 +258,7 @@ pub(super) unsafe fn layer(d: &mut LdpcDecoder, layer: usize) {
             );
             _mm_storeu_si128(vg.add(i0) as *mut __m128i, sum);
         }
+        unsatisfied
     }
 }
 

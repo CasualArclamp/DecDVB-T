@@ -1009,3 +1009,49 @@ Main Headlines, then a story with "Page 1 of 2"; page numbers can be typed,
 GREEN gives full-screen TV, CANCEL steps back and out. The engine's whole
 10-second session costs 10–20 ms and a full redraw 4–11 ms. A live C23 tune
 was not possible (the HackRF read -44 dBFS on C23 today: aerial or radio).
+
+## CPU pass on the DVB-T2 receiver (2026-10-24)
+
+Asked for: more CPU savings after the T2 sounder. Measured on the C30 capture
+with `t2_decode` (CPU time per 8 s of signal), the equaliser alone with the
+new `cargo run --release -p decdvbt-rx --example t2_eq_bench` (the fastest of
+40 runs of one UK frame: other work on the machine can only slow a run).
+
+| stage | before | after |
+|---|---|---|
+| LDPC | 3.92 s | 3.43 s |
+| resampling | 0.93 s | 0.64 s |
+| channel estimate | 0.61 s | 0.46 s |
+| receiver in all | ~1.0 core | ~0.9 core |
+
+- **LDPC: the parity count folded into the layer pass.** Each layer XORs the
+  posteriors it gathers (one instruction an edge block) and counts its
+  unsatisfied checks as it read them. A count above `EXACT_BELOW` (64) stands
+  in for the exact count in the plateau test; a small one is counted exactly,
+  so a decode still stops on the iteration it converges in and the stall test
+  sees the truth. A failed decode reports the exact count. 57 → 47 µs an
+  iteration (rate 2/3 normal), the same iterations a block on C30 (8.6), every
+  block decoded; the kernel still matches the portable code bit for bit (both
+  do the same).
+- **Resampling: four outputs at a time.** Each output's dot product used to end
+  in its own horizontal reduction, which cost more than its multiplies; four
+  outputs' eight sums now reduce together into their interleaved (re, im)
+  pairs, stored in one go.
+- **Equalising:** every carrier divided by the channel in an AVX2 pass (same
+  arithmetic, same results; the plain loop compiled scalar, 2 ns a carrier),
+  then the data cells written in their logical order, each read from its
+  carrier through a precomputed table per symbol phase (`Demod::source`),
+  instead of written where the frequency interleaver sends them. Medians by
+  selection, not sorting. 17.5 → 15.4 ms a UK frame.
+- **Cell buffers recycled**: the FEC stage hands each frame's cell and
+  variance buffers back (`Done::buffers`), and the data cells are written
+  straight after P2's into the job's buffer (`Demod::data_cells_into`), no
+  longer copied into a second one.
+
+Tried and dropped: dividing inside the ordered gather (dependent random reads
+with a division: slower, 16 against 14 ms).
+
+What is left, largest first: LDPC (~43 %), demapping (~12 %), resampling
+(~8 %), the channel estimate (~6 %, of which the frequency interpolation is
+the most), deinterleaving (~6 %), the FFTs (~5 %).
+

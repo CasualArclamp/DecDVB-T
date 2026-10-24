@@ -2090,10 +2090,7 @@ fn lock_details(g: &Geometry, cfo_hz: f64) -> Vec<(String, String)> {
         kv("useful", format!("{useful_us:.0} µs")),
         kv(
             "carriers",
-            format!(
-                "{} ({} data)",
-                g.active_carriers, g.data_carriers
-            ),
+            format!("{} ({} data)", g.active_carriers, g.data_carriers),
         ),
         kv("carrier offset", format!("{:+.2} kHz", cfo_hz / 1e3)),
     ]

@@ -152,7 +152,11 @@ pub struct Demod {
     pattern_of: Vec<u16>,
     patterns: Vec<Vec<TimeTap>>,
     fi_p2: FreqInterleaver,
-    fi_data: FreqInterleaver,
+    /// For a data symbol `j`, `source[j % source.len()][p]` is the carrier
+    /// logical data cell `p` is read from: the data carriers of the
+    /// symbol's place in the pilot pattern, through the frequency
+    /// interleaver (which alternates between even and odd symbols).
+    source: Vec<Vec<u32>>,
     fi_fc: Option<FreqInterleaver>,
 }
 
@@ -266,13 +270,25 @@ impl Demod {
             });
             pattern_of.push(id);
         }
+        let fi_data = FreqInterleaver::new(mode.fft, carriers.data_cells());
+        let period = if dy % 2 == 0 { dy } else { 2 * dy };
+        let source = (0..period)
+            .map(|j| {
+                let ks = &data_ks[j % dy];
+                let mut src = vec![0u32; ks.len()];
+                for (&k, &p) in ks.iter().zip(fi_data.h(j)) {
+                    src[p as usize] = k;
+                }
+                src
+            })
+            .collect();
         Demod {
             prof: DemodProfile::default(),
             sounding: false,
+            source,
             reference,
             fft: SymbolFft::new(geo.n),
             fi_p2: FreqInterleaver::new(mode.fft, carriers.p2_cells()),
-            fi_data: FreqInterleaver::new(mode.fft, carriers.data_cells()),
             fi_fc: geo
                 .has_fc
                 .then(|| FreqInterleaver::new(mode.fft, carriers.closing_cells())),
@@ -465,6 +481,24 @@ impl Demod {
     /// symbols in logical order and their variances, the SNR, and the
     /// channel at the middle symbol.
     pub fn data_cells(&mut self, carriers: &mut [Iq], scope: bool) -> Option<Equalised> {
+        let (mut cells, mut var) = (Vec::new(), Vec::new());
+        let mut e = self.data_cells_into(carriers, scope, &mut cells, &mut var)?;
+        (e.cells, e.var) = (cells, var);
+        Some(e)
+    }
+
+    /// [`Self::data_cells`], the cells and variances appended to `cells` and
+    /// `var` (and those of the returned [`Equalised`] left empty). The
+    /// receiver passes a frame's buffers again and again: 20 MB new to the
+    /// process every frame cost a page fault each 4 KB as it was first
+    /// written, more than the writes themselves.
+    pub fn data_cells_into(
+        &mut self,
+        carriers: &mut [Iq],
+        scope: bool,
+        cells: &mut Vec<Iq>,
+        var: &mut Vec<f32>,
+    ) -> Option<Equalised> {
         let geo = self.geo;
         let (c_ps, mid) = (geo.c_ps, geo.mid);
         let first = geo.n_p2;
@@ -540,14 +574,17 @@ impl Demod {
         }
         let c_data = self.data_ks[first % dy].len();
         let n_syms = last - first;
-        let mut cells = vec![Iq::new(0.0, 0.0); n_syms * c_data];
-        // The reciprocal of each cell's channel power until the noise is known.
-        let mut var = vec![0f32; n_syms * c_data];
+        // From `pre` on: the cells, and the reciprocal of each cell's channel
+        // power until the noise is known.
+        let pre = cells.len();
+        cells.resize(pre + n_syms * c_data, Iq::new(0.0, 0.0));
+        var.resize(pre + n_syms * c_data, 0.0);
         let (mut pad_re, mut pad_im) = (
             vec![0f32; n_nodes + 2 * KERNEL_HALF + 1],
             vec![0f32; n_nodes + 2 * KERNEL_HALF + 1],
         );
         let (mut hr, mut hi) = (vec![0f32; c_ps], vec![0f32; c_ps]);
+        let (mut eq_c, mut eq_r) = (vec![Iq::new(0.0, 0.0); c_ps], vec![0f32; c_ps]);
         // For the noise, and the SNR: continual pilots' errors, and the
         // channel's mean power.
         let mut errs: Vec<f32> = Vec::new();
@@ -605,27 +642,33 @@ impl Demod {
                 errs.push(e);
                 own.push(e);
             }
-            own.sort_by(f32::total_cmp);
+            // The median, found without sorting the rest.
+            let half = own.len() / 2;
+            let med = if own.is_empty() {
+                1.0
+            } else {
+                *own.select_nth_unstable_by(half, f32::total_cmp).1
+            };
             let g_j = hr.iter().zip(&hi).map(|(a, b)| a * a + b * b).sum::<f32>() / c_ps as f32;
-            let v_j = (own.get(own.len() / 2).copied().unwrap_or(1.0) / std::f32::consts::LN_2)
-                .max(1e-12);
+            let v_j = (med / std::f32::consts::LN_2).max(1e-12);
             sym_snr.push(10.0 * (g_j / v_j).log10());
             gain += f64::from(g_j);
-            // The data cells, undone from the frequency interleaver as they
-            // are written.
-            let perm = self.fi_data.h(j);
-            let base = rel * c_data;
+            // Every carrier divided by the channel, in carrier order (plain
+            // arithmetic over arrays, which vectorises), then the data cells
+            // written in their logical order, each read from its carrier.
+            // Written where the frequency interleaver sends them instead, the
+            // scattered writes missed the cache at 6 ns a cell; scattered
+            // reads overlap.
+            divide(row, &hr, &hi, &mut eq_c, &mut eq_r);
+            let src = &self.source[j % self.source.len()];
+            let base = pre + rel * c_data;
             let (cells_j, var_j) = (
                 &mut cells[base..base + c_data],
                 &mut var[base..base + c_data],
             );
-            for (&k, &p) in self.data_ks[j % dy].iter().zip(perm) {
-                let k = k as usize;
-                let (y, hre, him) = (row[k], hr[k], hi[k]);
-                let r = 1.0 / (hre * hre + him * him).max(1e-9);
-                cells_j[p as usize] =
-                    Iq::new((y.re * hre + y.im * him) * r, (y.im * hre - y.re * him) * r);
-                var_j[p as usize] = r;
+            for ((c, v), &k) in cells_j.iter_mut().zip(var_j.iter_mut()).zip(src) {
+                *c = eq_c[k as usize];
+                *v = eq_r[k as usize];
             }
         }
         if errs.is_empty() {
@@ -633,12 +676,13 @@ impl Demod {
         }
         self.prof.channel += t_chan.elapsed();
         let t_cells = Instant::now();
-        errs.sort_by(f32::total_cmp);
         // The median of |e|² of complex Gaussian noise is variance · ln 2.
-        let vy = (errs[errs.len() / 2] / std::f32::consts::LN_2).max(1e-12);
+        let half = errs.len() / 2;
+        let vy = (*errs.select_nth_unstable_by(half, f32::total_cmp).1 / std::f32::consts::LN_2)
+            .max(1e-12);
         let mean_gain = (gain / (last - first) as f64) as f32;
         let snr_db = 10.0 * (mean_gain / vy).log10();
-        for v in &mut var {
+        for v in &mut var[pre..] {
             *v *= vy;
         }
         // The frame-closing symbol, which has scattered pilots at every node
@@ -688,8 +732,8 @@ impl Demod {
         }
         self.prof.cells += t_cells.elapsed();
         Some(Equalised {
-            cells,
-            var,
+            cells: Vec::new(),
+            var: Vec::new(),
             snr_db,
             channel: chan_mid,
             symbol_snr_db: sym_snr,
@@ -795,6 +839,85 @@ impl Demod {
             hi[k0..k1].copy_from_slice(&ai[p0..p0 + len]);
         }
     }
+}
+
+/// Every carrier divided by the channel (`hr`, `hi`): the cell, and the
+/// reciprocal of the channel's power there.
+fn divide(row: &[Iq], hr: &[f32], hi: &[f32], eq: &mut [Iq], eq_r: &mut [f32]) {
+    let n = row.len();
+    assert!(hr.len() >= n && hi.len() >= n && eq.len() >= n && eq_r.len() >= n);
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU has AVX2, and the lengths are checked above.
+        done = unsafe { divide_avx2(row, hr, hi, eq, eq_r) };
+    }
+    for k in done..n {
+        let (y, hre, him) = (row[k], hr[k], hi[k]);
+        let r = 1.0 / (hre * hre + him * him).max(1e-9);
+        eq[k] = Iq::new((y.re * hre + y.im * him) * r, (y.im * hre - y.re * him) * r);
+        eq_r[k] = r;
+    }
+}
+
+/// [`divide`] eight carriers at a time, the same sums in the same order (so
+/// the same results): the interleaved cells split into real and imaginary
+/// parts, divided, and interleaved again. The compiler left the plain loop
+/// scalar (2 ns a carrier). Returns the carriers done.
+///
+/// # Safety
+/// The CPU must have AVX2; the slices hold at least `row.len()` values.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn divide_avx2(
+    row: &[Iq],
+    hr: &[f32],
+    hi: &[f32],
+    eq: &mut [Iq],
+    eq_r: &mut [f32],
+) -> usize {
+    use std::arch::x86_64::*;
+    let blocks = row.len() / 8;
+    // SAFETY: each block reads and writes 8 values below `8 · blocks`.
+    unsafe {
+        let one = _mm256_set1_ps(1.0);
+        let floor = _mm256_set1_ps(1e-9);
+        let (y, d) = (row.as_ptr() as *const f32, eq.as_mut_ptr() as *mut f32);
+        for b in 0..blocks {
+            let k = 8 * b;
+            // [r0 i0 r1 i1 | r2 i2 r3 i3] and the next four: split, then put
+            // the 64-bit pairs back in order.
+            let (a, c) = (
+                _mm256_loadu_ps(y.add(2 * k)),
+                _mm256_loadu_ps(y.add(2 * k + 8)),
+            );
+            let re = _mm256_castpd_ps(_mm256_permute4x64_pd::<0xD8>(_mm256_castps_pd(
+                _mm256_shuffle_ps::<0x88>(a, c),
+            )));
+            let im = _mm256_castpd_ps(_mm256_permute4x64_pd::<0xD8>(_mm256_castps_pd(
+                _mm256_shuffle_ps::<0xDD>(a, c),
+            )));
+            let (hre, him) = (
+                _mm256_loadu_ps(hr.as_ptr().add(k)),
+                _mm256_loadu_ps(hi.as_ptr().add(k)),
+            );
+            let p = _mm256_add_ps(_mm256_mul_ps(hre, hre), _mm256_mul_ps(him, him));
+            let r = _mm256_div_ps(one, _mm256_max_ps(p, floor));
+            let er = _mm256_mul_ps(
+                _mm256_add_ps(_mm256_mul_ps(re, hre), _mm256_mul_ps(im, him)),
+                r,
+            );
+            let ei = _mm256_mul_ps(
+                _mm256_sub_ps(_mm256_mul_ps(im, hre), _mm256_mul_ps(re, him)),
+                r,
+            );
+            _mm256_storeu_ps(eq_r.as_mut_ptr().add(k), r);
+            let (lo, hi4) = (_mm256_unpacklo_ps(er, ei), _mm256_unpackhi_ps(er, ei));
+            _mm256_storeu_ps(d.add(2 * k), _mm256_permute2f128_ps::<0x20>(lo, hi4));
+            _mm256_storeu_ps(d.add(2 * k + 8), _mm256_permute2f128_ps::<0x31>(lo, hi4));
+        }
+    }
+    8 * blocks
 }
 
 /// The least-squares fit's window and polynomial degree: four sightings and

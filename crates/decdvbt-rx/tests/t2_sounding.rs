@@ -64,7 +64,11 @@ fn the_t2_map_shows_a_moving_echo() {
     assert_eq!((g.fft_name, g.guard_name, g.pilot_step), ("8K", "1/16", 12));
     let mut fading = Vec::new();
     s.take_fading(&mut fading);
-    assert!(fading.len() > 100 && fading[0].len() == g.columns, "{}", fading.len());
+    assert!(
+        fading.len() > 100 && fading[0].len() == g.columns,
+        "{}",
+        fading.len()
+    );
     let m = s.delay_doppler().expect("a map").clone();
     // The main path at 0 µs and 0 Hz, the echo 6 dB down 6 µs on and 8 Hz
     // above, nothing at its mirror.
