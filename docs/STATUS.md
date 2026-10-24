@@ -884,13 +884,24 @@ rot 22`, `--example t2_thresholds`, `--example t2_tune`.
 lost, 111302 LDPC blocks, none lost, 3.2 million transport packets with no
 continuity jump and no bad section; `decdvbt decode --plp N` picks a PLP.
 
-**Known gaps and next steps.** The UK EPG's text is compressed with the
-Freeview/Freesat Huffman tables (DVB text type 0x1F), which the text decoder
-does not do yet, so event names show as noise (service names are fine): it
-needs the tables (MythTV's `freesat_tables`, GPL-2+). MISO, FEF, T2-Lite and
+**Known gaps and next steps.** MISO, FEF, T2-Lite and
 TIME_IL_TYPE 1 are not decoded, and only one PLP at a time. `decdvbt scan --classify 5` tunes each channel that looks like digital TV and
 says DVB-T or DVB-T2 and its mode (live: C22, C23, C25, C26 and C28 are DVB-T,
 C30 DVB-T2 256-QAM 2/3 rotated). The Maps tab and the channel sounder are DVB-T's (the Channel
 and Maps tabs say so while a T2 signal is locked; the Scopes and History tabs
 show T2's channel). The channel's moving echoes at 32K are followed frame by
 frame, not within one.
+
+## The UK guide's compressed text (2026-10-24)
+
+Asked for: decode the Freesat/Freeview Huffman text (DVB text type 0x1F), with
+the tables taken from MythTV (the download approved). The UK terrestrial
+guide sends event names and descriptions that way; they showed as noise. Now
+`decdvbt-ts::huffman` decodes them (after MythTV's `freesat_huffman.cpp`,
+GPL-2.0-or-later), with tables 1 and 2 (2027 and 3160 codes) generated into
+`huffman_tables.rs` by `tools/gen_huffman.py` from MythTV's
+`freesat_tables.cpp`; `dvb_text` uses it for a 0x1F string. On C30 the guide
+reads "Pointless", "The Chase", "the regional news", "Gymnastics: World
+Championships" and so on, and the services list's now-showing lines too. A test
+round-trips text through both tables with an encoder built from the same
+tables.

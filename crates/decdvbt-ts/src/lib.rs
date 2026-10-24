@@ -12,6 +12,8 @@
 
 pub mod backlog;
 pub mod epg;
+pub mod huffman;
+mod huffman_tables;
 pub mod psi;
 pub mod section;
 pub mod serve;

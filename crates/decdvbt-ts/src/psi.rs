@@ -821,9 +821,15 @@ fn mjd_utc(b: &[u8], seconds: bool) -> String {
 }
 
 /// DVB text (EN 300 468 Annex A) as a Rust string: a leading byte below 0x20
-/// selects a character table — read UTF-8 (0x15) as such, anything else as
-/// Latin-1 — and control codes are dropped.
+/// selects a character table — read UTF-8 (0x15) as such, the Freesat and
+/// Freeview Huffman compression (0x1F, see [`crate::huffman`]) by its tables,
+/// anything else as Latin-1 — and control codes are dropped.
 pub fn dvb_text(b: &[u8]) -> String {
+    if b.first() == Some(&0x1F)
+        && let Some(s) = crate::huffman::decode(b)
+    {
+        return clean(&s);
+    }
     let (utf8, body) = match b.first() {
         Some(0x15) => (true, &b[1..]),
         Some(0x10) if b.len() >= 3 => (false, &b[3..]),
@@ -835,6 +841,11 @@ pub fn dvb_text(b: &[u8]) -> String {
     } else {
         body.iter().map(|&c| c as char).collect()
     };
+    clean(&s)
+}
+
+/// The text without control codes (C0, and C1 as Latin-1 reads them), trimmed.
+fn clean(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() && !('\u{80}'..='\u{9F}').contains(c))
         .collect::<String>()
