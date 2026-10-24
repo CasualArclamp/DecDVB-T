@@ -9,8 +9,12 @@
 //! - [`backlog`]: the stream since its last keyframe, for a player that
 //!   starts now.
 //! - [`udp`]: transport packets carried in UDP, found in an IP stream.
+//! - [`dsmcc`], [`biop`]: DSM-CC object carousels (the UK's MHEG-5
+//!   interactive services) as a file tree.
 
 pub mod backlog;
+pub mod biop;
+pub mod dsmcc;
 pub mod epg;
 pub mod huffman;
 mod huffman_tables;
@@ -35,6 +39,7 @@ pub fn null_packet() -> [u8; TS_LEN] {
     p
 }
 
+pub use dsmcc::{Lookup, ObjectCarousel, StreamEvent};
 pub use epg::{Epg, EpgEvent, LocalTime, content_name, freeview_genre_name, genre_name};
 pub use psi::{
     EsInfo, Event, NetworkInfo, OtherService, PidRow, PidStats, Programme, Terrestrial,

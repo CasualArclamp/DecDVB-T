@@ -905,3 +905,30 @@ reads "Pointless", "The Chase", "the regional news", "Gymnastics: World
 Championships" and so on, and the services list's now-showing lines too. A test
 round-trips text through both tables with an encoder built from the same
 tables.
+
+## BBC Red Button: the DSM-CC object carousel (2026-10-24)
+
+Asked for: UK Red Button (MHEG-5 in DSM-CC object carousels), in three
+stages: the carousel, an MHEG-5 engine, and a GUI overlay.
+
+**Stage 1, the carousel.** `decdvbt-ts::dsmcc` reassembles an object
+carousel (ISO/IEC 13818-6, TR 101 202) from a service's DSM-CC PIDs: the DSI
+gives the service gateway, every DII of the carousel its modules (sizes,
+versions, the zlib compressed-module descriptor), the DDBs fill them; a
+complete module is inflated (miniz_oxide) and its BIOP messages
+(`decdvbt-ts::biop`: directories, files, streams and stream event objects,
+IORs) indexed by key. Paths are walked from the gateway on demand
+(`lookup("/a")`, `file(..)`, `tree()`, `dump(dir)`), a DII with a new module
+version replaces the module, and stream event descriptors (table 0x3D) are
+queued for the engine. A block of a module already in is dropped after its
+8-byte header, before the CRC. The PMT parser now keeps each stream's
+component tag, carousel id and data broadcast id.
+
+`decdvbt decode SOURCE --carousel SID DIR` writes the service's carousel to a
+folder; SOURCE may now be a `.ts` file (read as it is, no receiver). On the
+4 s C23 capture (decoded to a TS first): service 4416 (BBC Red Button) boots
+carousel 1 on PID 7201 (data broadcast id 0x0106); in 4 s, 21 of its 125
+modules come in (720 kB), 88 files: `/a` (the application, ASN.1 MHEG-5),
+`/s/init.mhg` and other scenes, `/g/*.png`, configuration in `/d/r/*.cf`. Five
+unit tests on synthetic carousels (two modules, one compressed; out-of-order
+blocks; a new module version; TS packetised; a stream event).

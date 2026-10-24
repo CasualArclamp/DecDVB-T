@@ -705,6 +705,7 @@ name = "decdvbt-ts"
 version = "0.1.0"
 dependencies = [
  "decdvbt-core",
+ "miniz_oxide 0.8.9",
  "thiserror 2.0.21",
 ]
 

@@ -11,3 +11,5 @@ rust-version.workspace = true
 [dependencies]
 decdvbt-core = { path = "../decdvbt-core" }
 thiserror.workspace = true
+# zlib for compressed carousel modules (EN 301 192 §9.3.4).
+miniz_oxide = "0.8.9"

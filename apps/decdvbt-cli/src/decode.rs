@@ -2,6 +2,8 @@
 //! `decdvbt decode`: run the receiver over a capture (or the live HackRF),
 //! write the transport stream, and say what came out: the mode, the signal's
 //! quality, the Reed–Solomon statistics and the services the stream holds.
+//! A `.ts` file is read as it is (no receiver). `--carousel SID DIR` writes
+//! the service's DSM-CC object carousel (its MHEG-5 application) to a folder.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -11,13 +13,15 @@ use anyhow::{Context, Result};
 use decdvbt_core::channel::{uhf_centre_hz, uhf_channel_at};
 use decdvbt_rx::auto::{AutoReceiver, Standard};
 use decdvbt_ts::TS_LEN;
+use decdvbt_ts::dsmcc::ObjectCarousel;
 use decdvbt_ts::psi::TsAnalyser;
 
 use crate::source;
 
 #[derive(clap::Args)]
 pub struct DecodeArgs {
-    /// An IQ file, or a UHF channel ("C26") for the HackRF.
+    /// An IQ file, a transport stream (`.ts`), or a UHF channel ("C26") for
+    /// the HackRF.
     source: String,
     /// Write the transport stream here.
     #[arg(short, long)]
@@ -55,9 +59,128 @@ pub struct DecodeArgs {
     /// stream (they are kept, with the error flag set, by default).
     #[arg(long)]
     drop_errors: bool,
+    /// Write service SID's object carousel (its MHEG-5 / Red Button
+    /// application) to the folder DIR: `--carousel 4416 out/rb`.
+    #[arg(long, num_args = 2, value_names = ["SID", "DIR"])]
+    carousel: Vec<String>,
+}
+
+/// `--carousel`: the service's carousel, made once its PMT is in.
+struct CarouselDump {
+    sid: u16,
+    dir: PathBuf,
+    oc: Option<ObjectCarousel>,
+    /// The PMT had no carousel.
+    none: bool,
+}
+
+impl CarouselDump {
+    fn new(args: &[String]) -> Result<Option<Self>> {
+        let [sid, dir] = args else { return Ok(None) };
+        Ok(Some(CarouselDump {
+            sid: sid
+                .parse()
+                .context("--carousel: the service id is a number")?,
+            dir: PathBuf::from(dir),
+            oc: None,
+            none: false,
+        }))
+    }
+
+    fn packet(&mut self, an: &TsAnalyser, p: &[u8; TS_LEN]) {
+        if let Some(oc) = self.oc.as_mut() {
+            oc.packet(p);
+        } else if !self.none
+            && let Some(prog) = an.programmes.get(&self.sid)
+            && !prog.streams.is_empty()
+        {
+            self.oc = ObjectCarousel::for_programme(prog);
+            self.none = self.oc.is_none();
+        }
+    }
+
+    fn finish(&self) -> Result<()> {
+        let Some(oc) = &self.oc else {
+            println!(
+                "carousel: service {} {}",
+                self.sid,
+                if self.none {
+                    "has no object carousel"
+                } else {
+                    "was not found"
+                }
+            );
+            return Ok(());
+        };
+        let (done, modules) = oc.progress();
+        let (tree, pending) = oc.tree();
+        std::fs::create_dir_all(&self.dir)?;
+        let files = oc.dump(&self.dir)?;
+        println!(
+            "carousel {} of service {} on PID(s) {:?}: {} of {} modules in ({} kB), {} files written to {}{}{}",
+            oc.carousel_id,
+            self.sid,
+            oc.pids().collect::<Vec<_>>(),
+            done,
+            modules,
+            oc.bytes() / 1000,
+            files,
+            self.dir.display(),
+            if pending > 0 {
+                format!(", {pending} objects still to come")
+            } else {
+                String::new()
+            },
+            if oc.has_gateway() {
+                ""
+            } else {
+                " (no DSI yet)"
+            }
+        );
+        for (path, kind, size) in tree.iter().take(60) {
+            println!("  {kind} {size:>8} {path}");
+        }
+        if tree.len() > 60 {
+            println!("  ... {} more", tree.len() - 60);
+        }
+        Ok(())
+    }
+}
+
+/// A transport stream file: the analyser (and carousel) over it.
+fn run_ts(a: &DecodeArgs, mut dump: Option<CarouselDump>) -> Result<()> {
+    use std::io::Read;
+    let t0 = Instant::now();
+    let mut f = std::io::BufReader::new(
+        std::fs::File::open(&a.source).with_context(|| format!("cannot open {}", a.source))?,
+    );
+    let mut analyser = TsAnalyser::new();
+    let mut p = [0u8; TS_LEN];
+    while f.read_exact(&mut p).is_ok() {
+        if p[0] != decdvbt_ts::TS_SYNC {
+            continue; // not aligned: the file is expected whole packets
+        }
+        analyser.packet(&p);
+        if let Some(d) = dump.as_mut() {
+            d.packet(&analyser, &p);
+        }
+    }
+    println!("{} read in {:.2} s", a.source, t0.elapsed().as_secs_f64());
+    summarise(&analyser);
+    if a.guide > 0 {
+        guide(&analyser, a.guide);
+    }
+    if let Some(d) = &dump {
+        d.finish()?;
+    }
+    Ok(())
 }
 
 pub fn run(a: DecodeArgs) -> Result<()> {
+    let mut dump = CarouselDump::new(&a.carousel)?;
+    if a.source.to_ascii_lowercase().ends_with(".ts") {
+        return run_ts(&a, dump);
+    }
     let mut src = source::open(
         &a.source,
         a.file_rate,
@@ -106,6 +229,9 @@ pub fn run(a: DecodeArgs) -> Result<()> {
                 continue;
             }
             analyser.packet(p);
+            if let Some(d) = dump.as_mut() {
+                d.packet(&analyser, p);
+            }
             if let Some(w) = out.as_mut() {
                 w.write_all(p)?;
             }
@@ -158,6 +284,9 @@ pub fn run(a: DecodeArgs) -> Result<()> {
             continue;
         }
         analyser.packet(p);
+        if let Some(d) = dump.as_mut() {
+            d.packet(&analyser, p);
+        }
         if let Some(w) = out.as_mut() {
             w.write_all(p)?;
         }
@@ -165,6 +294,9 @@ pub fn run(a: DecodeArgs) -> Result<()> {
     }
     if let Some(mut w) = out {
         w.flush()?;
+    }
+    if let Some(d) = &dump {
+        d.finish()?;
     }
     let signal_s = abs as f64 / fs;
     let took = t0.elapsed().as_secs_f64();

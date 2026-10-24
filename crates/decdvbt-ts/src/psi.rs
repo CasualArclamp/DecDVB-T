@@ -92,6 +92,15 @@ pub struct EsInfo {
     /// What a descriptor says the stream is, where the stream type does not
     /// (private PES carrying AC-3, subtitles, teletext…).
     pub kind: Option<&'static str>,
+    /// The stream identifier descriptor's component tag (EN 300 468
+    /// §6.2.39): what a DSM-CC carousel's taps call this stream.
+    pub component_tag: Option<u8>,
+    /// The carousel identifier descriptor's carousel id (ISO/IEC 13818-6
+    /// §11.4.1, tag 0x13): this stream carries an object carousel's DSI.
+    pub carousel_id: Option<u32>,
+    /// The data broadcast id descriptor's id (EN 300 468 §6.2.12; 0x0106 is
+    /// the UK's MHEG-5 profile, D-Book 7 §8.1.2).
+    pub data_broadcast_id: Option<u16>,
 }
 
 impl EsInfo {
@@ -550,6 +559,13 @@ impl TsAnalyser {
                     0x56 if d.len() >= 3 => {
                         es.kind = Some("teletext");
                         es.language = Some(dvb_text(&d[..3]));
+                    }
+                    0x52 if !d.is_empty() => es.component_tag = Some(d[0]),
+                    0x13 if d.len() >= 4 => {
+                        es.carousel_id = Some(u32::from_be_bytes([d[0], d[1], d[2], d[3]]))
+                    }
+                    0x66 if d.len() >= 2 => {
+                        es.data_broadcast_id = Some(u16::from_be_bytes([d[0], d[1]]))
                     }
                     0x6A => es.kind = Some("AC-3 audio"),
                     0x7A => es.kind = Some("E-AC-3 audio"),
