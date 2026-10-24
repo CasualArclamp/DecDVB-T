@@ -962,3 +962,50 @@ Asked for: the Channel and Maps tabs for a T2 lock (they said "DVB-T only").
 - A T2 signal with decoding off gets DVB-T's sounder, which says no DVB-T was
   found and to turn decoding on.
 
+
+**Stage 2, the MHEG-5 engine.** New crate `decdvbt-mheg` (UK Engine Profile,
+ETSI ES 202 184 / D-Book 7), with MythTV's freemheg (GPL-2.0-or-later) as the
+reference, credited per module:
+
+- `asn1`: the binary (BER) interchange form into a tree, typed by tag as
+  freemheg does; `tags`: the ISO/IEC 13522-5 Annex A tags.
+- `obj`: groups, links, the five variable types, resident programs,
+  rectangles, bitmaps, text (and hypertext / entry fields drawn as text),
+  token and list groups, streams with their video and audio components.
+- `engine`: the life cycle (preparation, activation, deactivation,
+  destruction), links fired by synchronous events onto the action stack and
+  asynchronous ones queued, about 60 elementary actions (TransitionTo,
+  Launch/Spawn/Quit, SetData, Test/SetVariable and arithmetic, Call/Fork,
+  SetTimer, SendEvent, token-group Move and CallActionSlot, position, size,
+  colours, stacking, persistent store, GetEngineSupport, Clone…), the UK keys
+  and input registers, content from the carousel. Where freemheg blocks for a
+  file still to come, the engine parks the action and retries on the next
+  tick; a missing file's engine event comes after half a second (the BBC app
+  retries at once, which spun); after the last application quits the boot
+  application starts again.
+- `programs`: the UK resident programs (GCD, FDa, GDW, Rnd, CTC, CTO, GSL,
+  GSS, SSS, SES, GSI, TIn, BSI, GBI, CCR, CGR, VTG, GDA, GIS, WAI…). Strings
+  are bytes (the BBC keeps colours as raw bytes in its strings).
+- `render`: a 720x576 RGBA canvas drawn only when something changed:
+  rectangles, PNG bitmaps (scaled, tiled, offset), text with the UK markup
+  (ESC 'C' colours), CR breaks, tabs, wrapping and justification, video as a
+  clear hole. Tiresias Screenfont is not on this PC: Segoe UI squeezed to
+  85 % across stands in, and a line written for Tiresias that is up to 18 %
+  too wide is squeezed to fit rather than wrapped (the BBC breaks its lines
+  for Tiresias). MPEG-2 I-frame bitmaps are not decoded yet.
+
+`cargo run --release -p decdvbt-mheg --example redbutton -- out/live_c30.ts
+--sid 17536 --keys wait,100,wait,15 --png out/rb.png` runs a service's app
+headless and saves the canvas (`--trace` for the engine's trace); `census`
+and `mhegdump` list and print MHEG objects.
+
+**Results.** The 4 s C23 capture holds 21 of the BBC carousel's 125 modules,
+and seven short C23 captures together 71: `/a` boots and reaches the trigger
+scene, but the bridge scene is missing. The live C30 recording of yesterday
+(BBC One HD, the same BBC application) holds 89 of its 94 modules, and there
+the red key shows BBC Red Button Text: the bridge menu (News Index, Sport,
+Weather…, with page numbers and the date), SELECT opens the News Index, then
+Main Headlines, then a story with "Page 1 of 2"; page numbers can be typed,
+GREEN gives full-screen TV, CANCEL steps back and out. The engine's whole
+10-second session costs 10–20 ms and a full redraw 4–11 ms. A live C23 tune
+was not possible (the HackRF read -44 dBFS on C23 today: aerial or radio).

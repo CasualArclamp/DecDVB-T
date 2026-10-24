@@ -667,6 +667,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "decdvbt-mheg"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "decdvbt-ts",
+ "png",
+]
+
+[[package]]
 name = "decdvbt-mod"
 version = "0.1.0"
 dependencies = [

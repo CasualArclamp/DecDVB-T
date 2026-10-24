@@ -334,6 +334,8 @@ pub struct TsAnalyser {
     pub packets: u64,
     /// The transport stream id, from the PAT.
     pub ts_id: Option<u16>,
+    /// The original network id, from the SDT.
+    pub original_network_id: Option<u16>,
     pub bad_sections: u64,
     // Rate window: signal seconds, and packet counts at its start.
     win_secs: f64,
@@ -594,6 +596,9 @@ impl TsAnalyser {
 
     fn sdt(&mut self, body: &[u8]) {
         // original_network_id (2), reserved (1), then services.
+        if body.len() >= 2 {
+            self.original_network_id = Some(u16::from_be_bytes([body[0], body[1]]));
+        }
         let mut at = 3;
         while at + 5 <= body.len() {
             let sid = u16::from_be_bytes([body[at], body[at + 1]]);

@@ -1,0 +1,16 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-mheg"
+description = "MHEG-5 (UK Engine Profile, the D-Book) for DecDVB-T: the Red Button applications of a DSM-CC object carousel, drawn on a 720x576 canvas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+decdvbt-ts = { path = "../decdvbt-ts" }
+# PNG bitmaps (D-Book 7 §13.4.2).
+png = "0.18.1"
+# Glyph outlines and rasterising for the text classes.
+ab_glyph = "0.2.32"
