@@ -1082,7 +1082,9 @@ over it and the picture in the BBC's window. CPU: 59.4 % against 57.4 %
 without the Red Button (a 40 ms repaint request first cost 9 points by adding
 frames; the engine now asks for 100 ms).
 
-**Not done.** A live C23 tune (the HackRF read -44 dBFS today), so the C23
+**Not done.** A live C23 tune (the HackRF read -44 dBFS in the morning; at
+07:20 -31 dBFS, but the receiver locked at 0.5 dB SNR with 155 relocks in
+75 s and no packets), so the C23
 pages themselves were only seen as far as the 71 modules of the short
 captures allow (`/a` boots to the trigger scene). MPEG-2 I-frame bitmaps,
 stream events to the application, the interaction channel, ListGroup's item
