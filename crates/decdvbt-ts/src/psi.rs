@@ -156,6 +156,19 @@ pub struct Programme {
     pub lcn: Option<u16>,
 }
 
+/// A service of another multiplex of the network, as its SDT (table 0x46) and
+/// the NIT give it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OtherService {
+    pub number: u16,
+    pub ts_id: u16,
+    pub name: Option<String>,
+    pub service_type: Option<u8>,
+    pub lcn: Option<u16>,
+    /// The multiplex's centre frequency, Hz, from the NIT.
+    pub centre_hz: Option<u64>,
+}
+
 /// A terrestrial delivery system descriptor (EN 300 468 §6.2.13.4): how a
 /// DVB-T multiplex is transmitted.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -270,6 +283,9 @@ pub struct TsReport {
     pub packets: u64,
     pub rate_bps: f64,
     pub programmes: Vec<Programme>,
+    /// The other multiplexes' services (their names, numbers and the
+    /// multiplex's UHF channel), for the guide.
+    pub others: Vec<OtherService>,
     pub pids: Vec<PidRow>,
     pub network: NetworkInfo,
     /// (PID, table id, sections seen).
@@ -304,6 +320,8 @@ pub struct TsAnalyser {
     pub local_time: Option<LocalTime>,
     /// The programme guide: present/following and the schedule.
     pub epg: Epg,
+    /// The other multiplexes' services the SDT names (table 0x46).
+    pub others: BTreeMap<u16, OtherService>,
     pub packets: u64,
     /// The transport stream id, from the PAT.
     pub ts_id: Option<u16>,
@@ -458,6 +476,9 @@ impl TsAnalyser {
                 self.epg.section(ext, body);
             }
             (PID_EIT, 0x50..=0x5F) => self.epg.section(ext, body),
+            // The other multiplexes' services: their guide, and their names.
+            (PID_EIT, 0x4F | 0x60..=0x6F) => self.epg.section(ext, body),
+            (PID_SDT, 0x46) => self.sdt_other(ext, body),
             // TOT: the time, then descriptors and a CRC.
             (PID_TDT, 0x73) => {
                 self.set_time(&s[3..8]);
@@ -567,6 +588,10 @@ impl TsAnalyser {
             p.number = sid;
             p.free_ca = free_ca;
             for (tag, v) in descriptors(desc) {
+                if tag == 0x73 && !v.is_empty() {
+                    // default_authority_descriptor: the CRIDs' authority.
+                    self.epg.authorities.insert(sid, dvb_text(v));
+                }
                 if tag == 0x48 && v.len() >= 2 {
                     // service_descriptor: type, provider name, service name.
                     p.service_type = Some(v[0]);
@@ -577,6 +602,38 @@ impl TsAnalyser {
                         let name = &v[(3 + pl).min(v.len())..(3 + pl + nl).min(v.len())];
                         p.name = Some(dvb_text(name));
                     }
+                }
+            }
+            at += 5 + loop_len;
+        }
+    }
+
+    /// The SDT of another multiplex (table 0x46): its services' names and CRID
+    /// authorities, for the guide.
+    fn sdt_other(&mut self, ts_id: u16, body: &[u8]) {
+        let mut at = 3;
+        while at + 5 <= body.len() {
+            let sid = u16::from_be_bytes([body[at], body[at + 1]]);
+            let loop_len = u16::from_be_bytes([body[at + 3] & 0x0F, body[at + 4]]) as usize;
+            let desc = &body[(at + 5).min(body.len())..(at + 5 + loop_len).min(body.len())];
+            let o = self.others.entry(sid).or_default();
+            o.number = sid;
+            o.ts_id = ts_id;
+            for (tag, v) in descriptors(desc) {
+                match tag {
+                    0x48 if v.len() >= 2 => {
+                        o.service_type = Some(v[0]);
+                        let pl = v[1] as usize;
+                        if 2 + pl < v.len() {
+                            let nl = v[2 + pl] as usize;
+                            let name = &v[(3 + pl).min(v.len())..(3 + pl + nl).min(v.len())];
+                            o.name = Some(dvb_text(name));
+                        }
+                    }
+                    0x73 if !v.is_empty() => {
+                        self.epg.authorities.insert(sid, dvb_text(v));
+                    }
+                    _ => {}
                 }
             }
             at += 5 + loop_len;
@@ -767,11 +824,29 @@ impl TsAnalyser {
         for p in &mut programmes {
             p.lcn = lcn(p.number);
         }
+        let others = self
+            .others
+            .values()
+            .filter(|o| !self.programmes.contains_key(&o.number))
+            .map(|o| {
+                let mut o = o.clone();
+                o.lcn = lcn(o.number);
+                o.centre_hz = self
+                    .network
+                    .transponders
+                    .iter()
+                    .find(|t| t.ts_id == o.ts_id)
+                    .and_then(|t| t.terrestrial)
+                    .map(|t| t.centre_hz);
+                o
+            })
+            .collect();
         TsReport {
             ts_id: self.ts_id,
             packets: self.packets,
             rate_bps: self.rate_bps,
             programmes,
+            others,
             pids,
             network: self.network.clone(),
             tables: self.tables.iter().map(|(&(p, t), &n)| (p, t, n)).collect(),

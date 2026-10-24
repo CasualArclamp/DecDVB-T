@@ -41,6 +41,10 @@ pub struct DecodeArgs {
     /// HackRF VGA gain, dB (0-62, steps of 2).
     #[arg(long, default_value_t = 8)]
     vga: u16,
+    /// Print the guide: this many events of each service (of every
+    /// multiplex the stream's guide covers), with their details.
+    #[arg(long, default_value_t = 0)]
+    guide: usize,
     /// The DVB-T2 PLP to decode, by id (the first data PLP if not given).
     #[arg(long)]
     plp: Option<u8>,
@@ -175,6 +179,9 @@ pub fn run(a: DecodeArgs) -> Result<()> {
     if rx.standard() == Standard::Dvbt2 {
         t2_report(&rx, signal_s, packets_out, a.output.as_deref());
         summarise(&analyser);
+        if a.guide > 0 {
+            guide(&analyser, a.guide);
+        }
         return Ok(());
     }
     let st = rx.status();
@@ -247,6 +254,9 @@ pub fn run(a: DecodeArgs) -> Result<()> {
             .map_or(String::new(), |p| format!(" written to {}", p.display()))
     );
     summarise(&analyser);
+    if a.guide > 0 {
+        guide(&analyser, a.guide);
+    }
     Ok(())
 }
 
@@ -335,6 +345,77 @@ fn t2_report(rx: &AutoReceiver, signal_s: f64, packets: u64, output: Option<&std
         "{packets} transport packets{}",
         output.map_or(String::new(), |p| format!(" written to {}", p.display()))
     );
+}
+
+/// The guide: for each service with events, by channel number, its next
+/// `per` events with their marks, kinds, warnings and CRIDs.
+fn guide(an: &TsAnalyser, per: usize) {
+    let r = an.report();
+    let epg = &an.epg;
+    let now = r.utc_unix.unwrap_or(0);
+    let mut rows: Vec<(Option<u16>, u16, String)> = r
+        .programmes
+        .iter()
+        .map(|p| (p.lcn, p.number, p.name.clone().unwrap_or_default()))
+        .chain(
+            r.others
+                .iter()
+                .map(|o| (o.lcn, o.number, o.name.clone().unwrap_or_default())),
+        )
+        .filter(|(_, sid, _)| epg.services.get(sid).is_some_and(|m| !m.is_empty()))
+        .collect();
+    rows.sort_by_key(|(lcn, sid, _)| (lcn.unwrap_or(u16::MAX), *sid));
+    println!(
+        "guide: {} events, {} services ({} of other multiplexes)",
+        epg.events(),
+        rows.len(),
+        rows.iter()
+            .filter(|(_, sid, _)| r.others.iter().any(|o| o.number == *sid))
+            .count()
+    );
+    for (lcn, sid, name) in rows {
+        let events = epg.between(sid, now, i64::MAX);
+        let last = events.last().map_or(0, |e| e.end());
+        println!(
+            "{:>4} {name} ({} events, to {})",
+            lcn.map_or(String::new(), |n| n.to_string()),
+            epg.services[&sid].len(),
+            decdvbt_ts::epg::civil(last).2
+        );
+        for e in events.iter().take(per) {
+            let (_, mo, d, h, mi, _) = decdvbt_ts::epg::civil(e.start);
+            let mut marks = Vec::new();
+            for (on, m) in [
+                (e.hd, "HD"),
+                (e.subtitles, "S"),
+                (e.hard_of_hearing, "HoH"),
+                (e.audio_description, "AD"),
+                (e.signed, "SL"),
+                (e.surround, "5.1"),
+            ] {
+                if on {
+                    marks.push(m);
+                }
+            }
+            let kinds = e.kinds();
+            println!(
+                "       {mo:02}-{d:02} {h:02}:{mi:02} UTC {:>3} min  {}  [{}] {}{}",
+                e.duration_s / 60,
+                e.name,
+                marks.join(" "),
+                kinds.join(", "),
+                e.guidance
+                    .as_ref()
+                    .map_or(String::new(), |g| format!("  ! {g}"))
+            );
+            if let Some(c) = &e.series_crid {
+                println!("              series {}", epg.full_crid(sid, c));
+            }
+            if let Some(c) = &e.episode_crid {
+                println!("              episode {}", epg.full_crid(sid, c));
+            }
+        }
+    }
 }
 
 /// What the PSI/SI of the stream says.

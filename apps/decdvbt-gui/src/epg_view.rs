@@ -1,11 +1,15 @@
 // made by CasualArclamp
 //! The programme guide window: services down, time across, from the EIT
-//! (present/following and the schedule) in the local time the TOT gives.
+//! (present/following and the schedule) in the local time the TOT gives. The
+//! other multiplexes' services are there too (every Freeview multiplex sends
+//! the whole network's eight days), in channel-number order, dimmer: they
+//! cannot be played from this multiplex.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use decdvbt_core::channel::uhf_channel_at;
 use decdvbt_ts::epg::{civil, weekday};
-use decdvbt_ts::{Epg, EpgEvent, LocalTime, TsReport, genre_name};
+use decdvbt_ts::{Epg, EpgEvent, LocalTime, TsReport};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Rect, RichText, ScrollArea, Sense, Stroke, Ui,
     pos2, vec2,
@@ -57,8 +61,77 @@ fn genre_colour(g: Option<u8>) -> Color32 {
     }
 }
 
+/// A row of the guide: a service of this multiplex or another.
+struct Row {
+    number: u16,
+    lcn: Option<u16>,
+    name: String,
+    /// On this multiplex, with a picture or sound: it can be played.
+    playable: bool,
+    /// On another multiplex: its UHF channel.
+    elsewhere: Option<Option<u8>>,
+}
+
+/// The guide's rows: this multiplex's services and, if asked, the others' that
+/// have events, by channel number.
+fn rows(report: &TsReport, epg: &Epg, all: bool) -> Vec<Row> {
+    let mut v: Vec<Row> = services::ordered(report)
+        .into_iter()
+        .map(|p| Row {
+            number: p.number,
+            lcn: p.lcn,
+            name: p.name.clone().unwrap_or_else(|| "?".into()),
+            playable: services::on_air(p),
+            elsewhere: None,
+        })
+        .collect();
+    if all {
+        v.extend(
+            report
+                .others
+                .iter()
+                .filter(|o| epg.services.get(&o.number).is_some_and(|m| !m.is_empty()))
+                .map(|o| Row {
+                    number: o.number,
+                    lcn: o.lcn,
+                    name: o.name.clone().unwrap_or_else(|| "?".into()),
+                    playable: false,
+                    elsewhere: Some(o.centre_hz.and_then(|f| uhf_channel_at(f as f64))),
+                }),
+        );
+    }
+    v.sort_by_key(|r| (r.lcn.unwrap_or(u16::MAX), r.number));
+    v
+}
+
+/// The access and picture marks of an event: HD, S(ubtitles), HoH, AD, SL, 5.1.
+fn marks(e: &EpgEvent) -> Vec<&'static str> {
+    let mut m = Vec::new();
+    if e.hd {
+        m.push("HD");
+    }
+    if e.subtitles {
+        m.push(if e.hard_of_hearing { "S (HoH)" } else { "S" });
+    }
+    if e.audio_description {
+        m.push("AD");
+    }
+    if e.signed {
+        m.push("SL");
+    }
+    if e.surround {
+        m.push("5.1");
+    }
+    m
+}
+
 pub struct EpgView {
     pub open: bool,
+    /// Show the other multiplexes' services too.
+    all: bool,
+    /// A service whose programme on now is to be selected once the guide has
+    /// it (`--service` with `--window epg`, for screenshots).
+    pending: Option<u16>,
     selected: Option<(u16, u16)>,
     px_per_min: f32,
     /// Scroll to "now" on the next draw.
@@ -69,10 +142,17 @@ impl EpgView {
     pub fn new(open: bool) -> Self {
         EpgView {
             open,
+            all: true,
+            pending: None,
             selected: None,
             px_per_min: 4.0,
             jump: true,
         }
+    }
+
+    /// Select what is on now on `service` once the guide knows it.
+    pub fn select_now(&mut self, service: u16) {
+        self.pending = Some(service);
     }
 
     /// Draw the window; the service to play, if a programme on now was
@@ -97,11 +177,18 @@ impl EpgView {
         let mut play: Option<u16> = None;
         let lt = report.local_time;
         let now = report.utc_unix.unwrap_or_else(now_unix);
-        let services = services::ordered(report);
+        let services = rows(report, epg, self.all);
+        if let Some(sid) = self.pending
+            && let (Some(e), _) = epg.now_next(sid, now)
+        {
+            self.selected = Some((sid, e.event_id));
+            self.pending = None;
+        }
         ui.horizontal(|ui| {
             if ui.button("Now").clicked() {
                 self.jump = true;
             }
+            ui.checkbox(&mut self.all, "all multiplexes");
             ui.label("zoom");
             ui.add(egui::Slider::new(&mut self.px_per_min, 1.5..=10.0).show_value(false));
             ui.label(
@@ -136,7 +223,7 @@ impl EpgView {
         let width = ((t_max - t_min) as f32 / 60.0 * self.px_per_min).max(200.0);
         let height = HEADER_H + ROW_H * services.len() as f32;
         let x_of = |t: i64| (t - t_min) as f32 / 60.0 * self.px_per_min;
-        let detail_h = 96.0;
+        let detail_h = 170.0;
         let rows_h = (ui.available_height() - detail_h).max(120.0);
         ScrollArea::vertical()
             .id_salt("epg_v")
@@ -155,7 +242,7 @@ impl EpgView {
                         let row = ((pt.y - names.rect.top() - HEADER_H) / ROW_H).floor();
                         if row >= 0.0
                             && let Some(s) = services.get(row as usize)
-                            && services::on_air(s)
+                            && s.playable
                         {
                             play = Some(s.number);
                         }
@@ -169,15 +256,14 @@ impl EpgView {
                             format!(
                                 "{:>3} {}",
                                 s.lcn.map_or(String::new(), |n| n.to_string()),
-                                s.name
-                                    .as_deref()
-                                    .unwrap_or("?")
-                                    .chars()
-                                    .take(18)
-                                    .collect::<String>()
+                                s.name.chars().take(18).collect::<String>()
                             ),
                             FontId::monospace(12.0),
-                            Color32::LIGHT_GRAY,
+                            if s.elsewhere.is_some() {
+                                Color32::GRAY
+                            } else {
+                                Color32::LIGHT_GRAY
+                            },
                         );
                     }
                     let mut area = ScrollArea::horizontal()
@@ -230,7 +316,7 @@ impl EpgView {
                                 let on_now = e.start <= now && now < e.end();
                                 // What is on now, on a service with something to
                                 // show, plays when clicked (marked ▶).
-                                let playable = on_now && services::on_air(s);
+                                let playable = on_now && s.playable;
                                 if hit.clicked() {
                                     self.selected = Some((s.number, e.event_id));
                                     if playable {
@@ -242,6 +328,9 @@ impl EpgView {
                                 }
                                 let sel = self.selected == Some((s.number, e.event_id));
                                 let mut fill = genre_colour(e.genre);
+                                if s.elsewhere.is_some() {
+                                    fill = fill.gamma_multiply(0.75);
+                                }
                                 if on_now {
                                     fill = fill.gamma_multiply(1.5);
                                 }
@@ -293,30 +382,117 @@ impl EpgView {
             ui.label(RichText::new("Click an event for its description.").weak());
             return;
         };
-        let service = report
-            .programmes
-            .iter()
-            .find(|p| p.number == sid)
-            .and_then(|p| p.name.as_deref())
-            .unwrap_or("?");
-        ui.label(RichText::new(&e.name).strong());
+        let name_of = |sid: u16| {
+            report
+                .programmes
+                .iter()
+                .find(|p| p.number == sid)
+                .and_then(|p| p.name.clone())
+                .or_else(|| {
+                    report
+                        .others
+                        .iter()
+                        .find(|o| o.number == sid)
+                        .and_then(|o| o.name.clone())
+                })
+                .unwrap_or_else(|| "?".into())
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(&e.name).strong());
+            for m in marks(e) {
+                ui.label(
+                    RichText::new(m)
+                        .small()
+                        .color(Color32::BLACK)
+                        .background_color(Color32::from_rgb(170, 190, 210)),
+                );
+            }
+        });
         let mut meta = vec![
-            service.to_string(),
+            name_of(sid),
             format!("{} – {}", local_stamp(e.start, lt), hhmm(e.end(), lt)),
             format!("{} min", e.duration_s / 60),
         ];
-        if let Some(g) = e.genre.map(genre_name).filter(|g| !g.is_empty()) {
-            meta.push(g.to_string());
-        }
+        meta.extend(e.kinds().iter().map(|k| k.to_string()));
         if let Some(a) = e.min_age {
             meta.push(format!("{a}+"));
         }
+        if let Some(Some(ch)) = report
+            .others
+            .iter()
+            .find(|o| o.number == sid)
+            .map(|o| o.centre_hz.and_then(|f| uhf_channel_at(f as f64)))
+        {
+            meta.push(format!("on C{ch}"));
+        }
         ui.label(RichText::new(meta.join(" · ")).small().weak());
+        if let Some(g) = &e.guidance {
+            ui.label(
+                RichText::new(g)
+                    .small()
+                    .color(Color32::from_rgb(240, 190, 90)),
+            );
+        }
         ScrollArea::vertical()
             .id_salt("epg_detail")
-            .max_height(56.0)
+            .max_height(110.0)
             .show(ui, |ui| {
                 ui.label(e.description());
+                for (what, value) in &e.items {
+                    ui.label(RichText::new(format!("{what}: {value}")).small());
+                }
+                // The same episode at other times, and the series' events.
+                let other_times = |list: Vec<(u16, &EpgEvent)>| {
+                    list.into_iter()
+                        .filter(|(s, x)| !(*s == sid && x.event_id == e.event_id))
+                        .take(6)
+                        .map(|(s, x)| format!("{} {}", local_stamp(x.start, lt), name_of(s)))
+                        .collect::<Vec<_>>()
+                };
+                if let Some(c) = &e.episode_crid {
+                    let full = epg.full_crid(sid, c);
+                    let also = other_times(epg.showings(&full));
+                    if !also.is_empty() {
+                        ui.label(
+                            RichText::new(format!("Also shown: {}", also.join(" · "))).small(),
+                        );
+                    }
+                }
+                if let Some(c) = &e.series_crid {
+                    let full = epg.full_crid(sid, c);
+                    let series = epg.series_events(&full);
+                    let later: Vec<String> = series
+                        .iter()
+                        .filter(|(_, x)| x.start > e.start)
+                        .take(6)
+                        .map(|(s, x)| {
+                            format!("{} {} ({})", local_stamp(x.start, lt), x.name, name_of(*s))
+                        })
+                        .collect();
+                    ui.label(
+                        RichText::new(format!(
+                            "Series: {} events in the guide{}",
+                            series.len(),
+                            if later.is_empty() {
+                                String::new()
+                            } else {
+                                format!("; next: {}", later.join(" · "))
+                            }
+                        ))
+                        .small(),
+                    );
+                }
+                let crids: Vec<String> = [
+                    ("episode", &e.episode_crid),
+                    ("series", &e.series_crid),
+                    ("recommended", &e.recommendation_crid),
+                ]
+                .iter()
+                .filter_map(|(k, c)| c.as_ref().map(|c| format!("{k} {}", epg.full_crid(sid, c))))
+                .collect();
+                if !crids.is_empty() {
+                    ui.label(RichText::new(crids.join(" · ")).small().weak());
+                }
             });
     }
 }

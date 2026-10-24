@@ -3,8 +3,14 @@
 //! following (table 0x4E) and the schedule (0x50–0x5F), with their times as
 //! seconds since 1970 so a viewer can lay them out on a clock.
 //!
+//! The tables of this multiplex (0x4E, 0x50–0x5F) and of the others the
+//! network carries (0x4F, 0x60–0x6F): on Freeview every multiplex sends the
+//! whole network's guide, eight days of it.
+//!
 //! EN 300 468 §5.2.4 (EIT), §6.2.15 (extended event), §6.2.37 (short event),
-//! §6.2.9 (content), §6.2.28 (parental rating), §6.2.20 (local time offset).
+//! §6.2.9 (content), §6.2.28 (parental rating), §6.2.20 (local time offset),
+//! §6.2.8 (component); TS 102 323 §12.1 (content identifier, CRIDs); the DTG
+//! D-Book's guidance descriptor (0x89, private data specifier 0x233A).
 
 use std::collections::BTreeMap;
 
@@ -37,11 +43,53 @@ pub struct EpgEvent {
     pub genre: Option<u8>,
     /// The minimum age a parental rating gives, years.
     pub min_age: Option<u8>,
+    /// Every content byte (EN 300 468 table 29: genre nibble, then the
+    /// detail nibble), in the order sent.
+    pub content: Vec<u8>,
+    /// The event is UK Freeview's (original network 0x233A), whose content
+    /// bytes are the D-Book's genres, not EN 300 468's (see [`EpgEvent::kinds`]).
+    pub freeview: bool,
+    /// The episode's, the series' and a recommendation's CRIDs as sent (on
+    /// Freeview relative, "/m/KEIS": [`Epg::full_crid`] adds the authority).
+    pub episode_crid: Option<String>,
+    pub series_crid: Option<String>,
+    pub recommendation_crid: Option<String>,
+    /// From the component descriptors: high definition video, subtitles,
+    /// subtitles for the hard of hearing, audio description, a signer in
+    /// vision, surround sound.
+    pub hd: bool,
+    pub subtitles: bool,
+    pub hard_of_hearing: bool,
+    pub audio_description: bool,
+    pub signed: bool,
+    pub surround: bool,
+    /// The broadcaster's warning ("Contains strong language"), D-Book.
+    pub guidance: Option<String>,
+    /// The extended event descriptors' items: (what, value), e.g. ("Director",
+    /// "…").
+    pub items: Vec<(String, String)>,
 }
 
 impl EpgEvent {
     pub fn end(&self) -> i64 {
         self.start + i64::from(self.duration_s)
+    }
+
+    /// The names of the event's kinds of programme, from its content bytes,
+    /// each once.
+    pub fn kinds(&self) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = Vec::new();
+        for &c in &self.content {
+            let n = if self.freeview {
+                freeview_genre_name(c >> 4)
+            } else {
+                content_name(c)
+            };
+            if !n.is_empty() && !v.contains(&n) {
+                v.push(n);
+            }
+        }
+        v
     }
 
     /// The long description, or the short one if there is no long.
@@ -52,6 +100,125 @@ impl EpgEvent {
         } else {
             long
         }
+    }
+}
+
+/// The name of a content byte's detail (EN 300 468 table 29), or of its
+/// genre if the detail is general or not one the table names.
+pub fn content_name(byte: u8) -> &'static str {
+    let name = match byte {
+        0x10 => "Movie / drama",
+        0x11 => "Detective / thriller",
+        0x12 => "Adventure / western / war",
+        0x13 => "Science fiction / fantasy / horror",
+        0x14 => "Comedy",
+        0x15 => "Soap / melodrama / folklore",
+        0x16 => "Romance",
+        0x17 => "Serious / classical / religious / historical drama",
+        0x18 => "Adult movie / drama",
+        0x20 => "News / current affairs",
+        0x21 => "News / weather report",
+        0x22 => "News magazine",
+        0x23 => "Documentary",
+        0x24 => "Discussion / interview / debate",
+        0x30 => "Show / game show",
+        0x31 => "Game show / quiz / contest",
+        0x32 => "Variety show",
+        0x33 => "Talk show",
+        0x40 => "Sports",
+        0x41 => "Special event",
+        0x42 => "Sports magazine",
+        0x43 => "Football / soccer",
+        0x44 => "Tennis / squash",
+        0x45 => "Team sports",
+        0x46 => "Athletics",
+        0x47 => "Motor sport",
+        0x48 => "Water sport",
+        0x49 => "Winter sports",
+        0x4A => "Equestrian",
+        0x4B => "Martial sports",
+        0x50 => "Children's / youth",
+        0x51 => "Pre-school children's",
+        0x52 => "Entertainment for 6 to 14",
+        0x53 => "Entertainment for 10 to 16",
+        0x54 => "Informational / educational / school",
+        0x55 => "Cartoons / puppets",
+        0x60 => "Music / ballet / dance",
+        0x61 => "Rock / pop",
+        0x62 => "Serious / classical music",
+        0x63 => "Folk / traditional music",
+        0x64 => "Jazz",
+        0x65 => "Musical / opera",
+        0x66 => "Ballet",
+        0x70 => "Arts / culture",
+        0x71 => "Performing arts",
+        0x72 => "Fine arts",
+        0x73 => "Religion",
+        0x74 => "Popular culture / traditional arts",
+        0x75 => "Literature",
+        0x76 => "Film / cinema",
+        0x77 => "Experimental film / video",
+        0x78 => "Broadcasting / press",
+        0x79 => "New media",
+        0x7A => "Arts / culture magazine",
+        0x7B => "Fashion",
+        0x80 => "Social / political / economics",
+        0x81 => "Magazine / report / documentary",
+        0x82 => "Economics / social advisory",
+        0x83 => "Remarkable people",
+        0x90 => "Education / science / factual",
+        0x91 => "Nature / animals / environment",
+        0x92 => "Technology / natural sciences",
+        0x93 => "Medicine / physiology / psychology",
+        0x94 => "Foreign countries / expeditions",
+        0x95 => "Social / spiritual sciences",
+        0x96 => "Further education",
+        0x97 => "Languages",
+        0xA0 => "Leisure / hobbies",
+        0xA1 => "Tourism / travel",
+        0xA2 => "Handicraft",
+        0xA3 => "Motoring",
+        0xA4 => "Fitness and health",
+        0xA5 => "Cooking",
+        0xA6 => "Advertisement / shopping",
+        0xA7 => "Gardening",
+        0xB0 => "Original language",
+        0xB1 => "Black and white",
+        0xB2 => "Unpublished",
+        0xB3 => "Live broadcast",
+        _ => "",
+    };
+    if name.is_empty() {
+        genre_name(byte >> 4)
+    } else {
+        name
+    }
+}
+
+/// UK Freeview's genres (the DTG D-Book's use of the content descriptor's
+/// first nibble; the second is 0): not EN 300 468's table 29.
+pub fn freeview_genre_name(nibble: u8) -> &'static str {
+    match nibble {
+        0x1 => "Movie",
+        0x2 | 0x7 | 0x8 => "News and factual",
+        0x3 | 0x6 => "Entertainment",
+        0x4 => "Sport",
+        0x5 => "Children's",
+        0x9 => "Education",
+        0xA => "Lifestyle",
+        0xF => "Drama",
+        _ => "",
+    }
+}
+
+/// A Freeview genre nibble as the nearest EN 300 468 one (for colours and
+/// the like that go by the standard's).
+fn freeview_as_standard(nibble: u8) -> u8 {
+    match nibble {
+        0x6 => 0x3,
+        0x7 | 0x8 => 0x2,
+        0xF => 0x1,
+        n => n,
     }
 }
 
@@ -78,6 +245,9 @@ pub fn genre_name(nibble: u8) -> &'static str {
 pub struct Epg {
     /// Service id → event id → event.
     pub services: BTreeMap<u16, BTreeMap<u16, EpgEvent>>,
+    /// Each service's default CRID authority (the SDT's default authority
+    /// descriptor, "fp.bbc.co.uk"), for the relative CRIDs of its events.
+    pub authorities: BTreeMap<u16, String>,
     /// Counts the changes, so a viewer can tell when to look again.
     pub version: u64,
     /// The stream's clock, seconds since 1970, when it has said.
@@ -98,6 +268,8 @@ impl Epg {
     /// section header: transport stream id, original network id, last
     /// section of the segment, last table id, then the events).
     pub fn section(&mut self, service: u16, body: &[u8]) {
+        // The original network: UK Freeview's genres are its own.
+        let freeview = body.len() >= 4 && u16::from_be_bytes([body[2], body[3]]) == 0x233A;
         let mut at = 6;
         while at + 12 <= body.len() {
             let event_id = u16::from_be_bytes([body[at], body[at + 1]]);
@@ -118,13 +290,17 @@ impl Epg {
                     as u32,
                 running,
                 free_ca,
+                freeview,
                 ..Default::default()
             };
             if self.now.is_some_and(|n| ev.end() + KEEP_AFTER_END < n) {
                 continue; // over and gone
             }
+            // The private data specifier in force (0x233A: the UK's DTG).
+            let mut pds = 0u32;
             for (tag, d) in descriptors(desc) {
                 match tag {
+                    0x5F if d.len() >= 4 => pds = u32::from_be_bytes([d[0], d[1], d[2], d[3]]),
                     0x4D if d.len() >= 4 => {
                         // short_event_descriptor: language, name, text.
                         let nl = d[3] as usize;
@@ -137,15 +313,90 @@ impl Epg {
                     }
                     0x4E if d.len() >= 6 => {
                         // extended_event_descriptor: number, language, the
-                        // items (skipped), text.
+                        // items (what, value), text.
                         let items = d[4] as usize;
+                        let list = &d[5..(5 + items).min(d.len())];
+                        let mut k = 0;
+                        while k < list.len() {
+                            let dl = list[k] as usize;
+                            let what = list.get(k + 1..k + 1 + dl).unwrap_or(&[]);
+                            let il = list.get(k + 1 + dl).copied().unwrap_or(0) as usize;
+                            let value = list.get(k + 2 + dl..k + 2 + dl + il).unwrap_or(&[]);
+                            ev.items.push((dvb_text(what), dvb_text(value)));
+                            k += 2 + dl + il;
+                        }
                         if let Some(&tl) = d.get(5 + items) {
                             let text = &d
                                 [(6 + items).min(d.len())..(6 + items + tl as usize).min(d.len())];
                             ev.extended.insert(d[0] >> 4, dvb_text(text));
                         }
                     }
-                    0x54 if !d.is_empty() => ev.genre = Some(d[0] >> 4),
+                    0x54 if !d.is_empty() => {
+                        // content_descriptor: (nibbles, user byte) pairs.
+                        ev.genre = Some(if freeview {
+                            freeview_as_standard(d[0] >> 4)
+                        } else {
+                            d[0] >> 4
+                        });
+                        ev.content.extend(d.iter().step_by(2));
+                    }
+                    0x50 if d.len() >= 2 => {
+                        // component_descriptor: what the event's streams are
+                        // (EN 300 468 table 26).
+                        let (content, kind) = (d[0] & 0x0F, d[1]);
+                        match content {
+                            0x1 if (0x09..=0x10).contains(&kind) => ev.hd = true,
+                            0x5 if (0x0B..=0x10).contains(&kind) => ev.hd = true,
+                            0x9 => ev.hd = true, // HEVC: HD or UHD
+                            0x3 if (0x10..=0x15).contains(&kind) => ev.subtitles = true,
+                            0x3 if (0x20..=0x25).contains(&kind) => {
+                                ev.subtitles = true;
+                                ev.hard_of_hearing = true;
+                            }
+                            0x3 if kind == 0x30 || kind == 0x31 => ev.signed = true,
+                            0x2 | 0x6 if matches!(kind, 0x40 | 0x44 | 0x47 | 0x48) => {
+                                ev.audio_description = true
+                            }
+                            0x6 if matches!(kind, 0x05 | 0x07) => ev.surround = true,
+                            0x4 | 0x7 => ev.surround = true, // AC-3, DTS
+                            _ => {}
+                        }
+                    }
+                    0x76 => {
+                        // content_identifier_descriptor: CRIDs, by type (the
+                        // low nibble: 1 the item, 2 the series, 3 a
+                        // recommendation; Freeview sends 0x31..0x33).
+                        let mut k = 0;
+                        while k < d.len() {
+                            let (kind, location) = (d[k] >> 2, d[k] & 0x03);
+                            if location == 0 {
+                                let cl = d.get(k + 1).copied().unwrap_or(0) as usize;
+                                let crid = d
+                                    .get(k + 2..k + 2 + cl)
+                                    .map(|c| c.iter().map(|&b| b as char).collect::<String>());
+                                match kind & 0x0F {
+                                    1 => ev.episode_crid = crid,
+                                    2 => ev.series_crid = crid,
+                                    3 => ev.recommendation_crid = crid,
+                                    _ => {}
+                                }
+                                k += 2 + cl;
+                            } else {
+                                // A reference into a CRID table: not sent here.
+                                k += 3;
+                            }
+                        }
+                    }
+                    0x89 if pds == 0x233A && !d.is_empty() => {
+                        // guidance_descriptor (D-Book): type 0 is a language
+                        // and the text, type 1 a mode bit first.
+                        let text = match d[0] & 0x03 {
+                            0 => d.get(4..),
+                            1 => d.get(5..),
+                            _ => None,
+                        };
+                        ev.guidance = text.map(dvb_text).filter(|t| !t.is_empty());
+                    }
                     0x55 if d.len() >= 4 => {
                         // The first rating: 0x01..=0x0F is an age of 3 more.
                         let r = d[3];
@@ -182,6 +433,46 @@ impl Epg {
                 self.version += 1;
             }
         }
+    }
+
+    /// A CRID with its authority: a relative one ("/m/KEIS") takes the
+    /// service's default authority (TS 102 323 §6.3.1).
+    pub fn full_crid(&self, service: u16, crid: &str) -> String {
+        if crid.starts_with("crid://") {
+            return crid.to_string();
+        }
+        match self.authorities.get(&service) {
+            Some(a) => format!("crid://{a}{crid}"),
+            None => crid.to_string(),
+        }
+    }
+
+    /// Every showing of an episode (by its full CRID) across the services,
+    /// in time order.
+    pub fn showings(&self, episode: &str) -> Vec<(u16, &EpgEvent)> {
+        self.matching(episode, |e| e.episode_crid.as_deref())
+    }
+
+    /// Every event of a series (by its full CRID), in time order.
+    pub fn series_events(&self, series: &str) -> Vec<(u16, &EpgEvent)> {
+        self.matching(series, |e| e.series_crid.as_deref())
+    }
+
+    fn matching<'a>(
+        &'a self,
+        full: &str,
+        crid: impl Fn(&EpgEvent) -> Option<&str>,
+    ) -> Vec<(u16, &'a EpgEvent)> {
+        let mut v: Vec<(u16, &EpgEvent)> = self
+            .services
+            .iter()
+            .flat_map(|(&s, m)| m.values().map(move |e| (s, e)))
+            .filter(|(s, e)| {
+                crid(e).is_some_and(|c| self.full_crid(*s, c).eq_ignore_ascii_case(full))
+            })
+            .collect();
+        v.sort_by_key(|(_, e)| e.start);
+        v
     }
 
     /// Forget the events long over.
@@ -372,6 +663,51 @@ mod tests {
         epg.now = Some(t0 + 3 * 3600 + 3600 + 60);
         epg.prune();
         assert_eq!(epg.events(), 0);
+    }
+
+    /// A Freeview event as the UK sends it: components, CRIDs, a D-Book
+    /// guidance warning behind its private data specifier, a D-Book genre.
+    #[test]
+    fn freeview_details_are_read() {
+        let mut e = vec![0, 9, 0xEA, 0x60, 0x18, 0x00, 0x00, 0x00, 0x45, 0x00];
+        let mut d = vec![0x4D, 5 + 4, b'e', b'n', b'g', 4];
+        d.extend_from_slice(b"Film");
+        d.push(0);
+        // Components: H.264 HD video, DVB subtitles for the hard of hearing,
+        // HE-AAC audio description.
+        for (c, t) in [(0x05u8, 0x0Bu8), (0x03, 0x20), (0x06, 0x47)] {
+            d.extend_from_slice(&[0x50, 6, 0xF0 | c, t, 1, b'e', b'n', b'g']);
+        }
+        // CRIDs: the item (0x31) and the series (0x32), relative.
+        d.extend_from_slice(&[0x76, 2 + 7 + 2 + 7, 0x31 << 2, 7]);
+        d.extend_from_slice(b"/m/KEIS");
+        d.extend_from_slice(&[0x32 << 2, 7]);
+        d.extend_from_slice(b"/m-XW9N");
+        // Guidance: only after the DTG's private data specifier.
+        d.extend_from_slice(&[0x5F, 4, 0x00, 0x00, 0x23, 0x3A]);
+        let warn = b"Contains strong language";
+        d.extend_from_slice(&[0x89, (4 + warn.len()) as u8, 0xFC, b'e', b'n', b'g']);
+        d.extend_from_slice(warn);
+        d.extend_from_slice(&[0x54, 2, 0xF0, 0x00]); // Freeview: drama
+        e.extend_from_slice(&[0x80 | (d.len() >> 8) as u8, d.len() as u8]);
+        e.extend_from_slice(&d);
+        // Network 0x233A: Freeview.
+        let mut body = vec![0x10, 0x01, 0x23, 0x3A, 0, 0x60];
+        body.extend(e);
+        let sec = section(0x60, 4164, 0, &body);
+        let mut epg = Epg::new();
+        epg.authorities.insert(4164, "fp.bbc.co.uk".into());
+        epg.section(4164, &sec[8..sec.len() - 4]);
+        let ev = &epg.services[&4164][&9];
+        assert!(ev.hd && ev.subtitles && ev.hard_of_hearing && ev.audio_description);
+        assert!(!ev.signed && !ev.surround);
+        assert_eq!(ev.guidance.as_deref(), Some("Contains strong language"));
+        assert_eq!(ev.kinds(), ["Drama"]);
+        assert_eq!(ev.genre, Some(1));
+        let full = epg.full_crid(4164, ev.episode_crid.as_deref().unwrap());
+        assert_eq!(full, "crid://fp.bbc.co.uk/m/KEIS");
+        assert_eq!(epg.showings("CRID://fp.bbc.co.uk/m/KEIS").len(), 1);
+        assert_eq!(epg.series_events("crid://fp.bbc.co.uk/m-XW9N").len(), 1);
     }
 
     #[test]

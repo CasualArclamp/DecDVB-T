@@ -35,10 +35,10 @@ pub fn null_packet() -> [u8; TS_LEN] {
     p
 }
 
-pub use epg::{Epg, EpgEvent, LocalTime, genre_name};
+pub use epg::{Epg, EpgEvent, LocalTime, content_name, freeview_genre_name, genre_name};
 pub use psi::{
-    EsInfo, Event, NetworkInfo, PidRow, PidStats, Programme, Terrestrial, Transponder, TsAnalyser,
-    TsReport, ca_system_name, service_type_name, stream_type_name,
+    EsInfo, Event, NetworkInfo, OtherService, PidRow, PidStats, Programme, Terrestrial,
+    Transponder, TsAnalyser, TsReport, ca_system_name, service_type_name, stream_type_name,
 };
 pub use sink::{TcpSink, TsFile, TsTap, UdpSink};
 pub use udp::{UdpTs, UdpTsFinder};

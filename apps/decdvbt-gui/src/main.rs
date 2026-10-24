@@ -562,7 +562,13 @@ impl App {
             epg_at: Instant::now(),
             selected: opts.service,
             ts_window: ts_viewer::TsViewer::new(opts.window.as_deref() == Some("ts")),
-            epg_window: epg_view::EpgView::new(opts.window.as_deref() == Some("epg")),
+            epg_window: {
+                let mut v = epg_view::EpgView::new(opts.window.as_deref() == Some("epg"));
+                if let Some(sid) = opts.service {
+                    v.select_now(sid);
+                }
+                v
+            },
             tv: player::TvWindow::default(),
             tap: None,
             outputs_ui: {
