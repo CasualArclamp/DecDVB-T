@@ -1,7 +1,7 @@
 // made by CasualArclamp
-//! The scopes panel, after OnAir's: the cells of the last symbols at four
+//! The scopes panel, after OnAir's: the cells of the last symbols at three
 //! stages of the receiver (the TPS cells, the pilots and the data cells
-//! equalised, and what the transform gave before the equaliser), and what the
+//! equalised; the transform's raw output was only noise to look at), and what the
 //! pilots say of the channel: its gain and the signal-to-noise ratio across
 //! the band, its impulse response and the echoes in it.
 //!
@@ -144,7 +144,7 @@ impl Phosphor {
 }
 
 pub struct ScopeView {
-    scopes: [Phosphor; 4],
+    scopes: [Phosphor; 3],
     /// Symbols' cells in, to be added at the next draw.
     pending: Vec<Arc<Scopes>>,
     /// The last symbol's constellation, for the ideal points and the header.
@@ -164,7 +164,6 @@ impl Default for ScopeView {
                 Phosphor::new("tps"),
                 Phosphor::new("pilots"),
                 Phosphor::new("data"),
-                Phosphor::new("raw"),
             ],
             pending: Vec::new(),
             modulation: None,
@@ -198,7 +197,6 @@ impl ScopeView {
             self.scopes[0].add(&s.tps, Some(1.0));
             self.scopes[1].add(&s.pilots, Some(1.0));
             self.scopes[2].add(&s.data, Some(1.0));
-            self.scopes[3].add(&s.raw, None);
             self.modulation = s.modulation;
             self.t2 = s.t2_qam;
             self.pilot_mark = s.pilot_mark.unwrap_or(4.0 / 3.0);
@@ -240,17 +238,16 @@ impl ScopeView {
         let avail = ui.available_size();
         let height = (avail.y - 4.0).max(80.0);
         let gap = 8.0;
-        let side = ((avail.x * 0.52 - 3.0 * gap) / 4.0).clamp(80.0, height);
-        let plots_w = ((avail.x - 4.0 * side - 4.0 * gap - 8.0) / 3.0).max(80.0);
+        let side = ((avail.x * 0.42 - 2.0 * gap) / 3.0).clamp(80.0, height);
+        let plots_w = ((avail.x - 3.0 * side - 3.0 * gap - 8.0) / 3.0).max(80.0);
         let size = vec2(side, height);
         let seen = self.seen;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
-            let marks: [Vec<Iq>; 4] = [
+            let marks: [Vec<Iq>; 3] = [
                 vec![Iq::new(1.0, 0.0), Iq::new(-1.0, 0.0)],
                 vec![Iq::new(pilot_mark, 0.0), Iq::new(-pilot_mark, 0.0)],
                 ideal(modulation, t2),
-                Vec::new(),
             ];
             for (ph, marks) in self.scopes.iter_mut().zip(&marks) {
                 scope(ui, size, ph, seen, marks);
