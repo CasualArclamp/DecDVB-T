@@ -30,6 +30,7 @@ mod services;
 mod source;
 mod t2card;
 mod ts_viewer;
+mod video;
 mod waterfall;
 
 use std::collections::HashMap;
@@ -80,6 +81,10 @@ struct Options {
     rate_msps: Option<f64>,
     screenshot: Option<PathBuf>,
     after: f64,
+    /// With `--screenshot`: record the window from `after` on for
+    /// `video_secs` seconds to this file (see [`video`]).
+    video: Option<PathBuf>,
+    video_secs: f64,
     /// Frames a second while a source runs; the CPU it costs is most of the
     /// GUI's.
     fps: f64,
@@ -162,6 +167,8 @@ impl Options {
             rate_msps: None,
             screenshot: None,
             after: 4.0,
+            video: None,
+            video_secs: 6.0,
             fps: 15.0,
             assume: None,
             bottom: Bottom::Scopes,
@@ -231,6 +238,10 @@ impl Options {
                     o.fps_given = true;
                 }
                 "--after" => o.after = value("seconds")?.parse().map_err(|_| "bad --after")?,
+                "--video" => o.video = Some(value("a video file")?.into()),
+                "--video-secs" => {
+                    o.video_secs = value("seconds")?.parse().map_err(|_| "bad --video-secs")?;
+                }
                 f if !f.starts_with("--") => o.file = Some(f.into()),
                 _ => return Err(format!("unknown option {a}")),
             }
@@ -417,6 +428,10 @@ struct App {
     dec_rate: Option<(u64, Instant, f64)>,
     started: Instant,
     shot_sent: bool,
+    /// The window's recording, while `--video` runs, and whether it has
+    /// been made (a frame drawn after it must not start another).
+    video: Option<video::VideoTap>,
+    video_done: bool,
     /// For `--screenshot`: process CPU and time at 2 s, to average over the
     /// run without the screenshot's own cost.
     cpu_mark: Option<(f64, Instant)>,
@@ -526,6 +541,8 @@ impl App {
         let mut app = App {
             started: Instant::now(),
             shot_sent: false,
+            video: None,
+            video_done: false,
             cpu_mark: None,
             cpu_avg: None,
             frame_cost: [Duration::ZERO; 2],
@@ -1538,6 +1555,10 @@ impl App {
         if self.cpu_mark.is_none() && self.started.elapsed().as_secs_f64() >= 2.0 {
             self.cpu_mark = Some((decdvbt_engine::process_cpu_seconds(), Instant::now()));
         }
+        if self.opts.video.is_some() && self.started.elapsed().as_secs_f64() >= self.opts.after {
+            self.record_video(ctx, &path);
+            return;
+        }
         if !self.shot_sent && self.started.elapsed().as_secs_f64() >= self.opts.after {
             if let Some((c0, t0)) = self.cpu_mark {
                 let dt = t0.elapsed().as_secs_f64();
@@ -1568,6 +1589,57 @@ impl App {
             ),
             Err(e) => eprintln!("cannot save screenshot {}: {e}", path.display()),
         }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// `--video`: every frame read back and handed to the recording; at the
+    /// end the last frame is the screenshot and the window closes.
+    fn record_video(&mut self, ctx: &egui::Context, shot: &std::path::Path) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        ctx.request_repaint();
+        let image = ctx.input(|i| {
+            i.raw.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        let Some(image) = image else { return };
+        if self.video_done {
+            return;
+        }
+        if self.video.is_none() {
+            let out = self.opts.video.clone().expect("--video");
+            let tap = decdvbt_video::find_ffmpeg(prefs::ffmpeg_path().as_deref())
+                .ok_or_else(|| "ffmpeg not found".to_string())
+                .and_then(|ff| {
+                    video::VideoTap::start(&ff, &out, image.size).map_err(|e| e.to_string())
+                });
+            match tap {
+                Ok(t) => self.video = Some(t),
+                Err(e) => {
+                    eprintln!("cannot record {}: {e}", out.display());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+            }
+        }
+        let Some(tap) = &mut self.video else { return };
+        if let Err(e) = tap.push(&image) {
+            eprintln!("recording: {e}");
+        }
+        if tap.elapsed() < self.opts.video_secs {
+            return;
+        }
+        let tap = self.video.take().expect("recording");
+        self.video_done = true;
+        let frames = tap.finish().unwrap_or(0);
+        let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+        let (w, h) = (image.size[0] as u32, image.size[1] as u32);
+        let _ = image::save_buffer(shot, &rgba, w, h, image::ColorType::Rgba8);
+        eprintln!(
+            "video saved to {} ({frames} frames)",
+            self.opts.video.as_ref().expect("--video").display()
+        );
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 

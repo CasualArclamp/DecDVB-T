@@ -34,7 +34,8 @@ cargo run --release -p decdvbt-gui --example retune_soak -- C23 C26 C28 --rounds
 cargo run --release -p decdvbt-rx --example splice -- A.cs8 B.cs8 24            # offline: the old channel's samples then the new one's; ACQSCAN=1 for first-attempt acquisition
 # the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|maps|history|none,
 # --window ts|epg|sdr, --service ID (select), --play ID, --http 127.0.0.1:8001,
-# --udp 127.0.0.1:1234, --record, --fps 60 (smooth), env DECDVBT_REDBUTTON=wait,15 (start the playing
+# --udp 127.0.0.1:1234, --record, --fps 60 (smooth), --video OUT.mp4 --video-secs N (with --screenshot and
+# --after: record the window itself from --after on, for demos; out/promo has the release promo), env DECDVBT_REDBUTTON=wait,15 (start the playing
 # service's Red Button and press keys, one a second), --optimise (live: run the gain optimiser
 # after the lock; it changes the radio's gains and writes learned offsets to
 # %APPDATA%\DecDVB-T\prefs.txt)
