@@ -1082,11 +1082,30 @@ over it and the picture in the BBC's window. CPU: 59.4 % against 57.4 %
 without the Red Button (a 40 ms repaint request first cost 9 points by adding
 frames; the engine now asks for 100 ms).
 
-**Not done.** A live C23 tune (the HackRF read -44 dBFS in the morning; at
-07:20 -31 dBFS, but the receiver locked at 0.5 dB SNR with 155 relocks in
-75 s and no packets), so the C23
-pages themselves were only seen as far as the 71 modules of the short
-captures allow (`/a` boots to the trigger scene). MPEG-2 I-frame bitmaps,
+**Not done.** A live C23 tune in the morning (the aerial was faulty; see
+below for the C23 recording made after it was fixed). MPEG-2 I-frame bitmaps,
 stream events to the application, the interaction channel, ListGroup's item
 actions, sliders and entry-field editing are not done; the font is a
 squeezed Segoe UI, not Tiresias.
+
+**C23 (2026-10-24, later).** With the aerial fixed, the other session
+recorded 120 s of C23 (`captures/c23_490.000MHz_10Msps_amp120.cs8`, amp on,
+LNA 40, VGA 16; 18.5 dB, about 3 % of RS blocks lost), whose stream holds
+123 of the BBC carousel's 125 modules. `decdvbt-gui
+captures/c23_490.000MHz_10Msps_amp120.cs8 --decode --play 4164` then shows
+BBC One's Red Button live from the IQ file: red opens Red Button Text
+over the picture, SELECT opens the News Index, and again today's Main
+Headlines ("Storm Boelo to bring more wind…"), the picture in the BBC's
+window and the BBC clock reading the broadcast's local time (08:01, as on the
+picture). The BBC Red Button service itself (4416) shows its splash page
+("Welcome to BBC Red Button… Press RED to visit now").
+
+Fixes found on C23: GetServiceIndex and GetBasicSI now read a service list
+(this multiplex's services, then the SDT's others; "dvb://233a..1044" with
+empty fields matching any), and TuneIndex to a service of the multiplex makes
+the player play it, the Red Button following to its application (the splash's
+red key moves to BBC One); font attributes with a line spacing of 0
+("plain.36.0.0") take the font's own; and the red key that starts the Red
+Button waits until the application has sat idle in a scene for 1.5 s (the
+BBC's init scene took it and ignored it when the carousel was still coming).
+`DECDVBT_REDBUTTON_TRACE=1` prints the engine's trace from the GUI.

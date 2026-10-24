@@ -225,32 +225,49 @@ impl Engine {
         unix + self.local_offset_s
     }
 
+    /// GetServiceIndex: a service's place in the receiver's list, or -1
+    /// (D-Book 7 §13.10.4.11). "rec://svc/cur" and "rec://svc/def" are this
+    /// service; "dvb://onid.tsid.sid" is hexadecimal, an empty field matching
+    /// any (the BBC writes "dvb://233a..1044").
     fn service_index(&self, r: &str) -> i32 {
-        // "rec://svc/cur", "rec://svc/def": this service; "dvb://onid.tsid.sid".
-        if r.starts_with("rec://svc/") {
-            return 0;
+        let here = (
+            self.service.original_network_id,
+            self.service.transport_stream_id,
+            self.service.service_id,
+        );
+        let want: Option<[Option<u16>; 3]> = if r.starts_with("rec://svc/") {
+            Some([Some(here.0), Some(here.1), Some(here.2)])
+        } else if let Some(t) = r.strip_prefix("dvb://") {
+            let f: Vec<&str> = t.split('.').collect();
+            (f.len() == 3).then(|| {
+                let h = |x: &str| {
+                    (!x.is_empty())
+                        .then(|| u16::from_str_radix(x, 16).ok())
+                        .flatten()
+                };
+                [h(f[0]), h(f[1]), h(f[2])]
+            })
+        } else {
+            None
+        };
+        let Some(w) = want else { return -1 };
+        let matches = |&(o, t, s): &(u16, u16, u16)| {
+            w[0].is_none_or(|x| x == o)
+                && w[1].is_none_or(|x| x == t)
+                && w[2].is_none_or(|x| x == s)
+        };
+        if w[2].is_none() {
+            return -1;
         }
-        let r = r.trim_start_matches("dvb://").to_ascii_lowercase();
         self.service
             .services
             .iter()
-            .position(|s| {
-                s.trim_start_matches("dvb://").eq_ignore_ascii_case(&r)
-                    || s.trim_start_matches("dvb://").split('.').nth(2) == r.split('.').nth(2)
-                        && r.split('.').nth(2).is_some_and(|x| !x.is_empty())
-            })
-            .map_or(-1, |i| i as i32 + 1)
+            .position(matches)
+            .map_or(-1, |i| i as i32)
     }
 
     fn service_triplet(&self, i: i32) -> Option<(u16, u16, u16)> {
-        if i == 0 {
-            let s = &self.service;
-            return Some((s.original_network_id, s.transport_stream_id, s.service_id));
-        }
-        let s = self.service.services.get((i - 1) as usize)?;
-        let mut p = s.trim_start_matches("dvb://").split('.');
-        let mut h = || u16::from_str_radix(p.next()?, 16).ok();
-        Some((h()?, h()?, h()?))
+        self.service.services.get(usize::try_from(i).ok()?).copied()
     }
 }
 

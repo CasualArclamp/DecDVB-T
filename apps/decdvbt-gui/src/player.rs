@@ -124,7 +124,7 @@ impl TvWindow {
         self.stop();
         self.open = true;
         if self.red.service().is_some_and(|s| s != p.number) {
-            self.red.stop();
+            self.red.follow(p.number);
         }
         self.service = Some(p.number);
         let mut sel = selection(p, audio, subs);
@@ -200,6 +200,9 @@ impl TvWindow {
         self.red.update(ctx);
         let playing = self.service.filter(|_| self.player.is_some());
         self.red.keyboard(ctx, playing);
+        if let Some(sid) = self.red.take_tune() {
+            return Some(Request::Play(sid, None, None));
+        }
         // The picture due now.
         if let Some(f) = self.player.as_mut().and_then(|p| p.poll()) {
             let img =

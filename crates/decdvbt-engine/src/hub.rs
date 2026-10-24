@@ -63,6 +63,9 @@ pub struct CarouselState {
     pub offset_min: i32,
     pub original_network_id: Option<u16>,
     pub ts_id: Option<u16>,
+    /// The services of this multiplex, then those of the others the SDT
+    /// names: (original network, transport stream, service).
+    pub services: Vec<(u16, u16, u16)>,
 }
 
 /// The GUI's request for a service's carousel, and where the hub puts it.
@@ -433,6 +436,15 @@ impl Stage {
                 .map_or(0, |lt| lt.offset_at(a.utc_unix.unwrap_or(0)));
             st.original_network_id = a.original_network_id;
             st.ts_id = a.ts_id;
+            let (onid, tsid) = (a.original_network_id.unwrap_or(0), a.ts_id.unwrap_or(0));
+            if st.services.len() != a.programmes.len() + a.others.len() {
+                st.services = a
+                    .programmes
+                    .keys()
+                    .map(|&s| (onid, tsid, s))
+                    .chain(a.others.values().map(|o| (onid, o.ts_id, o.number)))
+                    .collect();
+            }
         }
         let (view_seen, epg_seen) = *sh.watched.lock().unwrap();
         if view_seen.elapsed() < WATCH_FOR && self.report_at.elapsed() >= REPORT_EVERY {

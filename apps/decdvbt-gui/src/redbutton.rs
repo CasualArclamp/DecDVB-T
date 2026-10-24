@@ -6,7 +6,7 @@
 //! The red key (R, or the button under the picture) starts it: the hub begins
 //! receiving the service's object carousel (`decdvbt_engine::CarouselLink`),
 //! the engine boots the application once the carousel's root has come, and
-//! the red key is handed to the application once it has a scene (the BBC's
+//! the red key is handed to the application once it has settled in a scene (the BBC's
 //! starts on its "press red" trigger and opens its menu on red). Keys while
 //! it runs: the arrows, Enter (select), Backspace or Esc (back), 0–9, R G Y
 //! B for the colour keys and T for Text. The button stops it.
@@ -31,6 +31,10 @@ use eframe::egui::{
     self, Color32, ColorImage, Key, Modifiers, Rect, TextureHandle, TextureOptions, pos2,
 };
 
+/// How long the application must sit idle in a scene before the red key
+/// that started it is pressed.
+const SETTLE: Duration = Duration::from_millis(1500);
+
 /// The canvas (D-Book 7 §13.10.1).
 const W: f32 = 720.0;
 const H: f32 = 576.0;
@@ -42,11 +46,15 @@ pub struct RedButton {
     renderer: Option<Renderer>,
     texture: Option<TextureHandle>,
     t0: Option<Instant>,
-    /// The red key, to give the application once it has a scene.
+    /// The red key, to give the application once it has settled.
     pending_red: bool,
+    /// The scene, and since when it has been the scene with the engine idle.
+    settled: Option<(String, Instant)>,
     /// Where the application wants the picture, on its canvas (`None`: full
     /// screen).
     video: Option<(i32, i32, i32, i32)>,
+    /// A service of this multiplex the application asked to tune to.
+    tune: Option<u16>,
     pub status: String,
     /// `DECDVBT_REDBUTTON`'s keys still to press, and when the last was.
     script: Option<Vec<String>>,
@@ -68,12 +76,18 @@ impl RedButton {
         self.link.clone()
     }
 
-    /// Start service `sid`'s application.
+    /// Start service `sid`'s application, and press red for it.
     pub fn start(&mut self, sid: u16) {
+        self.follow(sid);
+        self.pending_red = true;
+    }
+
+    /// Run service `sid`'s application from its start (the player moved to
+    /// another service while one ran: a receiver boots the new service's).
+    pub fn follow(&mut self, sid: u16) {
         self.stop();
         self.link = Some(CarouselLink::new(sid));
         self.t0 = Some(Instant::now());
-        self.pending_red = true;
         self.status = "waiting for the carousel".into();
         if self.renderer.is_none() {
             self.renderer = Some(Renderer::new());
@@ -86,6 +100,8 @@ impl RedButton {
         self.texture = None;
         self.video = None;
         self.pending_red = false;
+        self.settled = None;
+        self.tune = None;
         self.status.clear();
     }
 
@@ -128,6 +144,9 @@ impl RedButton {
                     return;
                 }
                 let mut e = Engine::new();
+                // DECDVBT_REDBUTTON_TRACE=1: the engine's trace on stderr.
+                e.tracing = std::env::var_os("DECDVBT_REDBUTTON_TRACE").is_some();
+                e.trace_stderr = e.tracing;
                 e.boot(oc);
                 self.status.clear();
                 self.engine.insert(e)
@@ -137,18 +156,42 @@ impl RedButton {
             original_network_id: st.original_network_id.unwrap_or(0),
             transport_stream_id: st.ts_id.unwrap_or(0),
             service_id: link.service,
-            services: Vec::new(),
+            services: st.services.clone(),
         };
         engine.clock_unix = st.utc.map(|(t, at)| t + at.elapsed().as_secs() as i64);
         engine.local_offset_s = st.offset_min as i64 * 60;
-        if self.pending_red && engine.has_scene() {
+        // The red key that started it goes to the application once it has
+        // settled in a scene (the BBC's init scene ignores keys; its trigger
+        // scene opens the menu on red).
+        let scene = engine.scene().map(str::to_string);
+        if scene.is_none() || !engine.is_idle() {
+            self.settled = None;
+        } else if self.settled.as_ref().map(|s| &s.0) != scene.as_ref() {
+            self.settled = scene.map(|s| (s, Instant::now()));
+        }
+        if self.pending_red
+            && self
+                .settled
+                .as_ref()
+                .is_some_and(|s| s.1.elapsed() >= SETTLE)
+        {
             self.pending_red = false;
             engine.key(key::RED);
         }
         let changed = engine.tick(now_ms, oc);
         for r in engine.requests.drain(..) {
-            if let Request::Video(v) = r {
-                self.video = v;
+            match r {
+                Request::Video(v) => self.video = v,
+                // TuneIndex: a service of this multiplex is played; others
+                // would need a retune, which is the app's to do (not yet).
+                Request::Tune(i) => {
+                    if let Some(&(_, tsid, sid)) =
+                        usize::try_from(i).ok().and_then(|i| st.services.get(i))
+                        && Some(tsid) == st.ts_id
+                    {
+                        self.tune = Some(sid);
+                    }
+                }
             }
         }
         if let Some(e) = &engine.error {
@@ -171,6 +214,11 @@ impl RedButton {
                 None => self.texture = Some(ctx.load_texture("mheg", img, TextureOptions::LINEAR)),
             }
         }
+    }
+
+    /// The service the application asked to be tuned to, once.
+    pub fn take_tune(&mut self) -> Option<u16> {
+        self.tune.take()
     }
 
     /// Draw the canvas over the picture's `rect`.

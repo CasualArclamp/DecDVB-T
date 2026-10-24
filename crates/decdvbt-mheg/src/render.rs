@@ -552,7 +552,8 @@ impl FontAttrs {
         let size = size.unwrap_or(24).clamp(6, 200);
         FontAttrs {
             size: size as f32,
-            line_spacing: ls.unwrap_or(size * 9 / 8 + 1).max(1),
+            // 0 ("plain.36.0.0") means the font's own spacing.
+            line_spacing: ls.filter(|&l| l > 0).unwrap_or(size * 9 / 8 + 1),
             letter_spacing: sp.unwrap_or(0),
         }
     }
@@ -614,6 +615,7 @@ mod tests {
             }
         );
         assert_eq!(FontAttrs::parse(b"31").size, 31.0);
+        assert_eq!(FontAttrs::parse(b"plain.36.0.0").line_spacing, 41);
     }
 
     #[test]

@@ -96,8 +96,10 @@ pub struct Service {
     pub original_network_id: u16,
     pub transport_stream_id: u16,
     pub service_id: u16,
-    /// Other services: (index, "dvb://onid.tsid.sid").
-    pub services: Vec<String>,
+    /// The services the receiver can tune, this one among them, as
+    /// (original network, transport stream, service): a service's index is
+    /// its place here (GetServiceIndex, TuneIndex).
+    pub services: Vec<(u16, u16, u16)>,
 }
 
 /// One frame of the action stack: a sequence, where it has got to, and the
@@ -252,6 +254,16 @@ impl Engine {
     /// The application is running and has a scene.
     pub fn has_scene(&self) -> bool {
         self.scene.is_some()
+    }
+
+    /// Nothing to do until a key, a timer or the carousel: no action waiting
+    /// for a file, no content awaited, no event queued.
+    pub fn is_idle(&self) -> bool {
+        self.stack.is_empty()
+            && self.blocked.is_none()
+            && self.awaiting.is_empty()
+            && self.events.is_empty()
+            && self.delayed.is_empty()
     }
 
     /// The visibles being drawn, bottom first: (object, class, position,

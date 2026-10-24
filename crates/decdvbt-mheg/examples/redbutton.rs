@@ -49,11 +49,17 @@ fn carousel_from_ts(path: &Path, sid: u16) -> (ObjectCarousel, decdvbt_mheg::Ser
     let oc = oc.expect("the service has no carousel");
     let (done, all) = oc.progress();
     eprintln!("carousel: {done} of {all} modules");
+    let (onid, tsid) = (an.original_network_id.unwrap_or(0), an.ts_id.unwrap_or(0));
     let service = decdvbt_mheg::Service {
-        original_network_id: an.original_network_id.unwrap_or(0),
-        transport_stream_id: an.ts_id.unwrap_or(0),
+        original_network_id: onid,
+        transport_stream_id: tsid,
         service_id: sid,
-        services: Vec::new(),
+        services: an
+            .programmes
+            .keys()
+            .map(|&s| (onid, tsid, s))
+            .chain(an.others.values().map(|o| (onid, o.ts_id, o.number)))
+            .collect(),
     };
     (oc, service)
 }
@@ -145,6 +151,9 @@ fn main() {
             .as_ref()
             .map_or(String::new(), |x| format!(", error: {x}"))
     );
+    for r in &e.requests {
+        eprintln!("  request: {r:?}");
+    }
     for s in e.shown() {
         eprintln!("  shown: {s}");
     }
