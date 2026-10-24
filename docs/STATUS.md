@@ -887,9 +887,7 @@ continuity jump and no bad section; `decdvbt decode --plp N` picks a PLP.
 **Known gaps and next steps.** MISO, FEF, T2-Lite and
 TIME_IL_TYPE 1 are not decoded, and only one PLP at a time. `decdvbt scan --classify 5` tunes each channel that looks like digital TV and
 says DVB-T or DVB-T2 and its mode (live: C22, C23, C25, C26 and C28 are DVB-T,
-C30 DVB-T2 256-QAM 2/3 rotated). The Maps tab and the channel sounder are DVB-T's (the Channel
-and Maps tabs say so while a T2 signal is locked; the Scopes and History tabs
-show T2's channel). The channel's moving echoes at 32K are followed frame by
+C30 DVB-T2 256-QAM 2/3 rotated). The Channel and Maps tabs work on T2 too (see below). The channel's moving echoes at 32K are followed frame by
 frame, not within one.
 
 ## The UK guide's compressed text (2026-10-24)
@@ -932,3 +930,35 @@ modules come in (720 kB), 88 files: `/a` (the application, ASN.1 MHEG-5),
 `/s/init.mhg` and other scenes, `/g/*.png`, configuration in `/d/r/*.cf`. Five
 unit tests on synthetic carousels (two modules, one compressed; out-of-order
 blocks; a new module version; TS packetised; a stream event).
+
+## The channel sounder and the maps on DVB-T2 (2026-10-24)
+
+Asked for: the Channel and Maps tabs for a T2 lock (they said "DVB-T only").
+
+- **Sounding from the receiver's own estimates** (`decdvbt-rx::t2::sounding`):
+  the T2 frame equaliser already has the channel at every node of the pilot
+  lattice (every D_x-th carrier) at every data symbol. While the sounder is
+  asked for, it hands out one row every D_y symbols. The rows have the
+  window's early start taken out (a phase ramp, so the main path sits at 0 µs),
+  each frame is turned to continue the last frame's final row (a common phase
+  and a slope, as the in-frame alignment does symbol to symbol), and the rows
+  are spread evenly in time across the P1/P2 gap by linear interpolation. They
+  feed the same `ChannelHistory`, fading rows and status as DVB-T's sounder;
+  a `Sounding` trait lets the engine publish either. While T2 has the lock,
+  DVB-T's sounder rests. The cost is a copy of the frame's channel: sounder
+  0.4–1.2 % (the maps once a second), decoder unchanged.
+- **`sounder::Geometry`** now names its FFT size and guard as text, keeps
+  DVB-T's own types in `dvbt`, and has `pilot_step` (12 for DVB-T, D_x for T2).
+- **Rotated constellations on the grid**: the scopes' data cells and the error
+  maps take one FEC block's points, with the interleavers undone, each point's
+  I and Q rejoined from its two cells (the cyclic Q delay) and turned back by
+  the rotation angle (`t2::plp::first_block_points`). The data scope shows
+  256-QAM's grid ("rotated (shown turned back)"), and the error cloud and MER
+  per point work for T2. The error maps are keyed by grid size, not by DVB-T's
+  `Modulation`.
+- Test: `crates/decdvbt-rx/tests/t2_sounding.rs` (8K PP4, an echo 6 µs on,
+  −6 dB, moving at +8 Hz: found at its delay and Doppler, nothing at the
+  mirror). On C30 the map shows the main path and short echoes within 5 µs.
+- A T2 signal with decoding off gets DVB-T's sounder, which says no DVB-T was
+  found and to turn decoding on.
+

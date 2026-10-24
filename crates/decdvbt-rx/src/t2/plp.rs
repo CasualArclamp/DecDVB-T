@@ -70,6 +70,40 @@ impl PlpParams {
     }
 }
 
+/// The first FEC block's constellation points from a frame's cells, `blocks`
+/// blocks of the PLP from `start`: the interleavers undone, and for a
+/// rotated constellation each point's I from its cell and Q from the next
+/// (EN 302 755 §6.1.5's cyclic Q delay), turned back by the rotation's angle.
+/// For the display: false if the cells do not reach.
+pub fn first_block_points(
+    params: &PlpParams,
+    ci: &CellInterleaver,
+    cells: &[Iq],
+    start: usize,
+    blocks: usize,
+    out: &mut Vec<Iq>,
+) -> bool {
+    let cs = params.cells_per_block();
+    let Some(&f) = ti_block_sizes(blocks, params.ti_blocks, false).first() else {
+        return false;
+    };
+    if blocks == 0 || start + f * cs > cells.len() {
+        return false;
+    }
+    let shift = ci.shifts(f)[0];
+    let (mut a, mut b) = (vec![Iq::new(0.0, 0.0); cs], vec![Iq::new(0.0, 0.0); cs]);
+    let src = &cells[start..start + f * cs];
+    ci.deinterleave_block(src, src, f, 0, shift, params.ti_blocks != 0, &mut a, &mut b);
+    out.clear();
+    if !params.rotated {
+        out.extend_from_slice(&a);
+        return true;
+    }
+    let back = Iq::from_polar(1.0, -params.qam.rotation_deg().to_radians() as f32);
+    out.extend((0..cs).map(|j| Iq::new(a[j].re, a[(j + 1) % cs].im) * back));
+    true
+}
+
 /// What decoding a frame's blocks did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrameStats {

@@ -24,7 +24,9 @@ use crate::symbol::PAD;
 use crate::t2::frame::{Demod, Geometry, SymbolFft, cp_peak, p2_equalise};
 use crate::t2::p1det;
 use crate::t2::pipe::{Done, FecPipe, Job};
-use crate::t2::plp::PlpParams;
+use crate::t2::plp::{PlpParams, first_block_points};
+use crate::t2::sounding::{FrameRows, T2Sounder};
+use decdvbt_fec::t2::timeint::CellInterleaver;
 use crate::window::Window;
 
 /// The signal's sample rate for 8 MHz channels, Hz.
@@ -201,6 +203,11 @@ pub struct T2Receiver {
     measure_state: MeasureState,
     heat_rate: f64,
     heat: Vec<Measurements>,
+    /// The channel sounder's rows from each frame, while asked for.
+    sounder: Option<T2Sounder>,
+    /// The cell interleaver of the PLP the scopes' cells were last read
+    /// from (made again if its coding changes).
+    scope_ci: Option<(PlpParams, CellInterleaver)>,
 }
 
 /// A frame's channel estimate at its middle symbol, for the display.
@@ -250,6 +257,8 @@ impl T2Receiver {
             measure_state: MeasureState::default(),
             heat_rate: 0.0,
             heat: Vec::new(),
+            sounder: None,
+            scope_ci: None,
         }
     }
 
@@ -293,6 +302,19 @@ impl T2Receiver {
         out.append(&mut self.heat);
     }
 
+    /// Make the channel sounder's rows from each frame while on (see
+    /// [`crate::t2::sounding`]): they cost a copy of the frame's channel.
+    pub fn set_sounding(&mut self, on: bool) {
+        if on != self.sounder.is_some() {
+            self.sounder = on.then(|| T2Sounder::new(FS_NATIVE));
+        }
+    }
+
+    /// The channel sounder, while it is on.
+    pub fn sounder(&mut self) -> Option<&mut T2Sounder> {
+        self.sounder.as_mut()
+    }
+
     /// The channel as the last frame's estimate has it (gain and
     /// signal-to-noise ratio across the band, the impulse response and its
     /// echoes), or `None` with no lock.
@@ -329,6 +351,9 @@ impl T2Receiver {
         self.status.tracking = false;
         self.status.l1_ok = false;
         self.status.decoding = false;
+        if let Some(s) = &mut self.sounder {
+            s.reset();
+        }
     }
 
     /// Transport packets (188 bytes each) decoded since the last call.
@@ -409,6 +434,9 @@ impl T2Receiver {
         self.status.tracking = false;
         self.status.l1_ok = false;
         self.status.decoding = false;
+        if let Some(s) = &mut self.sounder {
+            s.reset();
+        }
     }
 
     // ---- acquisition ------------------------------------------------------
@@ -748,6 +776,7 @@ impl T2Receiver {
         self.status.l1post = Some(post.clone());
 
         let scope = std::mem::take(&mut self.scope_wanted);
+        t.demod.sounding = self.sounder.is_some();
         let data = t.demod.data_cells(&mut carriers, scope);
         self.status.profile.equalise += t_eq.elapsed();
         {
@@ -765,6 +794,20 @@ impl T2Receiver {
         };
         self.status.snr_db = data.snr_db;
         let c_data = t.demod.carriers.data_cells();
+        if let Some(s) = &mut self.sounder {
+            s.push_frame(&FrameRows {
+                geo: &t.geo,
+                nodes: t.demod.nodes(),
+                data_cells: c_data,
+                rows: &data.node_rows,
+                symbols: &data.node_symbols,
+                // This frame's P1 in the signal's samples: the stream's
+                // place over the radio's samples a signal's sample.
+                p1_at: (t.next_p1 + (p1 - MARGIN as f64) * t.step) / t.step,
+                cfo_hz: t.cfo_hz,
+                clock_ppm: (t.step / self.rho - 1.0) * 1e6,
+            });
+        }
         let mid_symbol = (data.cells.len() / c_data.max(1)) / 2;
         if scope && let Some(plp) = self.status.plp {
             let cells = data.cells
@@ -827,11 +870,37 @@ impl T2Receiver {
                 let mut var = lvar;
                 cells.extend_from_slice(&data.cells);
                 var.extend_from_slice(&data.var);
+                let start = PRE_CELLS + t.l1pre.l1_post_size as usize + dynamic.plp_start as usize;
+                // A rotated constellation's cells are spread over stripes:
+                // the scopes show one FEC block's points instead, each put
+                // back together from its two cells and turned back.
+                if scope
+                    && params.rotated
+                    && let Some(sc) = &mut self.scopes
+                {
+                    if self.scope_ci.as_ref().is_none_or(|(p, _)| *p != params) {
+                        self.scope_ci =
+                            Some((params, CellInterleaver::new(params.frame, params.qam)));
+                    }
+                    let (_, ci) = self.scope_ci.as_ref().expect("made above");
+                    let mut pts = Vec::new();
+                    if first_block_points(
+                        &params,
+                        ci,
+                        &cells,
+                        start,
+                        dynamic.plp_num_blocks as usize,
+                        &mut pts,
+                    ) {
+                        sc.data = thin(pts.into_iter(), 3000);
+                        sc.derotated = true;
+                    }
+                }
                 let job = Job {
                     params,
                     cells,
                     var,
-                    start: PRE_CELLS + t.l1pre.l1_post_size as usize + dynamic.plp_start as usize,
+                    start,
                     blocks: dynamic.plp_num_blocks as usize,
                     period: Duration::from_secs_f64(t.geo.frame_samples() as f64 / FS_NATIVE),
                 };

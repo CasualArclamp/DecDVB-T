@@ -35,7 +35,8 @@ const DECAY: f32 = 0.9;
 
 #[derive(Default)]
 pub struct ErrorMaps {
-    modulation: Option<Modulation>,
+    /// The constellation's grid: points a side, and its name.
+    modulation: Option<(usize, &'static str)>,
     /// Per constellation point (row-major, Q from the top): Σ|e|² and the
     /// cells, decayed.
     sum: Vec<f32>,
@@ -48,13 +49,33 @@ pub struct ErrorMaps {
 }
 
 /// The side of the constellation's grid, and the factor that takes a unit-
-/// power cell to the odd-integer grid.
-fn grid(m: Modulation) -> (usize, f32) {
-    match m {
-        Modulation::Qpsk => (2, 2f32.sqrt()),
-        Modulation::Qam16 => (4, 10f32.sqrt()),
-        Modulation::Qam64 => (8, 42f32.sqrt()),
+/// power cell to the odd-integer grid: √(2(side² − 1)/3) for square QAM.
+fn grid(m: (usize, &'static str)) -> (usize, f32) {
+    let side = m.0;
+    (side, ((2 * (side * side - 1)) as f32 / 3.0).sqrt())
+}
+
+/// The grid a snapshot's data cells are on: DVB-T's constellation, or a T2
+/// one (a rotated one only once put back together and turned back).
+fn grid_of(s: &Scopes) -> Option<(usize, &'static str)> {
+    if let Some(m) = s.modulation {
+        return Some(match m {
+            Modulation::Qpsk => (2, "QPSK"),
+            Modulation::Qam16 => (4, "16-QAM"),
+            Modulation::Qam64 => (8, "64-QAM"),
+        });
     }
+    let (bits, rotated) = s.t2_qam?;
+    if rotated && !s.derotated {
+        return None;
+    }
+    Some(match bits {
+        2 => (2, "QPSK"),
+        4 => (4, "16-QAM"),
+        6 => (8, "64-QAM"),
+        8 => (16, "256-QAM"),
+        _ => return None,
+    })
 }
 
 /// The index (0..side) of the grid level nearest `v` (in cell units).
@@ -75,7 +96,7 @@ impl ErrorMaps {
 
     /// Add a snapshot's data cells.
     pub fn add(&mut self, s: &Scopes) {
-        let Some(m) = s.modulation else { return };
+        let Some(m) = grid_of(s) else { return };
         if s.data.is_empty() {
             return;
         }
@@ -241,7 +262,7 @@ impl ErrorMaps {
         p.rect_filled(rect, CornerRadius::ZERO, PANEL_BG);
         let font = FontId::monospace(11.0);
         let title = self.modulation.map_or("MER per point".to_string(), |m| {
-            format!("MER per point, dB ({})", m.name())
+            format!("MER per point, dB ({})", m.1)
         });
         p.text(
             rect.left_top() + vec2(4.0, 1.0),
@@ -339,7 +360,7 @@ mod tests {
 
     #[test]
     fn the_nearest_level_and_its_value_round_trip() {
-        let (side, norm) = grid(Modulation::Qam64);
+        let (side, norm) = grid((8, "64-QAM"));
         for i in 0..side {
             assert_eq!(nearest(level(i, side, norm), side, norm), i);
         }
@@ -350,7 +371,7 @@ mod tests {
 
     #[test]
     fn noise_that_grows_with_amplitude_shows_in_the_outer_points() {
-        let (side, norm) = grid(Modulation::Qam16);
+        let (side, norm) = grid((4, "16-QAM"));
         let mut maps = ErrorMaps::default();
         // Cells at each point with an error 0.02 at the inner four, 0.08 at the
         // outer twelve, in a fixed direction.

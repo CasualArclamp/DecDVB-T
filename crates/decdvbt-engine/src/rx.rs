@@ -22,7 +22,7 @@ use decdvbt_rx::auto::{AutoReceiver, Standard};
 use decdvbt_rx::delay_doppler::{DelayDoppler, FreqDoppler};
 use decdvbt_rx::receiver::ReceiverStatus;
 use decdvbt_rx::scope::{Measurements, Scopes};
-use decdvbt_rx::sounder::{Sounder, SounderConfig, Status as SounderStatus};
+use decdvbt_rx::sounder::{Sounder, SounderConfig, Sounding, Status as SounderStatus};
 use decdvbt_rx::t2::receiver::T2Status;
 use decdvbt_ts::Epg;
 
@@ -440,9 +440,11 @@ fn run(
         let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
         Sounder::new(SounderConfig::new(rate, offset))
     };
-    let new_decoder = |vfo_hz: f64, centre: f64, rate: f64, heat: Option<f64>| {
+    let new_decoder = |vfo_hz: f64, centre: f64, rate: f64, heat: Option<f64>, sound: bool| {
         let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
         let mut d = AutoReceiver::new(rate, offset);
+        // A T2 lock's sounder is the receiver's own (DVB-T's cannot read it).
+        d.set_sounding(sound);
         // A file is held to real time here too.
         d.set_realtime(true);
         d.set_heat(heat.unwrap_or(0.0));
@@ -455,10 +457,21 @@ fn run(
                 Ok(Command::Sounder(vfo)) => {
                     sounder = vfo.map(|v| (new_sounder(v, source.center_freq(), rate), v));
                     *sh.sounder.lock().unwrap() = SounderOut::default();
+                    if let Some((d, _)) = &mut decoder {
+                        d.set_sounding(sounder.is_some());
+                    }
                 }
                 Ok(Command::Decode(vfo)) => {
-                    decoder =
-                        vfo.map(|v| (new_decoder(v, source.center_freq(), rate, heat_rate), v));
+                    decoder = vfo.map(|v| {
+                        let d = new_decoder(
+                            v,
+                            source.center_freq(),
+                            rate,
+                            heat_rate,
+                            sounder.is_some(),
+                        );
+                        (d, v)
+                    });
                     *sh.decoder.lock().unwrap() = DecoderOut::default();
                     ts_scratch.clear();
                     feeder.reset();
@@ -489,7 +502,13 @@ fn run(
                             *s = new_sounder(*v, source.center_freq(), rate);
                         }
                         if let Some((d, v)) = &mut decoder {
-                            *d = new_decoder(*v, source.center_freq(), rate, heat_rate);
+                            *d = new_decoder(
+                                *v,
+                                source.center_freq(),
+                                rate,
+                                heat_rate,
+                                sounder.is_some(),
+                            );
                             ts_scratch.clear();
                             feeder.reset();
                         }
@@ -564,10 +583,25 @@ fn run(
         }
         meter.time(Stage::FrontEnd, || front.apply(&mut block));
 
+        // While DVB-T2 has the lock its receiver sounds the channel from its
+        // own estimates; DVB-T's sounder would only fail to lock, so it rests.
+        let t2_locked = decoder
+            .as_ref()
+            .is_some_and(|(d, _)| d.standard() == Standard::Dvbt2);
         if let Some((s, _)) = &mut sounder {
-            meter.time(Stage::Sounder, || s.push(&block, at));
+            if !t2_locked {
+                meter.time(Stage::Sounder, || s.push(&block, at));
+            }
             if sounder_pub.elapsed() >= pace.publish {
                 sounder_pub = Instant::now();
+                let s: &mut dyn Sounding = match decoder
+                    .as_mut()
+                    .filter(|_| t2_locked)
+                    .and_then(|(d, _)| d.t2_sounder())
+                {
+                    Some(t2) => t2,
+                    None => s,
+                };
                 // The map is made once a second, and only while locked.
                 let map = (map_at.elapsed() >= Duration::from_secs(1)).then(|| {
                     map_at = Instant::now();

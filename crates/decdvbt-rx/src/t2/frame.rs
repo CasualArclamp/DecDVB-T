@@ -118,6 +118,9 @@ struct TimeTap {
 pub struct Demod {
     pub geo: Geometry,
     pub prof: DemodProfile,
+    /// Hand out the lattice's values for the channel sounder (see
+    /// [`Equalised::node_rows`]).
+    pub sounding: bool,
     pub carriers: Carriers,
     reference: Reference,
     fft: SymbolFft,
@@ -265,6 +268,7 @@ impl Demod {
         }
         Demod {
             prof: DemodProfile::default(),
+            sounding: false,
             reference,
             fft: SymbolFft::new(geo.n),
             fi_p2: FreqInterleaver::new(mode.fft, carriers.p2_cells()),
@@ -385,9 +389,19 @@ pub struct Equalised {
     /// read, and its pilots equalised and normalised to ±1.
     pub scope_raw: Vec<Iq>,
     pub scope_pilots: Vec<Iq>,
+    /// For the channel sounder, when [`Demod::sounding`] is on: the channel
+    /// at every node of the pilot lattice ([`Demod::nodes`]) at every D_y-th
+    /// data symbol, symbol after symbol, and those symbols (in the frame).
+    pub node_rows: Vec<Iq>,
+    pub node_symbols: Vec<usize>,
 }
 
 impl Demod {
+    /// The carriers of the scattered pilots' lattice: every D_x-th.
+    pub fn nodes(&self) -> &[usize] {
+        &self.nodes
+    }
+
     /// All the symbols' carriers (`symbols · c_ps`, symbol by symbol).
     pub fn all_carriers(&mut self, y: &[Iq], t: &Timing) -> Vec<Iq> {
         let t0 = Instant::now();
@@ -542,6 +556,7 @@ impl Demod {
         let mut sym_snr: Vec<f32> = Vec::new();
         let mut own: Vec<f32> = Vec::new();
         let (mut scope_raw, mut scope_pilots) = (Vec::new(), Vec::new());
+        let (mut node_rows, mut node_symbols) = (Vec::new(), Vec::new());
         for j in first..last {
             let rel = j - first;
             for m in 0..n_nodes {
@@ -555,6 +570,19 @@ impl Demod {
                 }
                 pad_re[m + KERNEL_HALF] = re;
                 pad_im[m + KERNEL_HALF] = im;
+            }
+            // A node's value at a symbol is a cubic through its four
+            // nearest sightings (D_y symbols apart): one row every D_y
+            // symbols holds all there is of the channel's changes.
+            if self.sounding && rel.is_multiple_of(dy) {
+                let at = KERNEL_HALF..KERNEL_HALF + n_nodes;
+                node_rows.extend(
+                    pad_re[at.clone()]
+                        .iter()
+                        .zip(&pad_im[at])
+                        .map(|(&re, &im)| Iq::new(re, im)),
+                );
+                node_symbols.push(j);
             }
             self.interpolate_frequency(&mut pad_re, &mut pad_im, n_nodes, &mut hr, &mut hi);
             if j == (first + last) / 2 {
@@ -669,6 +697,8 @@ impl Demod {
             noise: vy,
             scope_raw,
             scope_pilots,
+            node_rows,
+            node_symbols,
         })
     }
 

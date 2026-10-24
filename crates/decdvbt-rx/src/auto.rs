@@ -150,6 +150,20 @@ impl AutoReceiver {
         self.t2.set_heat(rows_per_s);
     }
 
+    /// Make the channel sounder's rows from a DVB-T2 lock's frames while on
+    /// (DVB-T has a sounder of its own, [`crate::sounder`]).
+    pub fn set_sounding(&mut self, on: bool) {
+        self.t2.set_sounding(on);
+    }
+
+    /// The T2 lock's channel sounder, while it is on and T2 has the lock.
+    pub fn t2_sounder(&mut self) -> Option<&mut crate::t2::sounding::T2Sounder> {
+        match self.standard {
+            Standard::Dvbt2 => self.t2.sounder(),
+            _ => None,
+        }
+    }
+
     pub fn take_heat(&mut self, out: &mut Vec<Measurements>) {
         self.t.take_heat(out);
         self.t2.take_heat(out);

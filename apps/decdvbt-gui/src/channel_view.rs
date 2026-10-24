@@ -144,8 +144,8 @@ impl ChannelView {
                         RichText::new(format!(
                             "locked · {} {} guard · carrier {:+.2} kHz · clock {:+.1} ppm · \
                              coherence {:.2}",
-                            g.fft.name(),
-                            g.guard.name(),
+                            g.fft_name,
+                            g.guard_name,
                             s.cfo_hz / 1e3,
                             s.clock_ppm,
                             s.coherence
@@ -157,14 +157,14 @@ impl ChannelView {
                     ui.label(
                         RichText::new(format!(
                             "no DVB-T here (best cyclic-prefix contrast {:.1}, a lock needs 5): \
-                             another standard, or too weak",
+                             too weak, or DVB-T2 (sounded by its receiver: turn decoding on)",
                             s.contrast
                         ))
                         .color(AMBER),
                     );
                 }
                 _ => {
-                    ui.label(RichText::new("searching for a DVB-T signal…").weak());
+                    ui.label(RichText::new("searching for a signal…").weak());
                 }
             }
         });

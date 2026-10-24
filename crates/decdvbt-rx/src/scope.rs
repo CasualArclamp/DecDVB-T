@@ -41,6 +41,9 @@ pub struct Scopes {
     /// rotated (then `modulation` is `None`), and the level the pilots are
     /// normalised to (4/3 for DVB-T).
     pub t2_qam: Option<(u8, bool)>,
+    /// A rotated T2 constellation's `data` are its points put back together
+    /// from their two cells and turned back: on the square grid.
+    pub derotated: bool,
     pub pilot_mark: Option<f32>,
     /// The symbol's number since the lock.
     pub symbol: u64,
@@ -73,6 +76,7 @@ pub fn snapshot(
     };
     Scopes {
         t2_qam: None,
+        derotated: false,
         pilot_mark: None,
         raw: thin(raw.iter().copied(), MAX_POINTS),
         data: thin(

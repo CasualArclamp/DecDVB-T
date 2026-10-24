@@ -806,9 +806,10 @@ impl App {
     /// CPU only while it runs).
     fn sync_sounder(&mut self) {
         let Some(s) = &self.session else { return };
-        // The sounder is DVB-T's: a DVB-T2 lock has the scopes' and the
-        // history's channel plots instead, and the sounder's CPU is saved.
-        let want = (self.show_channel() && self.standard != Standard::Dvbt2)
+        // On a DVB-T2 lock the engine sounds the channel from the T2
+        // receiver's own estimates (the decoder has to be on for that).
+        let want = self
+            .show_channel()
             .then(|| {
                 self.vfo_hz
                     .or((self.centre_hz > 0.0).then_some(self.centre_hz))
@@ -1449,10 +1450,10 @@ impl App {
         });
         let mut mode = read.or(self.opts.assume);
         if read.is_none()
-            && let (Some(m), Some(g)) = (&mut mode, locked)
+            && let (Some(m), Some((fft, guard))) = (&mut mode, locked.and_then(|g| g.dvbt))
         {
-            m.fft = g.fft;
-            m.guard = g.guard;
+            m.fft = fft;
+            m.guard = guard;
         }
         if let (Standard::Dvbt2, Some(t2), true) = (self.standard, &self.dec2, self.decode) {
             return self.t2_card(t2);
@@ -1957,21 +1958,13 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         // The panel is as tall as its content asks.
                         ui.set_min_height(CHANNEL_PANEL_H);
-                        if self.standard == Standard::Dvbt2 {
-                            t2_note(ui);
-                        } else {
-                            self.chan_view.show(ui);
-                        }
+                        self.chan_view.show(ui);
                     });
             }
             Bottom::Maps => {
                 egui::Panel::bottom("maps").resizable(false).show(ui, |ui| {
                     ui.set_min_height(CHANNEL_PANEL_H);
-                    if self.standard == Standard::Dvbt2 {
-                        t2_note(ui);
-                    } else {
-                        self.chan_view.show_maps(ui, &mut self.errors);
-                    }
+                    self.chan_view.show_maps(ui, &mut self.errors);
                 });
             }
             Bottom::Scopes => {
@@ -2089,21 +2082,17 @@ impl eframe::App for App {
 /// the FFT size and the guard interval, and what follows from them.
 fn lock_details(g: &Geometry, cfo_hz: f64) -> Vec<(String, String)> {
     let kv = |k: &str, v: String| (k.to_string(), v);
-    let useful_us = g.fft.n() as f64 / (g.carrier_spacing_hz * g.fft.n() as f64) * 1e6;
+    let useful_us = 1e6 / g.carrier_spacing_hz;
     vec![
-        kv("FFT size", g.fft.name().to_string()),
-        kv(
-            "guard",
-            format!("{} ({:.0} µs)", g.guard.name(), g.guard_us),
-        ),
+        kv("FFT size", g.fft_name.to_string()),
+        kv("guard", format!("{} ({:.0} µs)", g.guard_name, g.guard_us)),
         kv("symbol", format!("{:.0} µs", g.symbol_s * 1e6)),
         kv("useful", format!("{useful_us:.0} µs")),
         kv(
             "carriers",
             format!(
                 "{} ({} data)",
-                g.fft.active_carriers(),
-                g.fft.data_carriers()
+                g.active_carriers, g.data_carriers
             ),
         ),
         kv("carrier offset", format!("{:+.2} kHz", cfo_hz / 1e3)),
@@ -2111,19 +2100,6 @@ fn lock_details(g: &Geometry, cfo_hz: f64) -> Vec<(String, String)> {
 }
 
 /// A mode's parameters for the signal card, as label / value pairs.
-/// What the channel and map panels say while a DVB-T2 signal is locked: their
-/// sounder reads DVB-T's pilots only.
-fn t2_note(ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new("DVB-T2 locked").strong());
-    ui.label(
-        egui::RichText::new(
-            "The channel sounder and the maps read DVB-T. The scopes tab shows this signal's              channel (its gain and signal-to-noise ratio across the band, its echoes) from              T2's own pilots, and the history tab how it moves.",
-        )
-        .weak(),
-    );
-}
-
 fn mode_details(m: &Mode) -> Vec<(String, String)> {
     let kv = |k: &str, v: String| (k.to_string(), v);
     let mut d = vec![

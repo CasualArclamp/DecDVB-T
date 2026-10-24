@@ -102,8 +102,8 @@ pub fn run(a: SoundArgs) -> Result<()> {
     };
     println!(
         "locked: {} guard {}, {} pilots a row, {} rows ({:.0} a second), {} lock(s)",
-        g.fft.name(),
-        g.guard.name(),
+        g.fft_name,
+        g.guard_name,
         g.columns,
         st.rows,
         1.0 / g.row_s,

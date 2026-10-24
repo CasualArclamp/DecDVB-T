@@ -63,13 +63,22 @@ impl SounderConfig {
     }
 }
 
-/// What the rows are rows of.
+/// What the rows are rows of: a DVB-T signal's (this sounder's) or a DVB-T2
+/// signal's (the T2 receiver's, see [`crate::t2::sounding`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
-    pub fft: FftSize,
-    pub guard: Guard,
+    /// "8K", "1/32": the FFT size and the guard interval, as named.
+    pub fft_name: &'static str,
+    pub guard_name: &'static str,
+    /// The same as DVB-T's own types, for a DVB-T signal.
+    pub dvbt: Option<(FftSize, Guard)>,
+    /// Carriers in a symbol, and those of them that carry data.
+    pub active_carriers: usize,
+    pub data_carriers: usize,
     /// Samples of a row (pilots in a symbol).
     pub columns: usize,
+    /// Carriers between columns: 12 for DVB-T, D_x for T2.
+    pub pilot_step: usize,
     /// The carrier of the first column, and the middle carrier (DC).
     pub first_carrier: usize,
     pub mid_carrier: usize,
@@ -83,7 +92,7 @@ pub struct Geometry {
 impl Geometry {
     /// Frequency of column `c` relative to the channel's centre, Hz.
     pub fn column_hz(&self, c: usize) -> f64 {
-        (self.first_carrier as f64 + 12.0 * c as f64 - self.mid_carrier as f64)
+        (self.first_carrier as f64 + (self.pilot_step * c) as f64 - self.mid_carrier as f64)
             * self.carrier_spacing_hz
     }
 }
@@ -105,6 +114,35 @@ pub struct Status {
     pub attempts: u32,
     pub contrast: f32,
     pub locks: u32,
+}
+
+/// What the display reads of a channel sounder, DVB-T's or DVB-T2's.
+///
+/// Rust note: a trait is a set of methods several types provide, so that
+/// code can take "any sounder" (`&mut dyn Sounding`) and not care which.
+pub trait Sounding {
+    fn status(&self) -> Status;
+    /// Fading rows made since the last call: |H|² in dB at each pilot.
+    fn take_fading(&mut self, out: &mut Vec<Vec<f32>>);
+    /// The delay–Doppler map of the last few seconds' rows.
+    fn delay_doppler(&mut self) -> Option<&DelayDoppler>;
+    /// The Doppler spectrum at each carrier over the same rows.
+    fn freq_doppler(&mut self) -> Option<&FreqDoppler>;
+}
+
+impl Sounding for Sounder {
+    fn status(&self) -> Status {
+        Sounder::status(self)
+    }
+    fn take_fading(&mut self, out: &mut Vec<Vec<f32>>) {
+        Sounder::take_fading(self, out)
+    }
+    fn delay_doppler(&mut self) -> Option<&DelayDoppler> {
+        Sounder::delay_doppler(self)
+    }
+    fn freq_doppler(&mut self) -> Option<&FreqDoppler> {
+        Sounder::freq_doppler(self)
+    }
 }
 
 struct Want {
@@ -323,9 +361,13 @@ impl Sounder {
         self.status.rows = 0;
         self.status.attempts = 0;
         self.status.geometry = Some(Geometry {
-            fft,
-            guard: l.guard,
+            fft_name: fft.name(),
+            guard_name: l.guard.name(),
+            dvbt: Some((fft, l.guard)),
+            active_carriers: fft.active_carriers(),
+            data_carriers: fft.data_carriers(),
             columns: (3 * phase..k_total).step_by(12).count(),
+            pilot_step: 12,
             first_carrier: 3 * phase,
             mid_carrier: (k_total - 1) / 2,
             carrier_spacing_hz: df,
@@ -497,7 +539,7 @@ mod tests {
         let st = s.status();
         assert!(st.tracking, "{st:?}");
         let g = st.geometry.unwrap();
-        assert_eq!((g.fft, g.guard), (FftSize::K8, Guard::G1_32));
+        assert_eq!(g.dvbt, Some((FftSize::K8, Guard::G1_32)));
         assert_eq!(g.columns, 568);
         assert!((st.cfo_hz - 337_000.0).abs() < 300.0, "cfo {}", st.cfo_hz);
         // The clock offset follows to ~1 ppm on a clean channel; an echo makes
@@ -579,7 +621,7 @@ mod tests {
         let st = s.status();
         assert!(st.tracking, "{st:?}");
         let g = st.geometry.unwrap();
-        assert_eq!((g.fft, g.guard), (FftSize::K2, Guard::G1_4));
+        assert_eq!(g.dvbt, Some((FftSize::K2, Guard::G1_4)));
         // 142 or 143 pilots a row, by the scattered phase of the symbols read.
         assert!((142..=143).contains(&g.columns), "{}", g.columns);
         assert!((st.cfo_hz + 45_000.0).abs() < 300.0, "{}", st.cfo_hz);

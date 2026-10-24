@@ -9,9 +9,11 @@
 //! - [`pipe`]: the FEC stage on a thread of its own.
 //! - [`receiver`]: acquisition, tracking, and the whole receive chain.
 //! - [`p1det`]: finding P1 symbols, reading S1 and S2 and the carrier offset.
+//! - [`sounding`]: the channel sounder's rows from the equaliser's estimates.
 
 pub mod frame;
 pub mod p1det;
 pub mod pipe;
 pub mod plp;
 pub mod receiver;
+pub mod sounding;

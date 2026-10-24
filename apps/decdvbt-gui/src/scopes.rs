@@ -152,6 +152,8 @@ pub struct ScopeView {
     /// A DVB-T2 signal's constellation (bits a cell, rotated) and the level
     /// its pilots sit at.
     t2: Option<(u8, bool)>,
+    /// The T2 cells shown are a rotated constellation's, turned back.
+    derotated: bool,
     pilot_mark: f32,
     seen: bool,
     measurements: Option<Arc<Measurements>>,
@@ -168,6 +170,7 @@ impl Default for ScopeView {
             pending: Vec::new(),
             modulation: None,
             t2: None,
+            derotated: false,
             pilot_mark: 4.0 / 3.0,
             seen: false,
             measurements: None,
@@ -198,12 +201,14 @@ impl ScopeView {
             self.scopes[1].add(&s.pilots, Some(1.0));
             self.scopes[2].add(&s.data, Some(1.0));
             self.modulation = s.modulation;
-            self.t2 = s.t2_qam;
+            // A rotated constellation put back together is on the grid.
+            self.t2 = s.t2_qam.map(|(b, rot)| (b, rot && !s.derotated));
+            self.derotated = s.derotated;
             self.pilot_mark = s.pilot_mark.unwrap_or(4.0 / 3.0);
             self.seen = true;
         }
         let modulation = self.modulation;
-        let (t2, pilot_mark) = (self.t2, self.pilot_mark);
+        let (t2, pilot_mark, derotated) = (self.t2, self.pilot_mark, self.derotated);
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Scopes").strong());
             if !self.seen {
@@ -212,7 +217,14 @@ impl ScopeView {
                 let mut bits = Vec::new();
                 bits.extend(modulation.map(|m| m.name().to_string()));
                 bits.extend(t2.map(|(b, rot)| {
-                    format!("{}-QAM{}", 1u32 << b, if rot { " rotated" } else { "" })
+                    let how = if rot {
+                        " rotated"
+                    } else if derotated {
+                        " rotated (shown turned back)"
+                    } else {
+                        ""
+                    };
+                    format!("{}-QAM{how}", 1u32 << b)
                 }));
                 if st.decoding && st.snr_db.is_finite() {
                     bits.push(format!("MER {:.1} dB", st.snr_db));
