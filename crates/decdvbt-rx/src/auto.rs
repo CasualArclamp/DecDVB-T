@@ -91,6 +91,7 @@ impl AutoReceiver {
             s.cfo_hz = t2.cfo_hz;
             s.clock_ppm = t2.clock_ppm;
             s.snr_db = t2.snr_db;
+            s.effective_snr_db = t2.effective_snr_db;
             s.locks = t2.locks;
             s.outer = OuterStats {
                 blocks: t2.blocks_ok + t2.blocks_bad,

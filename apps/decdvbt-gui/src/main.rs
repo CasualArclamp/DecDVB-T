@@ -1482,10 +1482,13 @@ impl App {
             ));
             details.push(kv("before RS", format!("{:.1e} BER", o.pre_rs_ber())));
         }
-        // The pilots' signal-to-noise ratio replaces the spectrum's C/N once
-        // decoding: it is the figure the code sees.
-        let (cn_db, cn_source) = if decoding && self.dec.snr_db.is_finite() {
-            (Some(self.dec.snr_db), "MER")
+        // The effective SNR replaces the spectrum's C/N once decoding: the
+        // band's mean SNR flatters a channel with notches, whose faded
+        // carriers are where the errors come from (see
+        // `decdvbt_rx::capacity`). The mean is kept as a detail.
+        let (cn_db, cn_source) = if decoding && self.dec.effective_snr_db.is_finite() {
+            details.push(kv_mer(self.dec.snr_db));
+            (Some(self.dec.effective_snr_db), "effective")
         } else {
             (self.cn_db, "spectrum")
         };
@@ -1505,8 +1508,11 @@ impl App {
 
     /// The card for a DVB-T2 lock.
     fn t2_card(&self, t2: &T2Status) -> card::Card {
-        let c = t2card::card(t2, self.ts_mbps());
-        let measured = t2.decoding && t2.snr_db.is_finite();
+        let mut c = t2card::card(t2, self.ts_mbps());
+        let measured = t2.decoding && t2.effective_snr_db.is_finite();
+        if measured {
+            c.details.push(kv_mer(t2.snr_db));
+        }
         card::Card {
             standard: Some(card::Standard::DvbT2),
             assumed: false,
@@ -1514,11 +1520,11 @@ impl App {
             qef_db: t2.plp.and_then(|p| p.qef_cn_db()),
             details: c.details,
             cn_db: if measured {
-                Some(t2.snr_db)
+                Some(t2.effective_snr_db)
             } else {
                 self.cn_db
             },
-            cn_source: if measured { "MER" } else { "spectrum" },
+            cn_source: if measured { "effective" } else { "spectrum" },
             channel: self.vfo_hz.and_then(uhf_channel_at),
             freq_hz: self.vfo_hz,
             active: self.session.is_some(),
@@ -2078,6 +2084,11 @@ impl eframe::App for App {
         }
         self.frame_cost[1] += t0.elapsed();
     }
+}
+
+/// The card's row for the band's mean SNR (the MER the pilots measure).
+fn kv_mer(snr_db: f32) -> (String, String) {
+    ("MER".to_string(), format!("{snr_db:.1} dB mean"))
 }
 
 /// What the sounder knows of a signal it has locked to, for the signal card:

@@ -170,6 +170,10 @@ pub struct ReceiverStatus {
     /// Signal-to-noise ratio of the data cells, dB: the mean channel power
     /// over the mean noise power the pilots show (once decoding).
     pub snr_db: f32,
+    /// The SNR a Gaussian channel would need to carry what the cells carry,
+    /// dB: below `snr_db` on a channel with notches, and the figure to set
+    /// against the mode's QEF C/N (see [`crate::capacity`]).
+    pub effective_snr_db: f32,
     pub coherence: f32,
     /// Symbols read since the lock, and locks since the start.
     pub symbols: u64,
@@ -618,6 +622,7 @@ impl Receiver {
                     pr.outer += u3 - u2;
                     self.status.outer = c.outer.stats;
                     self.status.snr_db = c.demap.snr_db();
+                    self.status.effective_snr_db = c.demap.effective_snr_db();
                 }
             }
             (Some(_), false) => {

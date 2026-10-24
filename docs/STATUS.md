@@ -1109,3 +1109,31 @@ red key moves to BBC One); font attributes with a line spacing of 0
 Button waits until the application has sat idle in a scene for 1.5 s (the
 BBC's init scene took it and ignored it when the carousel was still coming).
 `DECDVBT_REDBUTTON_TRACE=1` prints the engine's trace from the GUI.
+
+## Effective SNR for the margin (2026-10-24)
+
+Asked for: a margin that does not read "good" while the decode is bad (live
+C23 with deep notches showed +2.3 dB and lost blocks). The band's mean SNR
+flatters a notched channel: the faded carriers' bits are where the errors
+are. `decdvbt-rx::capacity` turns each cell's SNR into the mutual information
+its constellation carries (BICM, Gray square QAM as two PAM axes), averages
+it over the cells, and maps the average back to the SNR of a Gaussian
+channel that carries as much (MIESM). Tables are made once per constellation
+and read by the SNR's float bits (no logarithm per cell); DVB-T measures one
+symbol in four, T2 every eighth cell of a frame, a rotated constellation's
+point at the mean SNR of two cells half a frame apart (its I and Q fade
+apart). The card's margin is now the effective SNR less the QEF C/N; the
+mean is the MER row. The CLI prints both.
+
+| capture | mode | mean | effective | margin | BER before RS |
+|---|---|---|---|---|---|
+| C23 (Oct 23) | 64-QAM 2/3 | 21.5 | 18.0 | +1.5 | 3.4e-6 |
+| C23 (Oct 24, 120 s) | 64-QAM 2/3 | 18.6 | 16.0 | -0.5 | 2.1e-3 |
+| C26 | 64-QAM 2/3 | 19.1 | 17.5 | +1.0 | 1.5e-5 |
+| C28 | 64-QAM 3/4 | 23.7 | 20.0 | +2.0 | 8.9e-7 |
+| C30 (T2) | 256-QAM 2/3 rot | 20.8 | 19.4 | 0.0 | 0 blocks lost, 8.6 LDPC iterations |
+
+The DVB-T QEF figures are EN 300 744's ideal receiver; per-carrier noise
+estimates are noisy, which pulls the average information down a little, so
+the effective SNR leans pessimistic (a clean channel reads 1.5–3.5 dB under
+its mean). It ranks the captures as their error rates do.

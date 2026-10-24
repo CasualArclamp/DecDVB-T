@@ -31,6 +31,9 @@ const GAIN: f32 = 8.0;
 
 /// How much of each symbol's signal-to-noise figure goes into the running one.
 const SNR_RATE: f32 = 0.25;
+/// The effective SNR is measured on one symbol in this many (it moves no
+/// faster than the mean, and a lookup a cell is not free).
+const MI_EVERY: usize = 4;
 
 /// A unit-power cell scaled to the odd-integer grid: ×√2, ×√10, ×√42.
 fn unit_scale(m: Modulation) -> f32 {
@@ -114,6 +117,9 @@ pub struct Demapper {
     /// The mean gain |H|² of the data cells over the mean noise power at
     /// their carriers, as a ratio, followed over the symbols.
     snr: f32,
+    /// Information bits a data cell carries, smoothed, and the table of it.
+    mi: f32,
+    capacity: &'static crate::capacity::Capacity,
     avx2: bool,
     /// The interleaver (the plane) each place of a cell's v bits comes from.
     order: Vec<usize>,
@@ -169,6 +175,12 @@ impl Demapper {
             unit: unit_scale(modulation),
             src,
             snr: 0.0,
+            mi: 0.0,
+            capacity: crate::capacity::capacity(match modulation {
+                Modulation::Qpsk => 1,
+                Modulation::Qam16 => 2,
+                Modulation::Qam64 => 3,
+            }),
             avx2: Self::detect(),
             order,
             zr: vec![0.0; cells],
@@ -212,8 +224,16 @@ impl Demapper {
         10.0 * self.snr.max(1e-6).log10()
     }
 
+    /// The SNR, dB, a Gaussian channel would need to carry what the data
+    /// cells carry (see [`crate::capacity`]): below the mean SNR when the
+    /// channel has notches, and what the mode's QEF C/N is to be set against.
+    pub fn effective_snr_db(&self) -> f32 {
+        self.capacity.effective_db(self.mi)
+    }
+
     pub fn reset(&mut self) {
         self.snr = 0.0;
+        self.mi = 0.0;
     }
 
     /// Demap symbol `l` (its index in the frame) from the equalised carriers
@@ -229,11 +249,27 @@ impl Demapper {
             Modulation::Qam64 => self.run::<6>(l, z, w, noise, out),
         };
         let now = gain / power.max(1e-30);
-        self.snr = if self.snr == 0.0 {
+        let first = self.snr == 0.0;
+        self.snr = if first {
             now
         } else {
             self.snr + SNR_RATE * (now - self.snr)
         };
+        if first || l.is_multiple_of(MI_EVERY) {
+            let cap = self.capacity;
+            let sum: f32 = self
+                .gain
+                .iter()
+                .zip(&self.noise)
+                .map(|(&g, &n)| cap.information(g / n))
+                .sum();
+            let now = sum / self.cells as f32;
+            self.mi = if first {
+                now
+            } else {
+                self.mi + SNR_RATE * (now - self.mi)
+            };
+        }
     }
 
     /// Returns the sums of the cells' gains and of the noise at their

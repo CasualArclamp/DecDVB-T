@@ -368,9 +368,10 @@ pub fn run(a: DecodeArgs) -> Result<()> {
     }
     let o = &st.outer;
     println!(
-        "SNR {:.1} dB; Reed-Solomon: {} blocks, {} clean, {} corrected ({} bytes), {} uncorrectable, \
+        "SNR {:.1} dB mean, {:.1} dB effective; Reed-Solomon: {} blocks, {} clean, {} corrected ({} bytes), {} uncorrectable, \
          {} loss(es) of sync; error rate into the code {:.2e}",
         st.snr_db,
+        st.effective_snr_db,
         o.blocks,
         o.clean,
         o.corrected,

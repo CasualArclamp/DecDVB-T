@@ -138,6 +138,10 @@ pub struct T2Status {
     pub cfo_hz: f64,
     pub clock_ppm: f64,
     pub snr_db: f32,
+    /// The SNR a Gaussian channel would need to carry what the PLP's cells
+    /// carry, dB (see [`crate::capacity`]; a rotated constellation's point
+    /// at the mean SNR of its two cells).
+    pub effective_snr_db: f32,
     pub frames_ok: u64,
     pub frames_bad: u64,
     pub blocks_ok: u64,
@@ -878,6 +882,29 @@ impl T2Receiver {
         if let Some(i) = pick {
             let params = PlpParams::from_l1(&post.plps[i]);
             self.status.plp = params;
+            if let Some(p) = params {
+                // Every eighth data cell's SNR (cells of unit power, `var`
+                // their noise after equalising). A rotated constellation's
+                // point has its two components in two cells far apart in the
+                // frame, which fade apart: it is taken at the mean of two
+                // cells half a frame apart.
+                let cap = crate::capacity::capacity(p.qam.bits() as u32 / 2);
+                let data_var = &var[logical.len()..];
+                let half = data_var.len() / 2;
+                let (sum, n) = (0..if p.rotated { half } else { data_var.len() })
+                    .step_by(8)
+                    .fold((0f32, 0u32), |(s, n), i| {
+                        let snr = if p.rotated {
+                            0.5 * (1.0 / data_var[i] + 1.0 / data_var[i + half])
+                        } else {
+                            1.0 / data_var[i]
+                        };
+                        (s + cap.information(snr), n + 1)
+                    });
+                if n > 0 {
+                    self.status.effective_snr_db = cap.effective_db(sum / n as f32);
+                }
+            }
             let dynamic = post.dynamic.get(i);
             if let (Some(params), Some(dynamic)) = (params, dynamic) {
                 // The cells of the frame: P2's (all of them logical), then

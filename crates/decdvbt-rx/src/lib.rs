@@ -13,6 +13,7 @@
 
 pub mod acquire;
 pub mod auto;
+pub mod capacity;
 pub mod chest;
 pub mod delay_doppler;
 pub mod demap;

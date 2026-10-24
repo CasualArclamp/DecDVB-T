@@ -5,10 +5,13 @@
 //! received big with the margin beside it, and a C/N bar ticked at the C/N
 //! that mode needs.
 //!
-//! The margin is the measured C/N less the C/N the mode needs for quasi
-//! error free reception over a Gaussian channel. Until the receiver (M3)
-//! reads the mode from the TPS and measures MER, the card shows the
-//! spectral C/N estimate (`decdvbt_engine::snr`) and no mode, so no margin.
+//! The margin is the effective SNR (what the cells carry, as the SNR of a
+//! Gaussian channel that carries as much: `decdvbt_rx::capacity`) less the
+//! C/N the mode needs for quasi error free reception over a Gaussian
+//! channel. The band's mean SNR (the MER row) would flatter a channel with
+//! notches. Until the receiver reads the mode and measures, the card shows
+//! the spectral C/N estimate (`decdvbt_engine::snr`) and no mode, so no
+//! margin.
 
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Ui, pos2, vec2};
 
@@ -89,7 +92,12 @@ pub fn show(ui: &mut Ui, c: &Card) {
     let grey = ui.visuals().weak_text_color();
     let strong = ui.visuals().strong_text_color();
     let colour = c.standard.map_or(grey, Standard::colour);
-    let margin = c.cn_db.zip(c.qef_db).map(|(cn, q)| cn - q);
+    // To the tenth shown (and + 0.0 turns a −0.0 into 0.0), so that the colour
+    // agrees with the figure.
+    let margin = c
+        .cn_db
+        .zip(c.qef_db)
+        .map(|(cn, q)| ((cn - q) * 10.0).round() / 10.0 + 0.0);
     let health = margin.map(|m| margin_colour(Some(m)));
 
     // ---- the title bar: standard · mode, and where it is
@@ -184,9 +192,13 @@ pub fn show(ui: &mut Ui, c: &Card) {
         })
         .response;
     resp.on_hover_text(
-        "Margin: the measured C/N less the C/N this mode needs to be quasi error \
-         free over a Gaussian channel (EN 300 744 Table A.1 for DVB-T). Below 0 dB \
-         the FEC fails; within 1 dB a fade drops packets.\n\nUntil the receiver reads \
+        "Margin: the effective SNR less the C/N this mode needs to be quasi error \
+         free over a Gaussian channel (EN 300 744 Table A.1 for DVB-T). The \
+         effective SNR is what a Gaussian channel would need to carry what the \
+         cells carry, carrier by carrier: on a channel with notches it is below \
+         the mean (the MER row), because the faded carriers' bits are where the \
+         errors are. Below 0 dB the FEC fails; within 1 dB a fade drops \
+         packets.\n\nUntil the receiver reads \
          the mode, there is no margin: the bar shows a C/N estimated from the \
          spectrum (the block against the empty guard beside it).",
     );
