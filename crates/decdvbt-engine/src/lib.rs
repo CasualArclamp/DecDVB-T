@@ -6,6 +6,8 @@
 //! - [`hub`]: the transport stream after the receiver: analyser, outputs, the
 //!   player's tap.
 //! - [`spectrum`]: the averaged spectrum rows, built a few FFTs a block.
+//! - [`waterfall`]: the waterfall's thread: its FFTs, and its rows let out
+//!   at an even pace.
 //! - [`meter`]: CPU meters, whole-process and per stage.
 //! - [`snr`]: a C/N estimate from the spectrum, until the receiver measures MER.
 
@@ -15,6 +17,7 @@ pub mod meter;
 pub mod rx;
 pub mod snr;
 pub mod spectrum;
+pub mod waterfall;
 
 pub use frontend::{FrontEndReading, FrontEndSettings};
 pub use hub::{CarouselLink, CarouselState, Outputs, TsHub, TsView};

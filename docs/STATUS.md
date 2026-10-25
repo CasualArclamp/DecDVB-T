@@ -1137,3 +1137,29 @@ The DVB-T QEF figures are EN 300 744's ideal receiver; per-carrier noise
 estimates are noisy, which pulls the average information down a little, so
 the effective SNR leans pessimistic (a clean channel reads 1.5–3.5 dB under
 its mean). It ranks the captures as their error rates do.
+
+## Waterfall: an even scroll, one whole pixel a row (2026-10-25)
+
+Asked for: DecDAB's waterfall improvements (its commits b655ffc and 6dcef35:
+smoothness, no sub-pixel blending).
+
+- The waterfall's FFTs run on a thread of their own (`decdvbt-engine::waterfall`,
+  ported from DecDAB): the receive thread copies out the windows a row needs,
+  the thread transforms and averages them and lets the rows out on a steady
+  clock at the display's rate, two rows behind, so the bursts in which the
+  HackRF and the file reader deliver samples never reach the screen. Rows
+  still held when the source ends go out (DecDAB's version dropped them).
+- `Command::DisplayFps(fps)` replaces `Smooth`: a waterfall row a frame, the
+  transforms a row scaled so the cost a second is unchanged; results, scopes
+  and measurements handed over once a frame (every 33 to 100 ms).
+- The GUI queues the rows and puts one on each frame (two to catch up, the
+  backlog cut far behind). The waterfall holds exactly as many rows as it
+  has physical pixels and sits on pixel boundaries, so each step of the
+  scroll is one whole pixel and no row is smeared across two (linear
+  filtering then samples texel centres only). The trace's smoothing keeps a
+  0.12 s time constant at any rate. The fps list loses "(smooth)": the rate
+  is the waterfall's speed (60, 30, 15 px/s).
+- On the 120 s C23 capture: 94 % of frames take exactly one row at 60 fps, 83 %
+  at 15 fps (the screenshot report counts frames that took 0, 1 and 2). CPU
+  old against new, interleaved runs: 60 fps 80 % / 82 %, 15 fps 50 % / 58 %,
+  within the runs' own spread (±15 points between identical runs).

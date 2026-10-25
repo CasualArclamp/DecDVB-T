@@ -61,7 +61,8 @@ const GREEN: Color32 = Color32::from_rgb(110, 220, 130);
 /// the scopes.
 const CHANNEL_PANEL_H: f32 = 270.0;
 const SCOPES_PANEL_H: f32 = 250.0;
-/// The display rate from which the smooth mode (60 frames a second) applies.
+/// The display rate from which the heat maps take 60 rows a second (20
+/// below it).
 const SMOOTH_FPS: f64 = 45.0;
 /// The channel plan's transmitter offsets, Hz: a carrier found within
 /// [`SNAP_HZ`] of one is taken to be on it.
@@ -497,10 +498,18 @@ struct App {
     sdr_open: bool,
     optimiser: Option<sdr::Optimiser>,
     opt_result: Option<String>,
-    /// The smooth (60 frames a second) mode and what the engine was last told:
-    /// it, the heat maps' rate, the scopes and measurements.
-    smooth_mode: bool,
-    smooth_sent: bool,
+    /// The display rate the engine was last told (it makes a waterfall row
+    /// a frame, and paces what it hands over by it).
+    fps_sent: Option<f64>,
+    /// The waterfall's height on the screen, physical pixels: its rows, one
+    /// a pixel, so it moves a whole pixel a frame and the frame rate is its
+    /// speed (from DecDAB, same author).
+    wf_rows: usize,
+    /// Frames that put 0, 1 and 2 rows on the waterfall (for the screenshot
+    /// report: an even scroll is all 1s), and the rows come but not yet
+    /// shown: one goes on each frame.
+    wf_steps: [u32; 3],
+    rows_due: std::collections::VecDeque<Row>,
     heat: heatmaps::HeatView,
     errors: errormaps::ErrorMaps,
     heat_sent: Option<f64>,
@@ -627,8 +636,10 @@ impl App {
             sdr_open: opts.window.as_deref() == Some("sdr"),
             optimiser: None,
             opt_result: None,
-            smooth_mode: opts.fps >= SMOOTH_FPS,
-            smooth_sent: false,
+            fps_sent: None,
+            wf_rows: 0,
+            wf_steps: [0; 3],
+            rows_due: std::collections::VecDeque::new(),
             heat: heatmaps::HeatView::default(),
             errors: errormaps::ErrorMaps::default(),
             heat_sent: None,
@@ -758,9 +769,9 @@ impl App {
                 (
                     self.scopes_sent,
                     self.sdr_sent,
-                    self.smooth_sent,
+                    self.fps_sent,
                     self.heat_sent,
-                ) = (false, None, false, None);
+                ) = (false, None, None, None);
                 self.optimiser = None;
                 self.tuned_at = Instant::now();
                 self.centre_checked = false;
@@ -795,6 +806,7 @@ impl App {
 
     fn reset_view(&mut self) {
         self.history.reset();
+        self.rows_due.clear();
         self.smooth.clear();
         self.span_hz = 0.0;
         self.chan_view.reset();
@@ -1202,27 +1214,35 @@ impl App {
         self.sdr.save();
     }
 
-    /// The smooth mode follows the display rate.
-    fn sync_smooth(&mut self) {
-        self.smooth_mode = self.opts.fps >= SMOOTH_FPS;
+    /// The waterfall's row rate follows the display rate: a row a frame.
+    fn sync_fps(&mut self) {
+        let fps = self.opts.fps;
         let Some(s) = &self.session else { return };
-        if self.smooth_sent != self.smooth_mode {
-            s.rx.send(Command::Smooth(self.smooth_mode));
-            self.smooth_sent = self.smooth_mode;
+        if self.fps_sent != Some(fps) {
+            s.rx.send(Command::DisplayFps(fps));
+            self.fps_sent = Some(fps);
         }
-        // Twenty-five seconds of waterfall at the rate the rows come.
-        let rows_per_s = if self.smooth_mode { 60.0 } else { 20.0 };
-        self.history.set_capacity((25.0 * rows_per_s) as usize);
+        // Exactly a row a physical pixel of the waterfall's height: a row a
+        // frame then moves it one whole pixel a frame, 60 pixels a second at
+        // 60 fps, 15 at 15 (the time on the screen is the height over the
+        // rate). Any other count would draw rows across fractions of pixels,
+        // which shimmers as they move. A resize or a change of scaling starts
+        // the waterfall afresh.
+        if self.wf_rows > 0 && self.history.capacity() != self.wf_rows {
+            self.history.set_capacity(self.wf_rows);
+        }
     }
 
     /// Rows of the channel while the heat maps are shown.
     fn sync_heat(&mut self) {
         let Some(s) = &self.session else { return };
-        let want = (self.bottom == Bottom::Heat && self.decode).then_some(if self.smooth_mode {
-            60.0
-        } else {
-            20.0
-        });
+        let want = (self.bottom == Bottom::Heat && self.decode).then_some(
+            if self.opts.fps >= SMOOTH_FPS {
+                60.0
+            } else {
+                20.0
+            },
+        );
         if self.heat_sent != want {
             s.rx.send(Command::Heat(want));
             self.heat_sent = want;
@@ -1381,16 +1401,34 @@ impl App {
                 _ => {}
             }
         }
-        for row in rows {
+        // The rows wait in a queue and one goes on each frame, so the
+        // waterfall moves a row a frame even when the engine's rows and the
+        // frames do not fall in step; a queue that grows (the display slower
+        // than asked) is caught up two rows a frame, and one that has run far
+        // behind is cut.
+        self.rows_due.extend(rows);
+        let backlog = self.rows_due.len();
+        if backlog > (self.opts.fps as usize).max(10) {
+            self.rows_due.drain(..backlog - 2);
+        }
+        let take = match self.rows_due.len() {
+            0 => 0,
+            n if n > 3 => 2,
+            _ => 1,
+        };
+        if self.span_hz > 0.0 {
+            self.wf_steps[take.min(2)] += 1;
+        }
+        // A calm trace: a time constant of about 0.12 s, whatever the row
+        // rate.
+        let pull = 1.0 - (-1.0 / (0.12 * self.opts.fps.max(1.0)) as f32).exp();
+        for row in self.rows_due.drain(..take).collect::<Vec<_>>() {
             if row.tuning != self.tuning {
                 self.tuning = row.tuning;
                 self.reset_view();
             }
             self.centre_hz = row.center_hz;
             self.span_hz = row.sample_rate;
-            // A calm trace: each row pulled a third of the way in (in dB), a
-            // seventh when they come three times as often.
-            let pull = if self.smooth_sent { 0.14 } else { 0.35 };
             if self.smooth.len() != row.db.len() {
                 self.smooth.clone_from(&row.db);
             } else {
@@ -1579,12 +1617,13 @@ impl App {
         let (w, h) = (image.size[0] as u32, image.size[1] as u32);
         match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
             Ok(()) => eprintln!(
-                "screenshot saved to {} (CPU {:.1} % average; per frame: logic {:.2} ms, ui {:.2} ms, {} frames; {})",
+                "screenshot saved to {} (CPU {:.1} % average; per frame: logic {:.2} ms, ui {:.2} ms, {} frames; waterfall rows a frame 0/1/2: {:?}; {})",
                 path.display(),
                 self.cpu_avg.unwrap_or(self.cpu_percent),
                 self.frame_cost[0].as_secs_f64() * 1e3 / self.frames.max(1) as f64,
                 self.frame_cost[1].as_secs_f64() * 1e3 / self.frames.max(1) as f64,
                 self.frames,
+                self.wf_steps,
                 self.stats.describe
             ),
             Err(e) => eprintln!("cannot save screenshot {}: {e}", path.display()),
@@ -1831,13 +1870,10 @@ impl App {
                 .selected_text(format!("{} fps", self.opts.fps))
                 .width(70.0)
                 .show_ui(ui, |ui| {
+                    // The waterfall scrolls a row a frame: the rate is also
+                    // its speed.
                     for f in FPS_CHOICES {
-                        let label = if f >= SMOOTH_FPS {
-                            format!("{f} fps (smooth)")
-                        } else {
-                            format!("{f} fps")
-                        };
-                        ui.selectable_value(&mut self.opts.fps, f, label);
+                        ui.selectable_value(&mut self.opts.fps, f, format!("{f} fps"));
                     }
                 });
             if !self.note.is_empty() {
@@ -2005,7 +2041,7 @@ impl eframe::App for App {
         self.sync_decoder();
         self.sync_scopes();
         self.sync_sdr();
-        self.sync_smooth();
+        self.sync_fps();
         self.sync_heat();
         self.poll_stream();
         self.sync_outputs();
@@ -2065,7 +2101,7 @@ impl eframe::App for App {
                         .filter(|_| self.standard == Standard::Dvbt2)
                         .and_then(|t| t.frame_period_s())
                         .map(|p| (1.0 / p) as f32);
-                    let rate = t2_rate.unwrap_or(if self.smooth_sent { 60.0 } else { 20.0 });
+                    let rate = t2_rate.unwrap_or(self.heat_sent.unwrap_or(20.0) as f32);
                     self.heat.show(ui, rate);
                 });
             }
@@ -2081,6 +2117,9 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
+                self.wf_rows =
+                    band::waterfall_rows(ui.available_height(), ui.ctx().pixels_per_point())
+                        .max(64);
                 let tex = self.ring.update(ui.ctx(), &self.history);
                 let inp = band::BandInput {
                     spectrum_db: &self.smooth,

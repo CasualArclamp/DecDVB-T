@@ -29,7 +29,7 @@ use decdvbt_ts::Epg;
 use crate::frontend::{FrontEnd, FrontEndReading, FrontEndSettings};
 use crate::hub::{Feeder, Outputs, TsHub, TsView};
 use crate::meter::{Stage, StageLoad, StageMeter};
-use crate::spectrum::RowBuilder;
+use crate::waterfall::Waterfall;
 
 /// How the spectrum is built.
 #[derive(Debug, Clone, Copy)]
@@ -110,11 +110,12 @@ pub enum Command {
     /// the band, its impulse response) this many times a second while on, for
     /// the heat maps; `None` stops. A row costs a transform.
     Heat(Option<f64>),
-    /// The smooth display, for 60 frames a second: the waterfall's rows 60 a
-    /// second (the same number of transforms in all, a smaller share of them to
-    /// each row), the scopes' cells 30 times a second and the measurements 12,
-    /// and what the receiver has made handed over every 33 ms, not 100.
-    Smooth(bool),
+    /// The display's frame rate: the waterfall makes one row a frame, so it
+    /// scrolls a row a frame (the same transforms a second at any rate, a
+    /// smaller share of them to each row); what the receiver has made, the
+    /// scopes' cells and the measurements are handed over as often as the
+    /// display can show them (every 33 to 100 ms).
+    DisplayFps(f64),
     /// Which corrections are made to the radio's samples (the DC offset, the
     /// I/Q imbalance) before the spectrum, the receiver and the sounder see them.
     FrontEnd(FrontEndSettings),
@@ -186,15 +187,20 @@ impl Pace {
         }
     }
 
-    /// For 60 frames a second: the rows come three times as often with a
-    /// third of the transforms, so the waterfall costs the same.
-    fn smooth(opts: &RxOptions) -> Pace {
+    /// For a display of `fps` frames a second: a waterfall row a frame, with
+    /// the transforms a row scaled so the waterfall's cost a second stays
+    /// `opts`'s; the results handed over once a frame, but no more often
+    /// than 30 times a second and no less than 10.
+    fn for_fps(opts: &RxOptions, fps: f64) -> Pace {
+        let fps = fps.clamp(1.0, 120.0);
+        let publish = Duration::from_secs_f64((1.0 / fps).clamp(1.0 / 30.0, 0.1));
         Pace {
-            publish: Duration::from_millis(33),
-            scopes: Duration::from_millis(33),
-            measure: Duration::from_millis(80),
-            rows_per_s: opts.rows_per_s * 3.0,
-            segments: (opts.segments_per_row / 3).max(1),
+            publish,
+            scopes: publish,
+            measure: (publish * 5 / 2).max(Duration::from_millis(80)),
+            rows_per_s: fps,
+            segments: ((f64::from(opts.segments_per_row) * opts.rows_per_s / fps).round() as u32)
+                .max(1),
         }
     }
 }
@@ -218,7 +224,8 @@ pub struct DecoderUpdate {
 }
 
 struct Shared {
-    rows: Mutex<VecDeque<Row>>,
+    /// Filled by the waterfall's thread.
+    rows: Arc<Mutex<VecDeque<Row>>>,
     stats: Mutex<Stats>,
     sounder: Mutex<SounderOut>,
     decoder: Mutex<DecoderOut>,
@@ -251,9 +258,6 @@ impl Settle {
     }
 }
 
-/// Rows kept for a GUI that is slow to collect them.
-const MAX_QUEUED_ROWS: usize = 100;
-
 /// A running receive thread.
 pub struct Rx {
     cmd: Sender<Command>,
@@ -269,7 +273,7 @@ pub type DropProbe = Box<dyn Fn() -> u64 + Send>;
 impl Rx {
     pub fn start(source: Box<dyn IqSource>, opts: RxOptions, drops: Option<DropProbe>) -> Rx {
         let shared = Arc::new(Shared {
-            rows: Mutex::new(VecDeque::new()),
+            rows: Arc::new(Mutex::new(VecDeque::new())),
             stats: Mutex::new(Stats {
                 describe: source.describe(),
                 sample_rate: source.sample_rate(),
@@ -410,7 +414,14 @@ fn run(
     let rate = source.sample_rate();
     let live = source.is_live();
     let mut pace = Pace::normal(&opts);
-    let mut builder = RowBuilder::new(opts.fft, rate, pace.rows_per_s, pace.segments);
+    // The waterfall's rows are made and paced on a thread of their own.
+    let mut wf = Waterfall::start(
+        opts.fft,
+        rate,
+        pace.rows_per_s,
+        pace.segments,
+        Arc::clone(&sh.rows),
+    );
     let mut meter = StageMeter::default();
     let mut block: Vec<Iq> = Vec::new();
     let mut level = Level::default();
@@ -485,19 +496,16 @@ fn run(
                     }
                 }
                 Ok(Command::FrontEnd(f)) => front.settings = f,
-                Ok(Command::Smooth(on)) => {
-                    pace = if on {
-                        Pace::smooth(&opts)
-                    } else {
-                        Pace::normal(&opts)
-                    };
-                    builder = RowBuilder::new(opts.fft, rate, pace.rows_per_s, pace.segments);
+                Ok(Command::DisplayFps(fps)) => {
+                    pace = Pace::for_fps(&opts, fps);
+                    wf.set_rate(pace.rows_per_s, pace.segments);
                 }
                 Ok(Command::Retune(hz)) => match source.retune(hz) {
                     Ok(true) => {
                         tuning += 1;
                         settle.start(rate);
                         sh.rows.lock().unwrap().clear();
+                        wf.clear();
                         if let Some((s, v)) = &mut sounder {
                             *s = new_sounder(*v, source.center_freq(), rate);
                         }
@@ -663,26 +671,9 @@ fn run(
             }
         }
 
-        let row = meter.time(Stage::Spectrum, || {
-            if builder.push(&block) {
-                let mut db = Vec::with_capacity(builder.fft_size());
-                builder.take_row(&mut db).map(|_| Row {
-                    db,
-                    center_hz: source.center_freq(),
-                    sample_rate: rate,
-                    tuning,
-                })
-            } else {
-                None
-            }
-        });
-        if let Some(row) = row {
-            let mut q = sh.rows.lock().unwrap();
-            if q.len() == MAX_QUEUED_ROWS {
-                q.pop_front();
-            }
-            q.push_back(row);
-        }
+        // The waterfall: the windows its rows need go to its thread.
+        let centre = source.center_freq();
+        meter.time(Stage::Spectrum, || wf.push(&block, centre, tuning));
 
         if meter.tick() {
             let mut s = sh.stats.lock().unwrap();
@@ -798,9 +789,10 @@ mod tests {
         assert!(rx.stats().ended);
     }
 
-    /// The smooth display makes the waterfall's rows three times as often.
+    /// At 60 frames a second the waterfall makes a row a frame: three times
+    /// the default's rows.
     #[test]
-    fn smooth_mode_triples_the_waterfalls_rows() {
+    fn a_60_fps_display_triples_the_waterfalls_rows() {
         let rows_in_a_while = |smooth: bool| {
             let rx = Rx::start(
                 Box::new(ToneSource {
@@ -811,7 +803,7 @@ mod tests {
                 None,
             );
             if smooth {
-                rx.send(Command::Smooth(true));
+                rx.send(Command::DisplayFps(60.0));
             }
             let t0 = Instant::now();
             let mut n = 0;
