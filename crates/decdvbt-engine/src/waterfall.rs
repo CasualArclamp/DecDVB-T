@@ -12,7 +12,7 @@
 //! **Pacing.** Samples come in bursts: a HackRF hands over its USB
 //! transfers a few at a time, a file is read ahead and waits. The rows are made in the
 //! same bursts, so they are held here and let out one every 1/fps of wall
-//! time, a couple of rows behind, which the bursts never outrun. If rows
+//! time, a quarter of a second behind (`LEAD_S`), which the bursts never outrun. If rows
 //! pile up (the signal's clock a little faster than this one's, or the
 //! display rate lowered) the extras go at once; if they run out, the next
 //! goes as soon as it comes, and the clock runs on from there.
@@ -28,10 +28,19 @@ use decdvbt_core::Iq;
 use crate::rx::Row;
 use crate::spectrum::Spectrum;
 
-/// Rows held back before the first is let out: the burst it rides out.
-const LEAD_ROWS: usize = 2;
-/// Rows held beyond which the extras are let out at once.
-const MAX_HELD: usize = 6;
+/// Signal held back before the first row is let out, seconds: the longest
+/// gap in the rows it rides out. The receive thread stops feeding the
+/// waterfall while the DVB-T2 receiver works through a frame (a 217 ms
+/// frame at a time), tens of milliseconds; two rows of lead (DecDAB's,
+/// 67 ms at 30 fps) ran dry on C30, a quarter of a second does not.
+const LEAD_S: f64 = 0.25;
+
+/// Rows held back at a row every `period`, and the rows held beyond which
+/// the extras are let out at once (twice the lead and some).
+fn lead_rows(period: Duration) -> (usize, usize) {
+    let lead = ((LEAD_S / period.as_secs_f64()).ceil() as usize).max(2);
+    (lead, 2 * lead + 4)
+}
 /// Messages queued for the thread before the receive thread drops windows
 /// (a row then averages fewer; nothing waits).
 const QUEUE: usize = 512;
@@ -205,7 +214,7 @@ fn run(rx: Receiver<Msg>, fft: usize, rows_per_s: f64, out: Arc<Mutex<VecDeque<R
                     });
                 }
                 // Starting (or starting again): wait for a lead first.
-                if next.is_none() && held.len() >= LEAD_ROWS {
+                if next.is_none() && held.len() >= lead_rows(period).0 {
                     next = Some(Instant::now());
                 }
             }
@@ -238,7 +247,7 @@ fn run(rx: Receiver<Msg>, fft: usize, rows_per_s: f64, out: Arc<Mutex<VecDeque<R
                 // Dry: the next row goes as soon as it comes.
                 break;
             }
-            if now < t && held.len() <= MAX_HELD {
+            if now < t && held.len() <= lead_rows(period).1 {
                 break;
             }
             let r = held.pop_front().expect("not empty");
