@@ -1163,3 +1163,24 @@ smoothness, no sub-pixel blending).
   at 15 fps (the screenshot report counts frames that took 0, 1 and 2). CPU
   old against new, interleaved runs: 60 fps 80 % / 82 %, 15 fps 50 % / 58 %,
   within the runs' own spread (±15 points between identical runs).
+
+## A T2 signal under the threshold: an honest margin and a bounded CPU (2026-10-25)
+
+Live C30 stopped decoding: the receiver stays locked (L1 every frame, no frame
+lost) but the signal measures MER 15.9 dB against the 19.4 dB 256-QAM 2/3
+needs, so no LDPC block decodes. Lower gains read worse (LNA 32 12.3 dB, LNA 24
+10.8 dB): noise-limited, the aerial's signal weaker than the day before. Two
+things were wrong with how the app took it:
+
+- The card showed **+2.7 dB** (the spectrum's C/N) because it used the
+  measured SNR only while packets came. It now uses the effective SNR as soon
+  as L1 is read: the simulated case reads −7.2 dB in red.
+- The FEC tried every block of every frame for 50 iterations: **~360-400 %
+  CPU** for nothing. Now (1) while the FEC stage is behind on all its threads
+  the LDPC gives a block up once its unsatisfied checks stop falling
+  (`decode_hurried`), and (2) after two frames with no block decoded only the
+  first 12 blocks of each frame are tried (`PlpDecoder::set_limit`, the
+  frame's block plan kept whole), until one decodes again; the card says
+  "FEC: below threshold". Failing signal: 359 % → 59 %; live C30 at 15.9 dB:
+  the FEC stage on 1 thread at 23 % of real time. A good signal is unchanged
+  (C30 capture: 5252 blocks, 0 lost, 8.7 iterations).

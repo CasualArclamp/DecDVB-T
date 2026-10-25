@@ -121,6 +121,8 @@ pub struct FrameStats {
 
 pub struct PlpDecoder {
     pub params: PlpParams,
+    /// Decode only this many of a frame's blocks (the first), when set.
+    limit: Option<usize>,
     workers: Vec<PlpCoder>,
     ci: CellInterleaver,
     unpacker: Unpacker,
@@ -132,6 +134,7 @@ impl PlpDecoder {
         let workers: Option<Vec<PlpCoder>> = (0..threads.max(1)).map(|_| mk()).collect();
         Some(PlpDecoder {
             params,
+            limit: None,
             workers: workers?,
             ci: CellInterleaver::new(params.frame, params.qam),
             unpacker: Unpacker::default(),
@@ -146,6 +149,20 @@ impl PlpDecoder {
     /// Forget a packet cut by the last frame (the stream has jumped).
     pub fn reset(&mut self) {
         self.unpacker.reset();
+    }
+
+    /// Decode only the first `n` blocks of each frame (`None`: all of them).
+    /// For a signal under the code's threshold: a few blocks a frame tell
+    /// when it comes back, at a small part of the cost of all of them.
+    pub fn set_limit(&mut self, n: Option<usize>) {
+        self.limit = n;
+    }
+
+    /// Give hopeless blocks up early (see `PlpCoder::set_hurried`).
+    pub fn set_hurried(&mut self, on: bool) {
+        for w in &mut self.workers {
+            w.set_hurried(on);
+        }
     }
 
     /// Threads (and so coders) this decoder has: the most it can use.
@@ -184,6 +201,9 @@ impl PlpDecoder {
             at += f * cs;
         }
 
+        // The plan is the whole frame's (the blocks' places depend on how
+        // many there are); a limit decodes its first blocks only.
+        let blocks = self.limit.map_or(blocks, |l| l.min(blocks));
         let bb_len = self.workers[0].bbframe_bytes();
         let mut frames: Vec<Option<(Vec<u8>, BlockStats)>> = vec![None; blocks];
         let n_workers = threads.clamp(1, self.workers.len()).min(blocks);

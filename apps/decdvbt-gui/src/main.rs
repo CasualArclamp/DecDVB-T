@@ -1564,7 +1564,10 @@ impl App {
     /// The card for a DVB-T2 lock.
     fn t2_card(&self, t2: &T2Status) -> card::Card {
         let mut c = t2card::card(t2, self.ts_mbps());
-        let measured = t2.decoding && t2.effective_snr_db.is_finite();
+        // Measured as soon as L1 is read and the frames are equalised, packets
+        // or not: a signal under the code's threshold must show its negative
+        // margin, not the spectrum's flattering guess.
+        let measured = t2.l1_ok && t2.effective_snr_db.is_finite() && t2.snr_db.is_finite();
         if measured {
             c.details.push(kv_mer(t2.snr_db));
         }

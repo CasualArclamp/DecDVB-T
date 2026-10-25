@@ -16,6 +16,9 @@ use decdvbt_core::Iq;
 
 use crate::t2::plp::{FrameStats, PlpDecoder, PlpParams};
 
+/// Blocks a frame decoded while probing (see [`Job::probe`]).
+pub const PROBE_BLOCKS: usize = 12;
+
 /// Frames in the FEC stage's hands (decoding or queued) at most.
 const MAX_IN_FLIGHT: usize = 2;
 
@@ -27,6 +30,9 @@ pub struct Job {
     /// Where the PLP's first block starts in `cells`, and how many blocks.
     pub start: usize,
     pub blocks: usize,
+    /// Decode only the first few blocks: nothing has decoded for a while,
+    /// and these tell when the signal comes back.
+    pub probe: bool,
     /// How long a frame lasts: the time the stage has for one.
     pub period: Duration,
 }
@@ -172,6 +178,10 @@ fn worker(max_threads: usize, jobs: Receiver<Msg>, out: Sender<Done>, cancel: &A
     let mut packets = Vec::new();
     // Two to start with.
     let mut threads = 2.min(max_threads).max(1);
+    // The last frame's wall time over its period: past most of it on every
+    // thread there is, the stage is falling behind, and hopeless blocks are
+    // given up early until it has caught up.
+    let mut last_load = 0f32;
     for msg in jobs {
         let job = match msg {
             Msg::Reset => {
@@ -188,6 +198,8 @@ fn worker(max_threads: usize, jobs: Receiver<Msg>, out: Sender<Done>, cancel: &A
         }
         let done = match &mut decoder {
             Some(d) => {
+                d.set_hurried(threads >= d.max_threads() && last_load > 0.8);
+                d.set_limit(job.probe.then_some(PROBE_BLOCKS));
                 packets.clear();
                 let t0 = Instant::now();
                 let stats = d.decode_frame(
@@ -200,6 +212,7 @@ fn worker(max_threads: usize, jobs: Receiver<Msg>, out: Sender<Done>, cancel: &A
                 );
                 let load = (t0.elapsed().as_secs_f64() / job.period.as_secs_f64().max(1e-3)) as f32;
                 let used = threads;
+                last_load = load;
                 threads = adapt(threads, d.max_threads(), load);
                 let mut ts = Vec::with_capacity(packets.len() * 188);
                 for p in &packets {

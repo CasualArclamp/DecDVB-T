@@ -38,6 +38,8 @@ const MARGIN: usize = 3072;
 const ACQ_NATIVE: usize = 2_500_000;
 /// The wait between attempts to acquire, seconds.
 const RETRY_S: f64 = 0.2;
+/// Frames in a row with no block decoded after which the FEC only probes.
+const DEAD_FRAMES_TO_PROBE: u32 = 2;
 /// Frames in a row in which no P1 symbol, or no L1, was found, that end a lock.
 const MAX_MISSES: u32 = 3;
 /// Radio samples the window keeps behind the latest block: two margins, the
@@ -164,6 +166,10 @@ pub struct T2Status {
     /// Frames given up because the FEC stage was two frames behind (real
     /// time only).
     pub fec_dropped: u64,
+    /// Nothing has decoded for a couple of frames (the signal under the
+    /// code's threshold): only a few blocks a frame are tried, which is
+    /// enough to see the signal come back and saves most of the FEC's CPU.
+    pub fec_probing: bool,
     /// The PLPs L1 lists: id and type (0 common, 1 and 2 data).
     pub plp_ids: Vec<(u8, u8)>,
     /// What the last frame looked like, for a developer.
@@ -214,6 +220,8 @@ pub struct T2Receiver {
     scope_ci: Option<(PlpParams, CellInterleaver)>,
     /// Frames' cell buffers back from the FEC stage, for the next frames.
     pool: Vec<(Vec<Iq>, Vec<f32>)>,
+    /// Frames in a row whose blocks all failed (see `T2Status::fec_probing`).
+    dead_frames: u32,
 }
 
 /// A frame's channel estimate at its middle symbol, for the display.
@@ -266,6 +274,7 @@ impl T2Receiver {
             sounder: None,
             scope_ci: None,
             pool: Vec::new(),
+            dead_frames: 0,
         }
     }
 
@@ -941,6 +950,7 @@ impl T2Receiver {
                     var,
                     start,
                     blocks: dynamic.plp_num_blocks as usize,
+                    probe: self.dead_frames >= DEAD_FRAMES_TO_PROBE,
                     period: Duration::from_secs_f64(t.geo.frame_samples() as f64 / FS_NATIVE),
                 };
                 let threads = self.cfg.fec_threads;
@@ -978,6 +988,14 @@ impl T2Receiver {
                 p.ldpc += s.blocks_time.ldpc;
                 p.bch += s.blocks_time.bch;
                 self.status.decoding = s.ok > 0;
+                // Frames in a row with no block decoded: past a couple, only
+                // a few blocks are tried until one decodes again.
+                self.dead_frames = if s.ok == 0 && s.blocks > 0 {
+                    self.dead_frames + 1
+                } else {
+                    0
+                };
+                self.status.fec_probing = self.dead_frames >= DEAD_FRAMES_TO_PROBE;
                 self.status.blocks_ok += s.ok as u64;
                 self.status.blocks_bad += (s.blocks - s.ok) as u64;
                 self.status.ldpc_iterations += s.ldpc_iterations;

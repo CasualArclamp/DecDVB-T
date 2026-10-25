@@ -67,6 +67,15 @@ pub fn card(t2: &T2Status, stream_mbps: Option<f64>) -> T2Card {
             ),
         ));
     }
+    if t2.fec_probing {
+        details.push(kv(
+            "FEC",
+            format!(
+                "below threshold: trying {} blocks a frame",
+                decdvbt_rx::t2::pipe::PROBE_BLOCKS
+            ),
+        ));
+    }
     if t2.fec_dropped > 0 {
         details.push(kv(
             "FEC behind",

@@ -70,6 +70,9 @@ pub struct PlpCoder {
     /// The soft bits' scale, the LDPC iterations at most.
     scale: f32,
     iterations: usize,
+    /// Give a block up once its unsatisfied checks sit on a plateau (see
+    /// `LdpcDecoder::decode_hurried`), for a receiver behind its input.
+    hurried: bool,
 }
 
 impl PlpCoder {
@@ -108,6 +111,7 @@ impl PlpCoder {
             times: DecodeTimes::default(),
             scale: SCALE,
             iterations: ITERATIONS,
+            hurried: false,
             params,
             qam,
             rotated,
@@ -128,6 +132,15 @@ impl PlpCoder {
         self.scale = scale;
         self.decoder.set_norm_shift(norm_shift);
         self.iterations = iterations;
+    }
+
+    /// Give hopeless blocks up early while on: a block that will not decode
+    /// (the signal under the code's threshold) otherwise runs every one of
+    /// the iterations, and a frame of them takes many times its own length.
+    /// Off, a block near the threshold that wanders on a plateau before it
+    /// converges is still decoded.
+    pub fn set_hurried(&mut self, on: bool) {
+        self.hurried = on;
     }
 
     /// The time the stages took since the last call.
@@ -173,9 +186,13 @@ impl PlpCoder {
         let t1 = Instant::now();
         self.map.gather_q(&self.cell_q, &mut self.q);
         let t2 = Instant::now();
-        let ldpc = self
-            .decoder
-            .decode(&self.q, &mut self.info, self.iterations);
+        let ldpc = if self.hurried {
+            self.decoder
+                .decode_hurried(&self.q, &mut self.info, self.iterations)
+        } else {
+            self.decoder
+                .decode(&self.q, &mut self.info, self.iterations)
+        };
         let t3 = Instant::now();
         let bch = self.bch.decode(&mut self.info);
         let t4 = Instant::now();
