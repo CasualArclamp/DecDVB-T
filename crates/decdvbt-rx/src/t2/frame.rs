@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::notch::{CarrierWatch, NotchStat};
 use decdvbt_core::Iq;
 use decdvbt_ofdm::t2::carriers::p2_deal;
 use decdvbt_ofdm::t2::{Carriers, FreqInterleaver, Mode, Reference, Role};
@@ -158,6 +159,8 @@ pub struct Demod {
     /// interleaver (which alternates between even and odd symbols).
     source: Vec<Vec<u32>>,
     fi_fc: Option<FreqInterleaver>,
+    /// Tones in the channel (see [`crate::notch`]).
+    watch: CarrierWatch,
 }
 
 impl Demod {
@@ -288,6 +291,23 @@ impl Demod {
             source,
             reference,
             fft: SymbolFft::new(geo.n),
+            watch: {
+                let mut w = CarrierWatch::new();
+                // What each carrier shows in the signal's own power over a
+                // data cell's: the pilots' boosts, averaged over the pattern.
+                let amp = |r: Role| match r {
+                    Role::Data | Role::Reserved => 1.0,
+                    r => mode.pilot_amplitude(r).powi(2),
+                };
+                w.set_expected(
+                    (0..geo.c_ps)
+                        .map(|k| {
+                            (0..dy).map(|ph| amp(carriers.data(ph)[k])).sum::<f32>() / dy as f32
+                        })
+                        .collect(),
+                );
+                w
+            },
             fi_p2: FreqInterleaver::new(mode.fft, carriers.p2_cells()),
             fi_fc: geo
                 .has_fc
@@ -410,6 +430,8 @@ pub struct Equalised {
     /// data symbol, symbol after symbol, and those symbols (in the frame).
     pub node_rows: Vec<Iq>,
     pub node_symbols: Vec<usize>,
+    /// The tones found in the channel and erased (see [`crate::notch`]).
+    pub notch: NotchStat,
 }
 
 impl Demod {
@@ -564,6 +586,26 @@ impl Demod {
         // data symbol (its sighting or a cubic through the four nearest), the
         // channel across the symbol from those, and the cells divided by it.
         let n_nodes = self.nodes.len();
+        // Nodes of the pilot lattice under a tone (or its skirt): their
+        // sightings are the tone's, not the channel's, and the interpolator
+        // would carry the error a hundred carriers either way. They are
+        // rebuilt below from the nearest clean nodes.
+        let bad_nodes: Vec<bool> = if self.watch.flagged().is_empty() {
+            Vec::new()
+        } else {
+            let mut bad = vec![false; n_nodes];
+            for &f in self.watch.flagged() {
+                // The node at or just under the flagged carrier, and the next.
+                let m = self.nodes.partition_point(|&k| k <= f as usize);
+                if m > 0 {
+                    bad[m - 1] = true;
+                }
+                if m < n_nodes {
+                    bad[m] = true;
+                }
+            }
+            bad
+        };
         let mut sight: Vec<Iq> = Vec::with_capacity(self.sight_sym.len());
         for (m, &k) in self.nodes.iter().enumerate() {
             let (a, b) = (self.sight_off[m] as usize, self.sight_off[m + 1] as usize);
@@ -608,6 +650,35 @@ impl Demod {
                 pad_re[m + KERNEL_HALF] = re;
                 pad_im[m + KERNEL_HALF] = im;
             }
+            if !bad_nodes.is_empty() {
+                let mut m = 0;
+                while m < n_nodes {
+                    if !bad_nodes[m] {
+                        m += 1;
+                        continue;
+                    }
+                    let end = (m..n_nodes).find(|&i| !bad_nodes[i]).unwrap_or(n_nodes);
+                    // Clean nodes either side (none: leave the run as it is).
+                    let at = |i: usize| (pad_re[i + KERNEL_HALF], pad_im[i + KERNEL_HALF]);
+                    let (lo, hi) = (m.checked_sub(1).map(at), (end < n_nodes).then(|| at(end)));
+                    if lo.is_some() || hi.is_some() {
+                        let span = (end - m + 1) as f32;
+                        for i in m..end {
+                            let t = (i - m + 1) as f32 / span;
+                            let (r, q) = match (lo, hi) {
+                                (Some(l), Some(h)) => {
+                                    (l.0 + t * (h.0 - l.0), l.1 + t * (h.1 - l.1))
+                                }
+                                (Some(v), None) | (None, Some(v)) => v,
+                                (None, None) => unreachable!(),
+                            };
+                            pad_re[i + KERNEL_HALF] = r;
+                            pad_im[i + KERNEL_HALF] = q;
+                        }
+                    }
+                    m = end;
+                }
+            }
             // A node's value at a symbol is a cubic through its four
             // nearest sightings (D_y symbols apart): one row every D_y
             // symbols holds all there is of the channel's changes.
@@ -628,6 +699,9 @@ impl Demod {
                 }
             }
             let row = &carriers[j * c_ps..(j + 1) * c_ps];
+            if rel.is_multiple_of(2) {
+                self.watch.observe(row);
+            }
             if scope && j == (first + last) / 2 {
                 scope_raw = row.to_vec();
                 for (&k, &pv) in self.cp_ks[j % dy].iter().zip(&self.cp_pv[j]) {
@@ -660,6 +734,12 @@ impl Demod {
             // scattered writes missed the cache at 6 ns a cell; scattered
             // reads overlap.
             divide(row, &hr, &hi, &mut eq_c, &mut eq_r);
+            // A flagged carrier's cell has the tone's power as noise on top
+            // of the symbol's: its variance (the reciprocal channel power,
+            // scaled by the noise later) grows by that ratio.
+            for &k in self.watch.flagged() {
+                eq_r[k as usize] *= 1.0 + self.watch.power(k as usize) / v_j;
+            }
             let src = &self.source[j % self.source.len()];
             let base = pre + rel * c_data;
             let (cells_j, var_j) = (
@@ -674,6 +754,7 @@ impl Demod {
         if errs.is_empty() {
             return None;
         }
+        self.watch.refresh();
         self.prof.channel += t_chan.elapsed();
         let t_cells = Instant::now();
         // The median of |e|² of complex Gaussian noise is variance · ln 2.
@@ -743,6 +824,7 @@ impl Demod {
             scope_pilots,
             node_rows,
             node_symbols,
+            notch: self.watch.stat(),
         })
     }
 

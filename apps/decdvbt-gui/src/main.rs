@@ -295,10 +295,10 @@ fn attach_console() {
             let h = GetStdHandle(which);
             // No handle (-1 is INVALID_HANDLE_VALUE): not redirected, so
             // the console.
-            if h.is_null() || h as isize == -1 {
-                if let Ok(f) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
-                    SetStdHandle(which, f.into_raw_handle() as _);
-                }
+            if (h.is_null() || h as isize == -1)
+                && let Ok(f) = std::fs::OpenOptions::new().write(true).open("CONOUT$")
+            {
+                SetStdHandle(which, f.into_raw_handle() as _);
             }
         }
     }

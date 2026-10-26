@@ -1184,3 +1184,234 @@ things were wrong with how the app took it:
   "FEC: below threshold". Failing signal: 359 % → 59 %; live C30 at 15.9 dB:
   the FEC stage on 1 thread at 23 % of real time. A good signal is unchanged
   (C30 capture: 5252 blocks, 0 lost, 8.7 iterations).
+
+## A moving vehicle: Doppler-adaptive channel estimate (2026-10-26)
+
+Asked for: decoding from a moving vehicle without costing a static signal
+any CPU. The recording: `exe/captures/c29_538.000MHz_10Msps_20261026-074850.cs8`
+(C29, 538 MHz, 28 s, HackRF in a car).
+
+**What the recording is (measured).** DVB-T 8k, guard 1/32, 64-QAM 3/4
+non-hierarchical (QEF C/N 18.0 dB), 48 services. The level falls all the way:
+in-band power over the band-edge floor 25 dB in the first seconds, 19–21 dB
+at 8–13 s, 14 dB at 16 s, 6–10 dB from 17 s on; the ADC clips 0.1–0.6 % of
+samples in the first 6 s (the gains were set for the strongest point).
+Decoded before this work: seconds 0–8 mostly clean, 8–14 losing more and
+more blocks, 15–16 almost nothing, 17–28 nothing (24 relocks: the signal is
+under 64-QAM's threshold by 8 dB or more there, which no receiver change
+can fix; only gain control or a more robust mode would).
+
+**Why it failed (measured, `cargo run --release -p decdvbt-rx --example
+doppler -- FILE START DUR`).** Not Doppler. The continual pilots' Doppler
+spectrum (each is seen every symbol: ±540 Hz) is a line at 0 Hz holding
+94–98 % of the power, with a skirt to about ±35 Hz and a weak tail to
+±100 Hz; the mean Doppler is within ±2 Hz (the carrier loop follows it).
+The ICI that spread implies is −26…−29 dB (derived: (2π·σ·Tu)²/12), under the
+noise. The correlation fit (below) calls the channel steady at almost every
+point. MER per symbol is narrow (16–20 dB) with no impulsive dips: the
+recording is **noise-limited at the edge of 64-QAM 3/4**, MER 18–19 dB at
+8–14 s against the 18 dB QEF figure. What the receiver gave away was in the
+channel estimate's own noise: the IIR over the pilots (α = ½) leaves a third
+of a pilot's noise in the estimate, about 0.8 dB of MER at 20 dB (derived);
+and an echo-free channel was being estimated as if it could have echoes
+over the whole 300 µs the pilot grid allows.
+
+**What changed.**
+
+- `crates/decdvbt-rx/src/mobile.rs` (new):
+  - `Tracker`: the continual pilots' autocorrelation over lags 0–15 symbols
+    (on every 4th symbol, smoothed over ~0.4 s), fitted by a Rician/Clarke
+    model r(l) = a + b·J₀(ω·l) (a grid of ω, a and b by least squares). The
+    fit gives the noise-free power (so the pilots' noise), the steady share
+    and the maximum Doppler, and from them, by the Wiener-Hopf equations, the
+    best filter over a grid point's last four pilots for each pilot age
+    (0–3 symbols), and the modelled estimate error of that filter and of the
+    IIR. A scattered share under 1.2 % is taken for measurement error (steady
+    channel). The pilots within 32 carriers of the centre are left out: the
+    radio's DC offset and its block-stepped correction (`engine::frontend`
+    moves its estimate every 13 ms block) read as "3 % fading at 76 Hz" on
+    the static C23 rooftop recording and took the time filter up wrongly.
+  - `Ring`: the last four pilots of every grid point, in slots by epoch, and
+    the time filter over them (8 FMAs a grid point).
+  - `Denoiser`: the delay-domain filter: the grid (every 3rd carrier) is
+    transformed (4096 points in 8k), only the delays a channel inside the
+    guard can have are kept (late echoes to 9/8 of the guard, early ones to a
+    quarter of it), and transformed back: in 8k 1/32 it keeps 14 % of the
+    response, so 86 % of the estimate's noise goes (derived). Not made for a
+    guard over ~1/8 of the period (it would keep most of it).
+- `chest.rs`: the equaliser feeds the tracker, retunes every 256 symbols,
+  uses the time filter when the model says the IIR's error is 1.8× the
+  filter's and over −25 dB (off again under 1.35× or −27 dB), applies the
+  delay-domain filter when the receiver asks. Also a fix: the grid points'
+  own carriers took the raw IIR grid, not the filtered estimate.
+- `receiver.rs`: the delay-domain filter goes on when the effective SNR is
+  within 4 dB of the mode's QEF C/N **and** at least 2 % of RS blocks needed
+  mending in the last 128 symbols; off over 6 dB or after 4 s of the code
+  idle. `ReceiverStatus` has `doppler_hz`, `mobile`, `denoise`;
+  `decode --progress` prints them. Env `DECDVBT_DENOISE=0|1`,
+  `DECDVBT_MOBILE=0|1` force them, for comparisons.
+- `outer.rs`: 20 uncorrectable blocks in a row no longer send the RS decoder
+  back to hunting (15 packets read plus the 11 the deinterleaver holds lost
+  each time); it goes quiet, keeps its alignment and carries on at the first
+  block that corrects. Only 1500 in a row (~90 ms) start a new hunt.
+- `modulate --k-db K` (with `--fd`): Rician fading on every path, for
+  mobile test signals (`Channel::with_rician`).
+
+**Results (measured, `decode --seconds 40`, packets without the error flag;
+base = HEAD built in a worktree).**
+
+| signal | base | now |
+|---|---|---|
+| C29 car (28 s) | 225 256 good, 7 291 flagged, 3 error-free s | 240 417 good (+6.7 %), 6 769 flagged, 4 error-free s |
+| C29 good packets per second, s 9–14 | 14k 17k 15k 13k 12k 10k | 16k 17k 16k 15k 15k 14k |
+| C23 rooftop (40 s of the 120 s) | 625 067 good, 13 904 flagged | 636 880, 3 131 flagged (−77 %) |
+| C22/C25/C26/C28 rooftop | all clean | all the same |
+| sim 64-QAM 2/3 8k cn27 | 88 005 good, 2 647 flagged | 105 036, 1 240 |
+| sim 16-QAM 3/4 2k 1/8 TU6 cn22 | 1 833 packets (lost the lock) | 18 932 |
+| sim car: ra6, Rician K 6 dB, 35 Hz, cn 26, 64-QAM 3/4 8k (4 s) | 11 791 | 60 101 (5.1×) |
+| same at 70 Hz | 1 774 | 14 289 (8×) |
+| same at 140 Hz | 117 | 418 (still unusable) |
+| static sim cn 20 | 69 957, clean | the same |
+| C30 (DVB-T2) | 7070 LDPC blocks, 0 lost | the same (T2 path untouched) |
+
+On the moving sims the time filter is most of it (35 Hz: 12 400 good with
+neither filter, 17 300 with the delay filter alone, 49 900 with the time
+filter alone, 60 100 with both); its Doppler reads 32–38 Hz against the 35 Hz
+put in, 120 Hz in the unit test. On C29 the time filter stays off (correctly:
+forcing it on gives 231 220 good, worse), and the gain is the delay filter
+and the RS change. MER on C29 by the doppler example (cells clipped at 0.1):
+20.4 → 20.8 dB at 2 s, 18.5 → 18.8 at 9 s, 18.1 → 18.4 at 12 s.
+
+**CPU (measured).** The equaliser, fastest of 5 on the C26 capture: 36.2 µs a
+symbol as before (IIR), 40.1 with the time filter, 49.4 with the delay
+filter, 53.6 with both; i.e. at 1082 symbols/s +0.4 % and +1.4 % of a core.
+A static signal with margin (C26, C28; decode, fastest of 7): receiver
+1154 → 1162 ms, equalise 3.9 → 4.0 % of real time (noise). A static signal at
+its edge with the code mending blocks (C22: 25 % of blocks corrected; C23)
+does get the delay filter, +1.6 % of a core.
+
+**Not done / open.** The last 12 s of C29 are under threshold whatever the
+estimate. The time filter is causal (the 4 pilots up to 3 symbols old): a
+non-causal one (a few symbols' delay) would cut the estimate error by another
+~5 dB at 35 Hz (derived from the model), and over ~100 Hz in 8k ICI
+(−22 dB at 140 Hz) needs cancelling, neither done. The front end's DC
+estimate steps once a 13 ms block (seen as a 76 Hz modulation on the centre
+carriers): left as it is, the tracker now skips those carriers. Doppler
+shows in `ReceiverStatus` but not yet in the GUI.
+
+## Narrowband interference: CW tones cancelled and erased (2026-10-26)
+
+Asked for: a CW carrier ("birdie") inside the channel must not wreck the OFDM
+decode, for as near no CPU as possible on a clean signal.
+
+**Two stages, because a tone does two different kinds of harm.**
+
+1. **Carrier erasure after the FFT** (`decdvbt-rx::notch`, hooks in
+   `receiver.rs` and `t2/frame.rs`). A tone lands on one carrier (and a sinc
+   skirt) with the same power in every symbol. A slow average of each carrier's
+   raw |Y|² against the local median (blocks of 192 carriers, interpolated; a
+   second pass without the flagged ones, so a strong tone's skirt cannot raise
+   its own reference) flags a carrier that is 7 dB over it *and* 4.8 dB over
+   the carriers six either side (a fade's peak is wider than a tone; the first
+   version without the narrowness test flagged 231 carriers on C25 and made it
+   worse). Skirts are followed outwards while they stay 2.5 dB over. A flagged
+   carrier's interference power (its excess over the level) is added to that
+   carrier's noise estimate (DVB-T: `Equalizer::noise`; T2: the cell's
+   variance), so the soft decoder gives it no weight. The pilots' known boosts
+   are divided out (T2's continual pilots are 8/3 in amplitude: without that
+   the detector flagged 183 pilots on a clean signal). T2 also rebuilds the
+   pilot-lattice nodes under a flagged carrier from the nearest clean nodes, so
+   the interpolator does not spread the tone's error over the neighbours.
+2. **Frequency-shift-and-subtract before everything** (`decdvbt-rx::tone`,
+   hook at the top of both `push`es). A strong CW (a few dB under the signal's
+   power or more) is not harmed after the FFT but before it: the cyclic-prefix
+   correlation and the carrier-offset estimate take a CW for a perfect echo, and
+   the receiver never acquires (measured: a −6 dB tone, no lock; erasure cannot
+   help, it comes after acquisition). The detector is an 8192-point Hann FFT of
+   one block in 524288 samples, power-averaged, a bin 20 dB over the local
+   median inside the channel's ±3.75 MHz (hysteresis: kept to 14 dB). The
+   canceller is an oscillator at the tone's frequency (phase-continuous over
+   blocks and gaps) whose complex amplitude is subtracted from every sample; a
+   2048-sample sum of x·conj(osc) gives the amplitude, its turn the frequency
+   error (a first-order loop follows a drift or a ppm shift). Up to 4 tones. It
+   copies and subtracts only while a tone is held; otherwise the block is passed
+   through untouched.
+
+Why not an IIR notch in the time domain: it costs a few multiplies every sample
+for ever, notches the signal's own energy and needs a tracker for drift anyway.
+Subtraction takes the tone out and leaves the signal; only the tone's own
+carrier is lost, to the FEC.
+
+Both can be switched off for comparison: `DECDVBT_NOTCH=0`, `DECDVBT_TONE=0`.
+Stats: `ReceiverStatus::notch/tone`, `T2Status::notch/tone`; the CLI decode
+report prints a "narrowband interference" line, the GUI scope header shows
+"N CW tone(s) cancelled" / "N carrier(s) erased".
+
+### Measured (release; `crates/decdvbt-rx/examples/notch_sweep.rs`)
+
+Tone powers are dB over the capture's own mean power, at +1.0003 MHz (between
+bins), added in memory to `sim_64qam-2-3-8k-1-32_C30_..._cn25` (DVB-T, with
+white noise added to bring it to MER 19.6 dB, 64-QAM 2/3's edge) and to
+`sim_t2_uk_long` (T2 256-QAM, noise added to MER 19.2 dB; the first frame of
+nine is lost with a tone, while the averages build: the "off" and "erase" lost
+blocks of 171-182 are that frame). off / erasure only / both:
+
+| case | off | erase only | cancel + erase |
+|---|---|---|---|
+| T, no tone: pre-RS BER | 3.7e-7 | 3.7e-7 | 3.7e-7 |
+| T, −25 dB | 2.9e-7 | 1.2e-7 | 1.2e-7 (not engaged) |
+| T, −17 dB | 9.6e-7, MER 17.9 | 3.7e-7 | 3.7e-7, MER 14.1 incl. the tone |
+| T, −12 dB | 1.5e-6, MER 15.6 | 9.6e-7 | 3.5e-7, MER 19.6 |
+| T, −8 dB | 6.9e-6, MER 13.1 | 3.2e-6 but 5 locks (re-acquired) | 1.8e-7, MER 19.6 |
+| T, 0 dB | never locks | never locks | 1.4e-7, MER 19.6 |
+| T, +10 dB | never locks | never locks | 2.9e-7, MER 19.3 |
+| T2, no tone: LDPC iterations/block | 5.1 | 5.1 | 5.1 |
+| T2, −30 dB | 5.9 | 5.5 | 5.5 |
+| T2, −20 dB (1 block lost off/erase) | 7.3 | 6.5 | 6.5 |
+| T2, −10 dB: blocks lost / iterations | 182 / 10.3 | 171 / 7.3 | 0 / 6.6 |
+| T2, 0 dB | never locks | never locks | 0 lost, 6.6 |
+| T2, +10 dB | never locks | never locks | 202 lost (the first frame), 7.5 |
+
+A tone also drifting 20 kHz/s from −2.5 MHz (and one at +3.6 MHz, near the
+band edge) is followed and cancelled to the same BER at −15 and −5 dB.
+`tests/cw_tone.rs` runs the modulator's T2 signal with tones at −12, −4 and
++3 dB (all decode with no bad packet) and a clean one (nothing flagged).
+
+A single CW is cheap for the code to carry: at MER 25 dB a −10 dB tone costs
+a 64-QAM DVB-T decode nothing (0 pre-RS errors with or without anything), so
+below about −20 dB the erasure gains a factor of 2-3 in BER and no more.
+What breaks the receiver is a tone near or over the signal's power, and the
+canceller fixes that case.
+
+**Real captures** (`examples/tone_scan.rs`: long-term spectrum, 128-bin median;
+C22, C23 (incl. the 120 s one), C25, C26, C28, C30 and the C29 of 26 Oct): no
+persistent CW tone in any channel. What shows: the HackRF's DC spike at the
+centre (2 to 23 dB over the median, larger without the RF amp, e.g. C25 +18 dB
+with it, +23 dB without), the edge continual pilots at ±3.8 MHz and
+adjacent-channel edges (C25 −3.80 MHz +15 dB), nothing else over 8.5 dB. The
+DC spike is the one tone found: the canceller takes it out of C25 (amp)
+(pre-RS BER 9.3e-4 → 6.8e-4, 25352 → 19879 RS-corrected blocks of 70508; MER
+18.8 → 20.4 dB); erasing its carrier alone changes nothing (BER equal). C26/C28/
+C23/C22 and the T2 C30 are unchanged within 1 % (C30 LDPC iterations 8.6 → 8.0).
+
+**CPU on a clean signal** (derived from release micro-benchmarks, `cargo test
+--release -p decdvbt-rx bench_ -- --ignored --nocapture`, best of 20):
+carrier watch 1.64 µs a symbol observed (every second symbol) + 72 µs a refresh
+(every 64 symbols) at 8k = about 1.7 ms/s; at T2 32k 6.7 µs + 303 µs a frame
+= about 2.5 ms/s; detector 103 µs a pass, 19 passes/s = 2 ms/s. Together
+about 0.4-0.5 % of one core with nothing found. With a tone held the canceller
+adds 1.7 ns/sample = 1.7 % of a core at 10 Msps (measured). Whole-receiver
+wall times, fastest of N, are inside this machine's run-to-run spread (±20 %
+at the time) and are not a measurement of the stage:
+C26 amp, 4 s: off 1.47 s / on 1.55 s (fastest of 5), then 1.85 / 1.68 s (fastest of 8, interleaved); C28 amp under heavy load from other builds: 5.31 / 5.58 s (fastest of 10), where an idle run takes about 1.5 s.
+
+**Not done / limits.** The carrier erasure cannot recover the cells under a
+tone, only discard them (the canceller can). DVB-T's own scattered-pilot grid
+is not repaired under a tone (the Doppler work is changing the chest code; the
+innovation-based noise estimate already lowers those pilots' weights). A tone
+that moves faster than ~16 symbols (carrier erasure) or ~0.5 kHz in a
+2048-sample chunk (canceller) is not followed. Tones above 0 dB overload the
+8-bit ADC before any of this (the sweeps scale the file; a live radio would clip).
+The detector's ON threshold (20 dB over the median) sits above the T2 continual
+pilots' own lines (seen to 17 dB in a simulated 8k signal), so a tone weaker than
+about −14 dB is left to the erasure.

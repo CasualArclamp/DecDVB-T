@@ -9,6 +9,7 @@
 //! equalised ([`crate::t2::frame`]), L1 read from its P2 symbols, and its
 //! PLP's cells decoded ([`crate::t2::plp`]).
 
+use crate::tone::ToneCanceller;
 use std::time::{Duration, Instant};
 
 use decdvbt_core::Iq;
@@ -140,6 +141,10 @@ pub struct T2Status {
     pub cfo_hz: f64,
     pub clock_ppm: f64,
     pub snr_db: f32,
+    /// Tones found in the channel and erased (see [`crate::notch`]).
+    pub notch: crate::notch::NotchStat,
+    /// Strong tones taken out of the samples (see [`crate::tone`]).
+    pub tone: crate::tone::ToneStat,
     /// The SNR a Gaussian channel would need to carry what the PLP's cells
     /// carry, dB (see [`crate::capacity`]; a rotated constellation's point
     /// at the mean SNR of its two cells).
@@ -196,6 +201,7 @@ pub struct T2Receiver {
     interp: Interpolator,
     win: Window,
     track: Option<Track>,
+    tone: ToneCanceller,
     status: T2Status,
     next_attempt: u64,
     ts: Vec<u8>,
@@ -258,6 +264,7 @@ impl T2Receiver {
             // one's: keep what went by.
             win: Window::with_history(HISTORY),
             track: None,
+            tone: ToneCanceller::new(cfg.fs_in, cfg.vfo_offset_hz),
             status: T2Status::default(),
             next_attempt: 0,
             ts: Vec::new(),
@@ -411,6 +418,19 @@ impl T2Receiver {
     /// Hand over a block of the radio's samples, whose first is the stream's
     /// `abs_start`-th.
     pub fn push(&mut self, block: &[Iq], abs_start: u64) {
+        // A strong CW tone is taken out of the samples first (a copy, only
+        // while one is held).
+        if self.tone.process(block, abs_start) {
+            let cleaned = self.tone.take_out();
+            self.push_samples(&cleaned, abs_start);
+            self.tone.give_back(cleaned);
+        } else {
+            self.push_samples(block, abs_start);
+        }
+        self.status.tone = self.tone.stat();
+    }
+
+    fn push_samples(&mut self, block: &[Iq], abs_start: u64) {
         self.collect();
         if !self.win.is_wanting() {
             self.want_acquisition(abs_start.max(self.next_attempt));
@@ -821,6 +841,7 @@ impl T2Receiver {
             return;
         };
         self.status.snr_db = data.snr_db;
+        self.status.notch = data.notch;
         let c_data = t.demod.carriers.data_cells();
         if let Some(s) = &mut self.sounder {
             s.push_frame(&FrameRows {

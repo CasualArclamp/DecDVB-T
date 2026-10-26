@@ -32,9 +32,11 @@ use crate::chest::Equalizer;
 use crate::demap::Demapper;
 use crate::interp::Interpolator;
 use crate::lock::{ACQ_NATIVE, Failure, lock_on};
+use crate::notch::{CarrierWatch, NotchStat};
 use crate::outer::{OuterDecoder, OuterStats};
 use crate::scope::{self, MeasureState, Measurements, Scopes};
 use crate::symbol::{PAD, SymbolReader};
+use crate::tone::{ToneCanceller, ToneStat};
 use crate::tps_rx::TpsReceiver;
 use crate::window::Window;
 
@@ -63,6 +65,16 @@ const HEAT_QUEUE: usize = 256;
 const MIN_SNR_DB: f32 = 2.0;
 const UNDECODABLE_DB: f32 = 8.0;
 const POOR_LOOKS: u32 = 4;
+/// The delay-domain filter on the channel estimate goes on when the effective
+/// SNR is under what the mode needs plus the first figure and at least the
+/// share given of the Reed–Solomon blocks needed mending in the last look; off
+/// again above the second figure, or after the given looks in a row (4 s) with
+/// under the last share needing it.
+const DENOISE_ON_MARGIN_DB: f32 = 4.0;
+const DENOISE_OFF_MARGIN_DB: f32 = 6.0;
+const DENOISE_BUSY_FRAC: f32 = 0.02;
+const DENOISE_IDLE_FRAC: f32 = 0.001;
+const DENOISE_IDLE_LOOKS: u32 = 32;
 
 /// Is the signal there? Counts looks at the signal-to-noise ratio under the
 /// floor in a row.
@@ -175,6 +187,14 @@ pub struct ReceiverStatus {
     /// against the mode's QEF C/N (see [`crate::capacity`]).
     pub effective_snr_db: f32,
     pub coherence: f32,
+    /// The channel's maximum Doppler, Hz, as the continual pilots' correlation
+    /// in time fits it (`None` until a quarter second has been seen; a steady
+    /// channel reads 0), and how the channel estimate is being made: the time
+    /// filter for a moving channel instead of the IIR (`mobile`), and the
+    /// delay-domain filter for a signal near its threshold (`denoise`).
+    pub doppler_hz: Option<f32>,
+    pub mobile: bool,
+    pub denoise: bool,
     /// Symbols read since the lock, and locks since the start.
     pub symbols: u64,
     pub locks: u32,
@@ -193,6 +213,10 @@ pub struct ReceiverStatus {
     pub stalled_locks: u32,
     pub outer: OuterStats,
     pub profile: Profile,
+    /// Tones found in the channel and erased (see [`crate::notch`]).
+    pub notch: NotchStat,
+    /// Strong tones taken out of the samples (see [`crate::tone`]).
+    pub tone: ToneStat,
 }
 
 /// The inner and outer decoders for one set of TPS parameters.
@@ -235,6 +259,54 @@ struct Track {
     symbols: u64,
     health: Health,
     quality: Quality,
+    /// Narrowband interference: tones in the channel, erased in the demapper.
+    watch: CarrierWatch,
+    denoise: DenoiseGate,
+}
+
+/// When the delay-domain filter on the channel estimate is worth its CPU: the
+/// signal is near what the mode needs *and* the Reed–Solomon code is at work
+/// (a static signal that comes out clean, however small its margin, does
+/// without it). Looked at every [`QUALITY_SYMBOLS`].
+#[derive(Debug, Default)]
+struct DenoiseGate {
+    /// The Reed–Solomon counts at the last look: blocks, and blocks that
+    /// needed mending or could not be mended.
+    blocks: u64,
+    busy: u64,
+    /// Looks in a row with the code idle.
+    idle: u32,
+}
+
+impl DenoiseGate {
+    /// One look, with the margin of the effective SNR over the mode's QEF C/N
+    /// (dB) and the code's counts; whether the filter is wanted, given that it
+    /// is `on` now.
+    fn look(&mut self, on: bool, margin_db: f32, o: &OuterStats) -> bool {
+        let busy = o.corrected + o.uncorrectable;
+        // Counts that went back (a new chain) start the reckoning afresh.
+        let (db, dbusy) = if o.blocks >= self.blocks && busy >= self.busy {
+            (o.blocks - self.blocks, busy - self.busy)
+        } else {
+            (0, 0)
+        };
+        (self.blocks, self.busy) = (o.blocks, busy);
+        let frac = if db > 0 {
+            dbusy as f32 / db as f32
+        } else {
+            0.0
+        };
+        self.idle = if frac < DENOISE_IDLE_FRAC {
+            self.idle + 1
+        } else {
+            0
+        };
+        if on {
+            margin_db < DENOISE_OFF_MARGIN_DB && self.idle < DENOISE_IDLE_LOOKS
+        } else {
+            margin_db < DENOISE_ON_MARGIN_DB && frac >= DENOISE_BUSY_FRAC
+        }
+    }
 }
 
 pub struct Receiver {
@@ -244,6 +316,7 @@ pub struct Receiver {
     interp: Interpolator,
     win: Window,
     track: Option<Track>,
+    tone: ToneCanceller,
     status: ReceiverStatus,
     next_attempt: u64,
     ts: Vec<u8>,
@@ -259,6 +332,11 @@ pub struct Receiver {
     /// wanted a second (0: none), and the ones made and not yet taken.
     heat_rate: f64,
     heat: Vec<Measurements>,
+    /// Diagnostics, for comparing on a capture: env DECDVBT_DENOISE=0|1 and
+    /// DECDVBT_MOBILE=0|1 force the channel estimate's delay-domain filter and
+    /// its time filter off or on instead of leaving them to the signal.
+    dev_denoise: Option<bool>,
+    dev_mobile: Option<bool>,
 }
 
 impl Receiver {
@@ -271,6 +349,7 @@ impl Receiver {
             interp: Interpolator::new(),
             win: Window::new(),
             track: None,
+            tone: ToneCanceller::new(cfg.fs_in, cfg.vfo_offset_hz),
             status: ReceiverStatus::default(),
             next_attempt: 0,
             ts: Vec::new(),
@@ -282,6 +361,8 @@ impl Receiver {
             measure_state: MeasureState::default(),
             heat_rate: 0.0,
             heat: Vec::new(),
+            dev_denoise: std::env::var("DECDVBT_DENOISE").ok().map(|v| v == "1"),
+            dev_mobile: std::env::var("DECDVBT_MOBILE").ok().map(|v| v == "1"),
         }
     }
 
@@ -352,6 +433,19 @@ impl Receiver {
     /// Hand over a block of the radio's samples, whose first is the stream's
     /// `abs_start`-th.
     pub fn push(&mut self, block: &[Iq], abs_start: u64) {
+        // A strong CW tone is taken out of the samples first (a copy, only
+        // while one is held).
+        if self.tone.process(block, abs_start) {
+            let cleaned = self.tone.take_out();
+            self.push_samples(&cleaned, abs_start);
+            self.tone.give_back(cleaned);
+        } else {
+            self.push_samples(block, abs_start);
+        }
+        self.status.tone = self.tone.stat();
+    }
+
+    fn push_samples(&mut self, block: &[Iq], abs_start: u64) {
         if !self.win.is_wanting() {
             self.want_acquisition(abs_start.max(self.next_attempt));
         }
@@ -451,9 +545,12 @@ impl Receiver {
         // hundredths of a sample accurate, does the fine work.
         reader.alpha_cp = 0.05;
         reader.beta_cp = 0.0005;
+        let mut eq = Equalizer::new(l.fft);
+        eq.set_guard(l.guard);
+        eq.forced = self.dev_mobile;
         self.track = Some(Track {
             reader,
-            eq: Equalizer::new(l.fft),
+            eq,
             tps: TpsReceiver::new(l.fft),
             phase: l.phase,
             guard: l.guard,
@@ -463,6 +560,24 @@ impl Receiver {
             symbols: 0,
             health: Health::default(),
             quality: Quality::default(),
+            watch: {
+                // The continual pilots are 4/3 in amplitude and always there;
+                // the scattered ones (a carrier in three) the same, one
+                // symbol in four (EN 300 744, 4.5).
+                let mut w = CarrierWatch::new();
+                let mut expect = vec![1.0f32; l.fft.active_carriers()];
+                for k in (0..expect.len()).step_by(3) {
+                    expect[k] = 1.0 + (16.0 / 9.0 - 1.0) / 4.0;
+                }
+                for &k in decdvbt_ofdm::pilots::continual_pilots(l.fft) {
+                    if let Some(e) = expect.get_mut(k as usize) {
+                        *e = 16.0 / 9.0;
+                    }
+                }
+                w.set_expected(expect);
+                w
+            },
+            denoise: DenoiseGate::default(),
         });
         self.status.locks += 1;
         self.status.attempts = 0;
@@ -500,7 +615,19 @@ impl Receiver {
             self.raw.clear();
             self.raw.extend_from_slice(&carriers);
         }
+        // Narrowband interference: every second symbol's power per carrier
+        // goes into the watcher's average, the flags are redone every 64
+        // symbols, and the flagged carriers' noise goes up by the tone's
+        // power (so the demapper gives their cells no weight).
+        if t.symbols % 2 == 0 {
+            t.watch.observe(&carriers);
+            if t.watch.seen() % 32 == 0 {
+                t.watch.refresh();
+                self.status.notch = t.watch.stat();
+            }
+        }
         t.eq.process(&mut carriers, t.phase);
+        t.watch.add_to_noise(&mut t.eq.noise);
         t.reader.correct(f64::from(t.eq.timing_error()));
         let t2 = Instant::now();
         let pr = &mut self.status.profile;
@@ -636,6 +763,13 @@ impl Receiver {
         self.status.tps_synced = synced;
         self.status.decoding = synced && t.chain.is_some();
         self.status.coherence = coherence;
+        if t.symbols % QUALITY_SYMBOLS == 0 {
+            let fft = t.reader.fft;
+            let ts = (fft.n() + fft.n() / t.guard.divisor()) as f64 / self.fs_native;
+            self.status.doppler_hz = t.eq.doppler_hz(ts);
+        }
+        self.status.mobile = t.eq.mobile();
+        self.status.denoise = t.eq.denoising();
         self.status.cfo_hz = t.reader.f_total;
         self.status.clock_ppm = t.reader.rate * 1e6;
         self.status.symbols = t.symbols;
@@ -645,6 +779,20 @@ impl Receiver {
         if t.bad >= LOST_AFTER {
             self.drop_lock();
             return;
+        }
+        if t.symbols % QUALITY_SYMBOLS == 0
+            && let Some(info) = self.status.tps
+            && self.status.decoding
+            && !self.status.hierarchical
+        {
+            // The delay-domain filter on the channel estimate costs about 40 %
+            // of the equaliser's time and buys what a signal with little
+            // margin over the mode's threshold needs (up to ~1 dB of MER):
+            // see `DenoiseGate`.
+            let margin = self.status.effective_snr_db - qef_cn_db(info.modulation, info.rate_hp);
+            let wanted = t.denoise.look(t.eq.denoising(), margin, &self.status.outer);
+            let on = self.dev_denoise.unwrap_or(wanted);
+            t.eq.set_denoise(on);
         }
         if t.symbols % QUALITY_SYMBOLS == 0
             && t.eq.ready()

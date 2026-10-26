@@ -244,6 +244,12 @@ impl ScopeView {
                         o.uncorrectable as f64 / total as f64
                     ));
                 }
+                if st.tone.tones > 0 {
+                    bits.push(format!("{} CW tone(s) cancelled", st.tone.tones));
+                }
+                if st.notch.carriers > 0 {
+                    bits.push(format!("{} carrier(s) erased", st.notch.carriers));
+                }
                 ui.label(RichText::new(bits.join(" · ")).color(SNR));
             }
         });
@@ -562,11 +568,11 @@ fn response_plot(ui: &mut Ui, size: egui::Vec2, m: Option<&Measurements>) {
     across_band(
         ui,
         size,
-        "gain, dB (MHz from centre)",
+        "group delay, µs (MHz from centre)",
         m,
-        |m| &m.gain_db,
+        |m| &m.group_delay_us,
         TRACE,
-        -40.0,
+        f32::MIN,
     );
 }
 

@@ -260,7 +260,7 @@ pub fn run(a: DecodeArgs) -> Result<()> {
                 continue;
             }
             println!(
-                "{secs:5.1} s: {} symbols, TPS {}, SNR {:.1} dB, RS {} clean / {} fixed / {} lost, {} packets",
+                "{secs:5.1} s: {} symbols, TPS {}, SNR {:.1} dB, RS {} clean / {} fixed / {} lost, {} packets; Doppler {}, estimate {}{}",
                 st.symbols,
                 if st.tps_synced {
                     "in sync"
@@ -271,7 +271,11 @@ pub fn run(a: DecodeArgs) -> Result<()> {
                 st.outer.clean,
                 st.outer.corrected,
                 st.outer.uncorrectable,
-                packets_out
+                packets_out,
+                st.doppler_hz
+                    .map_or("-".to_string(), |d| format!("{d:.0} Hz")),
+                if st.mobile { "time filter" } else { "IIR" },
+                if st.denoise { " + delay filter" } else { "" },
             );
         }
     }
@@ -380,6 +384,9 @@ pub fn run(a: DecodeArgs) -> Result<()> {
         o.losses,
         o.pre_rs_ber()
     );
+    if let Some(l) = decdvbt_rx::notch::describe(&st.notch, &st.tone) {
+        println!("narrowband interference: {l}");
+    }
     println!(
         "{packets_out} transport packets{}",
         a.output
@@ -443,6 +450,9 @@ fn t2_report(rx: &AutoReceiver, signal_s: f64, packets: u64, output: Option<&std
         t2.bch_corrected,
         t2.resyncs
     );
+    if let Some(l) = decdvbt_rx::notch::describe(&t2.notch, &t2.tone) {
+        println!("narrowband interference: {l}");
+    }
     println!(
         "where the time went (% of real time, one core): acquire {:.1}; read frames {:.1} (resample {:.1}, rotate {:.1},          transforms {:.1}); equalise {:.1} (alignment {:.1}, channel {:.1}, cells {:.1}); FEC stage {:.1}          of which deinterleave {:.1}, demap {:.1}, bit deinterleave {:.1}, LDPC {:.1}, BCH {:.1}",
         pct(p.acquire),

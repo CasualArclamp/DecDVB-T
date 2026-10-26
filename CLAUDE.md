@@ -22,6 +22,8 @@ cargo run --release -p decdvbt-cli -- decode out/c23.ts --carousel 4416 out/rb  
 cargo run --release -p decdvbt-mheg --example redbutton -- out/live_c30.ts --sid 17536 --keys wait,100,wait,15 --png out/rb.png   # a service's MHEG-5 app, headless (--trace)
 cargo run --release -p decdvbt-cli -- capture C23 --amp --lna 32 --vga 8 --record x.cs8  # the RF amp must be on for DVB-T
 cargo run --release -p decdvbt-rx --example diag -- x.cs8   # per-symbol equaliser diagnostics (see its header)
+cargo run --release -p decdvbt-rx --example doppler -- x.cs8 9 1.5   # from 9 s for 1.5 s: Doppler spectrum of the pilots, the Rician fit, MER (env MOBILE=0|1 DENOISE=0|1, FIT, FINE)
+cargo run --release -p decdvbt-cli -- modulate --profile ra6 --fd 35 --k-db 6 --cn 26 x.cs8   # a moving vehicle: Rician fading (--k-db) at 35 Hz; decode with env DECDVBT_MOBILE / DECDVBT_DENOISE =0|1 to force the estimator
 cargo run --release -p decdvbt-cli -- decode C30 --amp --lna 32 --vga 8 -o out/c30.ts   # live DVB-T2 (or T) from the HackRF; --progress prints a line a second
 cargo run --release -p decdvbt-cli -- modulate --t2 uk --seconds 2.4 --cn 30 --cfo 50123 --sco 4 --path 0:0 --path 3:-12 captures/x.cs8   # a DVB-T2 test signal (uk, small, or 8k-1/16-pp4-16qam-3/4-short-ext)
 cargo run --release -p decdvbt-rx --example t2_decode -- captures/c30_546.000MHz_10Msps_amp.cs8 out/c30.ts 10 0 8   # the T2 receiver alone, per-frame lines and per-stage times (env THREADS)

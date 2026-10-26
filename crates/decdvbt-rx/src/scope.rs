@@ -111,6 +111,9 @@ pub struct Measurements {
     pub freq_mhz: Vec<f32>,
     pub gain_db: Vec<f32>,
     pub snr_db: Vec<f32>,
+    /// The channel's group delay at each point (µs): minus the slope of its
+    /// phase against frequency. A single path is flat; echoes make it ripple.
+    pub group_delay_us: Vec<f32>,
     /// The impulse response: for each tap its delay (µs) and its level against
     /// the strongest (dB, down to a floor), over a window around the guard.
     pub delay_us: Vec<f32>,
@@ -148,7 +151,9 @@ pub fn measure(
     // Across the band: groups of carriers.
     let group = k_total.div_ceil(CURVE_POINTS).max(1);
     let mean_w = w.iter().sum::<f32>() / k_total as f32;
-    let (mut freq, mut gain, mut snr) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut freq, mut gain, mut snr, mut gd) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let tau_per_rad = 1.0 / (std::f32::consts::TAU * df_mhz);
     for g in (0..k_total).step_by(group) {
         let end = (g + group).min(k_total);
         let (sw, sn) = (
@@ -160,6 +165,18 @@ pub fn measure(
         freq.push((mid - kmid as f32) * df_mhz);
         gain.push(10.0 * (sw / cnt / mean_w.max(1e-20)).max(1e-9).log10());
         snr.push(10.0 * (sw / sn.max(1e-20)).max(1e-9).log10());
+        // Group delay: the phase step between neighbouring carriers, summed
+        // as H[k+1]·conj(H[k]) over the group so a faded carrier counts for
+        // little. MHz in, so the delay comes out in µs.
+        let (mut re, mut im) = (0.0f32, 0.0f32);
+        for k in g..(end + 1).min(k_total) {
+            if k == 0 {
+                continue;
+            }
+            re += hr[k] * hr[k - 1] + hi[k] * hi[k - 1];
+            im += hi[k] * hr[k - 1] - hr[k] * hi[k - 1];
+        }
+        gd.push(-im.atan2(re) * tau_per_rad);
     }
     let mean_snr = 10.0
         * (w.iter().sum::<f32>() / noise.iter().sum::<f32>().max(1e-20))
@@ -223,6 +240,7 @@ pub fn measure(
         freq_mhz: freq,
         gain_db: gain,
         snr_db: snr,
+        group_delay_us: gd,
         delay_us: delay,
         impulse_db: level,
         echoes: peaks,
@@ -235,6 +253,36 @@ pub fn measure(
 mod tests {
     use super::*;
     use decdvbt_core::dvbt::FftSize;
+
+    /// One path 3 µs late is a flat group delay of 3 µs.
+    #[test]
+    fn group_delay_of_one_late_path_is_its_delay() {
+        let fft = FftSize::K8;
+        let fs = 64e6 / 7.0;
+        let k_total = fft.active_carriers();
+        let kmid = (k_total - 1) / 2;
+        let df = fs / fft.n() as f64;
+        let (mut hr, mut hi) = (vec![0.0f32; k_total], vec![0.0f32; k_total]);
+        for k in 0..k_total {
+            let ph = -std::f64::consts::TAU * (k as f64 - kmid as f64) * df * 3e-6;
+            (hr[k], hi[k]) = (ph.cos() as f32, ph.sin() as f32);
+        }
+        let w = vec![1.0f32; k_total];
+        let noise = vec![0.001f32; k_total];
+        let m = measure(
+            &mut MeasureState::default(),
+            fft.n(),
+            fs,
+            28.0,
+            (&hr, &hi),
+            &w,
+            &noise,
+        );
+        assert_eq!(m.group_delay_us.len(), m.freq_mhz.len());
+        for &d in &m.group_delay_us[1..] {
+            assert!((d - 3.0).abs() < 0.05, "{d}");
+        }
+    }
 
     /// A channel of two paths, 2 µs apart and 6 dB down: its estimate is
     /// 1 + a·e^(−j2πfτ); the impulse response has the second path at +2 µs,

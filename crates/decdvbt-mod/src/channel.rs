@@ -181,6 +181,18 @@ impl Channel {
         self
     }
 
+    /// Give every path Rician fading: a steady component `k_db` over the
+    /// scattered one, which spreads to ±`max_doppler_hz`.
+    pub fn with_rician(mut self, k_db: f64, max_doppler_hz: f64) -> Channel {
+        for p in &mut self.paths {
+            p.fading = Fading::Rician {
+                k_db,
+                max_doppler_hz,
+            };
+        }
+        self
+    }
+
     pub fn is_clean(&self) -> bool {
         self.paths.is_empty()
             && self.cfo_hz == 0.0

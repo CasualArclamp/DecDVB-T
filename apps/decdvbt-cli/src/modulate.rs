@@ -64,6 +64,11 @@ pub struct ModulateArgs {
     /// Rayleigh fading on every path, at this maximum Doppler, Hz.
     #[arg(long)]
     fd: Option<f64>,
+    /// With --fd: Rician instead of Rayleigh fading, a steady component this
+    /// many dB over the scattered one on every path (a vehicle with a line
+    /// of sight).
+    #[arg(long, requires = "fd", allow_hyphen_values = true)]
+    k_db: Option<f64>,
     /// Carrier frequency offset, Hz.
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     cfo: f64,
@@ -122,7 +127,10 @@ fn channel_of(a: &ModulateArgs) -> Result<Channel> {
         if ch.paths.is_empty() {
             ch.paths.push(ChannelPath::echo(0.0, 0.0));
         }
-        ch = ch.with_rayleigh(fd);
+        ch = match a.k_db {
+            Some(k_db) => ch.with_rician(k_db, fd),
+            None => ch.with_rayleigh(fd),
+        };
     }
     if let Some(i) = &a.impulse {
         let v = numbers(i, 3, "--impulse")?;

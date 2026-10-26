@@ -10,7 +10,11 @@
 //! 2. **Follow.** Aligned bytes go through the convolutional deinterleaver
 //!    (which delays them by 11 packets), are cut into 204-byte blocks, and
 //!    each is corrected by the Reed–Solomon code (up to 8 bytes). A run of
-//!    blocks that will not correct sends the decoder back to hunting.
+//!    blocks that will not correct makes it quiet (nothing is passed on, and
+//!    the alignment is kept: a fade in a moving vehicle lasts a few ms, and the
+//!    first block that corrects again carries on at once, where a new hunt would
+//!    cost the 15 packets it reads and the 11 the deinterleaver holds); only a
+//!    long run of them (`HARD_LOST`) sends the decoder back to hunting.
 //! 3. **Descramble.** The energy-dispersal sequence restarts at each packet
 //!    whose sync byte is inverted and runs on through the next seven; it is
 //!    laid out once and each packet XORed with its slice. A packet the code
@@ -24,8 +28,15 @@ use decdvbt_fec::rs::ReedSolomon;
 /// Packets in the hunt window and how many of them must show a sync byte.
 const HUNT_PACKETS: usize = 15;
 const HUNT_NEED: usize = 11;
-/// Uncorrectable blocks in a row that end the lock.
+/// Uncorrectable blocks in a row that count as a loss of the signal: the
+/// decoder goes quiet (keeps its alignment, passes nothing on).
 const LOST_AFTER: u32 = 20;
+/// Uncorrectable blocks in a row (about 90 ms of a 64-QAM 3/4 stream) after
+/// which the alignment itself is doubted and the decoder hunts afresh. A block
+/// is 204 bytes: the sync byte of a good one is the check, so a quiet decoder
+/// that is still aligned finds its first good block within a few of them once
+/// the signal is back.
+const HARD_LOST: u32 = 1500;
 
 /// The scrambling sequence over a group of eight: byte i of packet p is
 /// XORed with `seq[188p + i − 1]` (i = 1 … 187).
@@ -273,12 +284,17 @@ impl OuterDecoder {
             self.bad_run = 0;
         } else {
             self.bad_run += 1;
-            if self.bad_run >= LOST_AFTER {
+            if self.bad_run == LOST_AFTER {
                 self.stats.losses += 1;
+            }
+            if self.bad_run >= HARD_LOST {
                 self.reset();
                 return;
             }
         }
+        // Quiet: a loss was declared and no block has corrected since. The
+        // stream's place in its group of eight goes on being counted.
+        let quiet = self.bad_run >= LOST_AFTER;
 
         // Where the block is in its group of eight.
         let pos = if good && self.block[0] == SYNC_INVERTED {
@@ -293,7 +309,7 @@ impl OuterDecoder {
         self.next_pos = pos.map(|p| (p + 1) % GROUP);
         let Some(p) = pos else { return };
 
-        if !good && !self.emit_errors {
+        if quiet || (!good && !self.emit_errors) {
             return;
         }
         let seq = sequence();

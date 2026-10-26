@@ -35,8 +35,10 @@
 //!    told to the decoder as the poor evidence it is.
 
 use decdvbt_core::Iq;
-use decdvbt_core::dvbt::FftSize;
+use decdvbt_core::dvbt::{FftSize, Guard};
 use decdvbt_ofdm::pilots::{continual_pilots, prbs};
+
+use crate::mobile::{Denoiser, Estimate, Ring, Tracker};
 
 // The work is mostly loops over a few thousand carriers. They are written as
 // plain loops over separate real and imaginary arrays (which the compiler
@@ -70,6 +72,19 @@ const NOISE_SPAN: usize = 3;
 /// value in channel units has 9/16 of the noise), and the innovation holds the
 /// old estimate's noise too (α/(2−α) of it, a third at α = 1/2): 9/16 · 4/3.
 const INNOVATION: f32 = 0.75;
+/// How often (in symbols) the filters are fitted to the measured correlation,
+/// and when the time filter takes over from the IIR and gives back: its
+/// modelled error must be this many times better than the IIR's, and the IIR's
+/// big enough to matter (against the pilots' power: −25 dB, and −27 dB to give
+/// up). Two thresholds, so that it does not flap.
+const TUNE_EVERY: u32 = 256;
+/// Carriers either side of the centre whose continual pilots the measurement
+/// leaves out (see `new`).
+const DC_SPAN: usize = 32;
+const ON_RATIO: f32 = 1.8;
+const OFF_RATIO: f32 = 1.35;
+const MIN_MSE_ON: f32 = 0.003;
+const MIN_MSE_OFF: f32 = 0.002;
 /// The interpolator reaches this many grid points either side.
 const L: usize = 4;
 /// Kaiser β of its window.
@@ -140,6 +155,26 @@ pub struct Equalizer {
     /// The interpolator's taps for the carriers a third and two thirds of
     /// the way between grid points, for the grid points m−L+1 .. m+L.
     taps: [[f32; 2 * L]; 2],
+    /// How the channel changes, measured on the continual pilots, and what
+    /// the measurement says (see `mobile.rs`).
+    trk: Tracker,
+    est: Option<Estimate>,
+    /// Symbols since the filters were last tuned to the measurement.
+    since_tune: u32,
+    /// Whether the grid's estimate comes from the time filter over the last
+    /// four pilots (a moving channel) rather than the IIR (a still one).
+    mobile: bool,
+    /// Force the choice (tests, diagnostics) instead of the measurement's.
+    pub forced: Option<bool>,
+    ring: Ring,
+    /// Counts groups of four symbols (a new one at pilot phase 0), and the
+    /// phase of the symbol before.
+    epoch: usize,
+    last_phase: usize,
+    /// The delay-domain filter of the grid, if the guard is short enough for
+    /// it to matter, and whether it is on.
+    denoiser: Option<Denoiser>,
+    denoise_on: bool,
 }
 
 /// The interpolation taps for a point `f` (0..1) of the way from grid point
@@ -182,6 +217,7 @@ impl Equalizer {
             .map(|&k| (k as f32 - kmid as f32) / kmid as f32)
             .collect();
         let n_slopes = (2.0 * SLOPE_MAX / SLOPE_STEP) as usize + 1;
+        let trk_used: Vec<bool> = cps.iter().map(|&k| k.abs_diff(kmid) > DC_SPAN).collect();
         let np = cps.len().next_multiple_of(8);
         let mut cp_x = cp_x;
         cp_x.resize(np, 0.0);
@@ -231,6 +267,23 @@ impl Equalizer {
             hr: vec![0.0; k_total],
             hi: vec![0.0; k_total],
             taps: [interp_taps(1.0 / 3.0), interp_taps(2.0 / 3.0)],
+            // The continual pilots by the band's centre are left out of the
+            // measurement of the channel's changes: there the radio's DC
+            // offset, and its correction (the front end's estimate moves a
+            // step a block, every 13 ms at 10 MS/s), add a change of their
+            // own that read as 3 % of the power fading at 76 Hz on a rooftop
+            // aerial (C23), enough to take the time filter up on a still
+            // channel.
+            trk: Tracker::new(trk_used),
+            est: None,
+            since_tune: 0,
+            mobile: false,
+            forced: None,
+            ring: Ring::new(g),
+            epoch: 0,
+            last_phase: 0,
+            denoiser: None,
+            denoise_on: false,
         }
     }
 
@@ -282,6 +335,7 @@ impl Equalizer {
     }
 
     pub fn reset(&mut self) {
+        self.restart_filters();
         self.seen.fill(false);
         self.ref_ok = false;
         self.untrusted = 0;
@@ -310,6 +364,9 @@ impl Equalizer {
     #[inline(always)]
     fn process_inner(&mut self, c: &mut [Iq], phase: usize) {
         debug_assert_eq!(c.len(), self.k_total);
+        if phase.is_multiple_of(4) {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
         let kmid = self.kmid;
         let (np, n_cp) = (self.np, self.cps.len());
 
@@ -429,6 +486,7 @@ impl Equalizer {
                 self.ref_ok = false;
                 self.seen.fill(false);
                 self.symbols = 0;
+                self.restart_filters();
                 trusted = true;
             }
         }
@@ -437,8 +495,10 @@ impl Equalizer {
         if self.diagnostics {
             self.cp_resid.clear();
         }
-        for (&k, r) in self.cps.iter().zip(&mut self.cp_ref) {
+        let mut hnow = [Iq::new(0.0, 0.0); 192];
+        for (j, (&k, r)) in self.cps.iter().zip(&mut self.cp_ref).enumerate() {
             let h = c[k] * self.inv[k];
+            hnow[j] = h;
             if self.ref_ok {
                 err += (h - *r).norm_sqr();
                 pow += r.norm_sqr();
@@ -455,13 +515,29 @@ impl Equalizer {
         if pow > 0.0 {
             self.cp_nsr = err / pow;
         }
+        if self.ref_ok {
+            self.trk.push(&hnow[..n_cp]);
+        }
         self.ref_ok = true;
 
         // 2. The grid: this symbol's scattered pilots (carriers 3m with m
         // congruent to the phase mod 4) and the continual ones.
         let m_max = self.grid.len();
         let alpha = self.alpha;
-        if trusted {
+        if trusted && self.mobile {
+            let inv = &self.inv;
+            let predict = self.est.as_ref().map(|e| e.predict);
+            self.ring.update(
+                self.epoch,
+                phase,
+                self.k_total,
+                predict.as_ref(),
+                &mut self.nz,
+                NOISE_RATE,
+                INNOVATION,
+                |m| c[3 * m] * inv[3 * m],
+            );
+        } else if trusted {
             for m in (phase % 4..m_max).step_by(4) {
                 let k = 3 * m;
                 if k >= self.k_total {
@@ -497,11 +573,29 @@ impl Equalizer {
         // grid's own points are the carriers 3m; the two between each pair
         // take 2·L taps: a short filter over the grid, as real and imaginary
         // arrays.
-        for (m, g) in self.grid.iter().enumerate() {
-            self.ext_r[L + m] = g.re;
-            self.ext_i[L + m] = g.im;
+        if let (true, Some(est)) = (self.mobile, &self.est) {
+            self.ring.eval(
+                self.epoch,
+                phase,
+                &est.weights,
+                &mut self.ext_r[L..L + m_max],
+                &mut self.ext_i[L..L + m_max],
+            );
+        } else {
+            for (m, g) in self.grid.iter().enumerate() {
+                self.ext_r[L + m] = g.re;
+                self.ext_i[L + m] = g.im;
+            }
         }
-        let (first, last) = (self.grid[0], self.grid[m_max - 1]);
+        if self.denoise_on
+            && let Some(d) = &mut self.denoiser
+        {
+            d.run(&mut self.ext_r[L..L + m_max], &mut self.ext_i[L..L + m_max]);
+        }
+        let (first, last) = (
+            Iq::new(self.ext_r[L], self.ext_i[L]),
+            Iq::new(self.ext_r[L + m_max - 1], self.ext_i[L + m_max - 1]),
+        );
         self.ext_r[..L].fill(first.re);
         self.ext_i[..L].fill(first.im);
         self.ext_r[L + m_max..].fill(last.re);
@@ -515,8 +609,8 @@ impl Equalizer {
         let k_total = self.k_total;
         for m in 0..m_max {
             let k = 3 * m;
-            self.hr[k] = self.grid[m].re;
-            self.hi[k] = self.grid[m].im;
+            self.hr[k] = self.ext_r[L + m];
+            self.hi[k] = self.ext_i[L + m];
             if k + 1 < k_total {
                 self.hr[k + 1] = self.mid[0][0][m];
                 self.hi[k + 1] = self.mid[0][1][m];
@@ -573,6 +667,114 @@ impl Equalizer {
             }
         }
         self.symbols += 1;
+        self.last_phase = phase;
+        self.since_tune += 1;
+        if self.since_tune >= TUNE_EVERY {
+            self.since_tune = 0;
+            self.tune();
+        }
+    }
+
+    /// Forget what was measured of the channel's changes (a new lock, a
+    /// channel that is not the one measured): back to the IIR.
+    fn restart_filters(&mut self) {
+        self.trk.reset();
+        self.est = None;
+        self.mobile = false;
+        self.since_tune = 0;
+    }
+
+    /// The guard interval, which tells the delay-domain filter where an echo
+    /// can lie. Call once, after `new`.
+    pub fn set_guard(&mut self, guard: Guard) {
+        let n = self.fft.n();
+        self.denoiser = Denoiser::new(self.grid.len(), n, n / guard.divisor());
+    }
+
+    /// Switch the delay-domain filter on or off (a no-op for a guard so long
+    /// that it would keep most of the response). It costs two transforms of
+    /// the grid a symbol; the receiver turns it on when the signal has little
+    /// margin over what its mode needs.
+    pub fn set_denoise(&mut self, on: bool) {
+        let on = on && self.denoiser.is_some();
+        if on != self.denoise_on {
+            self.denoise_on = on;
+            self.est = None;
+            self.since_tune = TUNE_EVERY;
+        }
+    }
+
+    pub fn denoising(&self) -> bool {
+        self.denoise_on
+    }
+
+    /// Whether the time filter over the last four pilots is in use: the
+    /// measured change of the channel says the IIR would lag it.
+    pub fn mobile(&self) -> bool {
+        self.mobile
+    }
+
+    /// The channel's maximum Doppler, Hz, from the Rician model fitted to the
+    /// continual pilots' correlation in time (`ts` the symbol's length, s; 0
+    /// for a steady channel); `None` until the first fit, a quarter second in.
+    pub fn doppler_hz(&self, ts: f64) -> Option<f32> {
+        self.est
+            .as_ref()
+            .map(|e| e.omega / (std::f32::consts::TAU * ts as f32))
+    }
+
+    /// The time filter's fit to the measurement, once there is one.
+    pub fn filter_fit(&self) -> Option<&Estimate> {
+        self.est.as_ref()
+    }
+
+    /// The channel estimate's modelled error, dB against the channel's power,
+    /// of the IIR and of the time filter, from the measured correlation.
+    pub fn estimate_error_db(&self) -> Option<(f32, f32)> {
+        self.est.as_ref().map(|e| {
+            (
+                10.0 * e.mse_iir.max(1e-9).log10(),
+                10.0 * e.mse_wiener.max(1e-9).log10(),
+            )
+        })
+    }
+
+    /// Fit the filters to the measurement: the time filter's weights, and
+    /// whether to use it.
+    fn tune(&mut self) {
+        let scale = match (&self.denoiser, self.denoise_on) {
+            (Some(d), true) => d.kept().max(0.05),
+            _ => 1.0,
+        };
+        let Some(est) = self.trk.solve(scale) else {
+            return;
+        };
+        // Stay on until the IIR would do about as well, or its error is small
+        // beside the noise anyway.
+        let measured = if self.mobile {
+            !(est.mse_iir < OFF_RATIO * est.mse_wiener || est.mse_iir < MIN_MSE_OFF)
+        } else {
+            est.mse_iir >= ON_RATIO * est.mse_wiener && est.mse_iir >= MIN_MSE_ON
+        };
+        let want = self.forced.unwrap_or(measured);
+        self.est = Some(est);
+        if want != self.mobile && self.ready() {
+            if want {
+                // The ring starts as the grid, which the filter gives back.
+                self.ring.seed(&self.grid);
+            } else {
+                // The grid takes up the filter's estimate.
+                let g = self.grid.len();
+                let (mut r, mut i) = (vec![0.0; g], vec![0.0; g]);
+                let w = self.est.as_ref().map(|e| e.weights).unwrap();
+                self.ring
+                    .eval(self.epoch, self.last_phase, &w, &mut r, &mut i);
+                for (m, v) in self.grid.iter_mut().enumerate() {
+                    *v = Iq::new(r[m], i[m]);
+                }
+            }
+            self.mobile = want;
+        }
     }
 }
 
@@ -643,6 +845,18 @@ pub(crate) mod tests {
     /// the data cells against their nearest constellation points, for the
     /// symbols after the estimate settles.
     fn mer(mode_text: &str, ch: Channel, seconds: f64) -> f64 {
+        mer_with(mode_text, ch, seconds, 20, |_| {}).0
+    }
+
+    /// The same from symbol `from` on, the equaliser set up by `setup` first;
+    /// it is handed back as it ended.
+    fn mer_with(
+        mode_text: &str,
+        ch: Channel,
+        seconds: f64,
+        from: usize,
+        setup: impl FnOnce(&mut Equalizer),
+    ) -> (f64, Equalizer) {
         let mode = Mode::parse(mode_text).unwrap();
         let x = make(mode_text, ch, seconds);
         let mut planar = Planar::default();
@@ -672,6 +886,8 @@ pub(crate) mod tests {
             1,
         );
         let mut eq = Equalizer::new(l.fft);
+        eq.set_guard(l.guard);
+        setup(&mut eq);
         let plan = SymbolPlan::new(l.fft);
         let cons = Constellation::new(mode.modulation, Alpha::NonHierarchical);
         let (mut carriers, mut errors, mut count) = (Vec::new(), 0.0f64, 0usize);
@@ -682,7 +898,7 @@ pub(crate) mod tests {
         while reader.read(&interp, &planar, 0, &mut carriers).is_ok() {
             eq.process(&mut carriers, phase);
             reader.correct(f64::from(eq.timing_error()));
-            if n >= 20 {
+            if n >= from {
                 for &k in plan.data_carriers(phase) {
                     let z = eq.z[k as usize];
                     let near = cons.point(cons.nearest(z));
@@ -693,8 +909,8 @@ pub(crate) mod tests {
             phase = (phase + 1) % 4;
             n += 1;
         }
-        assert!(n > 100, "only {n} symbols");
-        10.0 * (count as f64 / errors).log10()
+        assert!(n > from + 100, "only {n} symbols");
+        (10.0 * (count as f64 / errors).log10(), eq)
     }
 
     /// A channel that changes under the equaliser (as when the radio is
@@ -742,6 +958,120 @@ pub(crate) mod tests {
             eq.process(&mut symbol(l, 1), l % 4);
         }
         assert!(eq.coherence > 0.95, "after: {}", eq.coherence);
+    }
+
+    /// A steady channel through the time filter: the estimate stays the
+    /// channel.
+    #[test]
+    fn the_time_filter_gives_a_steady_channel_back() {
+        let fft = FftSize::K2;
+        let plan = SymbolPlan::new(fft);
+        let k_total = fft.active_carriers();
+        let w = prbs(k_total);
+        let ch = |k: usize| Iq::from_polar(1.0 + 0.3 * ((k as f32) * 0.01).sin(), 0.002 * k as f32);
+        let symbol = |l: usize| -> Vec<Iq> {
+            (0..k_total)
+                .map(|k| {
+                    let x = match plan.roles(l)[k] {
+                        Role::Pilot => Iq::new(pilot_value(w[k]), 0.0),
+                        _ => Iq::new(0.5, -0.5),
+                    };
+                    x * ch(k)
+                })
+                .collect()
+        };
+        let mut eq = Equalizer::new(fft);
+        eq.forced = Some(true);
+        eq.diagnostics = true;
+        for l in 0..700 {
+            eq.process(&mut symbol(l), l % 4);
+        }
+        assert!(eq.mobile());
+        let worst = (50..k_total - 50)
+            .map(|k| (eq.h[k] - ch(k)).norm())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 0.05, "worst error {worst}");
+    }
+
+    /// Two paths, each a steady part and a scattered one 6 dB under it at
+    /// 120 Hz of Doppler (a 2k symbol is 0.28 ms: 0.21 rad a symbol, as 35 Hz
+    /// is in 8k), at 35 dB: the IIR lags the channel, the time filter does
+    /// not, and left to itself the equaliser measures the Doppler and takes
+    /// the time filter up.
+    #[test]
+    fn a_moving_channel_takes_the_time_filter_and_gains_by_it() {
+        let ch = || {
+            Channel {
+                paths: vec![Path::echo(0.0, 0.0), Path::echo(1.5, -3.0)],
+                cn_db: Some(35.0),
+                ..Default::default()
+            }
+            .with_rician(6.0, 120.0)
+        };
+        let from = 600;
+        let (iir, _) = mer_with("16qam-3/4-2k-1/32", ch(), 0.4, from, |eq| {
+            eq.forced = Some(false)
+        });
+        let (time, _) = mer_with("16qam-3/4-2k-1/32", ch(), 0.4, from, |eq| {
+            eq.forced = Some(true)
+        });
+        let (_, auto) = mer_with("16qam-3/4-2k-1/32", ch(), 0.4, from, |_| {});
+        assert!(
+            time > iir + 1.5,
+            "IIR {iir:.1} dB, time filter {time:.1} dB"
+        );
+        assert!(
+            auto.mobile(),
+            "the measurement did not take the time filter up"
+        );
+        // 2k with a 1/32 guard: the symbol is 2112 samples at 64/7 MHz.
+        let fd = auto.doppler_hz(2112.0 / (64e6 / 7.0)).unwrap();
+        assert!((80.0..160.0).contains(&fd), "Doppler {fd:.0} Hz");
+    }
+
+    /// A still channel: the IIR stays, and the Doppler reads nothing.
+    #[test]
+    fn a_still_channel_keeps_the_iir() {
+        let ch = Channel {
+            paths: vec![Path::echo(0.0, 0.0), Path::echo(1.5, -3.0)],
+            cn_db: Some(30.0),
+            ..Default::default()
+        };
+        let (_, eq) = mer_with("16qam-3/4-2k-1/32", ch, 0.3, 20, |_| {});
+        assert!(!eq.mobile());
+        let fd = eq.doppler_hz(2112.0 / (64e6 / 7.0)).unwrap();
+        assert!(fd < 5.0, "Doppler {fd:.0} Hz");
+    }
+
+    /// The delay-domain filter keeps an echo near the end of the guard (which
+    /// pins down its sign convention: a first version kept the wrong end, and
+    /// a short channel did not show it), and takes noise out of the estimate
+    /// of a short channel.
+    #[test]
+    fn the_delay_filter_keeps_echoes_and_takes_noise() {
+        let long = || Channel {
+            paths: vec![Path::echo(0.0, 0.0), Path::echo(24.0, -6.0)],
+            cn_db: Some(30.0),
+            ..Default::default()
+        };
+        let (off, _) = mer_with("16qam-3/4-8k-1/32", long(), 0.15, 20, |_| {});
+        let (on, _) = mer_with("16qam-3/4-8k-1/32", long(), 0.15, 20, |eq| {
+            eq.set_denoise(true)
+        });
+        assert!(
+            on > off - 0.3,
+            "a 24 us echo: off {off:.1} dB, on {on:.1} dB"
+        );
+        let short = || Channel {
+            paths: vec![Path::echo(0.0, 0.0), Path::echo(1.0, -6.0)],
+            cn_db: Some(20.0),
+            ..Default::default()
+        };
+        let (off, _) = mer_with("16qam-3/4-8k-1/32", short(), 0.15, 20, |_| {});
+        let (on, _) = mer_with("16qam-3/4-8k-1/32", short(), 0.15, 20, |eq| {
+            eq.set_denoise(true)
+        });
+        assert!(on > off + 0.3, "20 dB: off {off:.1} dB, on {on:.1} dB");
     }
 
     #[test]
