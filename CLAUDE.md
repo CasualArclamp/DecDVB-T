@@ -34,6 +34,13 @@ cargo run --release -p decdvbt-gui -- captures/c23_490.000MHz_10Msps_amp.cs8 --d
 cargo run -p decdvbt-gui --example make_icon                      # redraws apps/decdvbt-gui/assets/icon.ico and icon-256.png (preview in out/)
 cargo run --release -p decdvbt-gui --example retune_soak -- C23 C26 C28 --rounds 20   # HackRF: tune between channels like the GUI, time each lock
 cargo run --release -p decdvbt-rx --example splice -- A.cs8 B.cs8 24            # offline: the old channel's samples then the new one's; ACQSCAN=1 for first-attempt acquisition
+# the transmitter (docs/TX_DESIGN.md). Scripts and tests set DECDVBT_TX_NO_RADIO=1 (the library then refuses to open the HackRF); only a person pressing TRANSMIT transmits
+cargo run --release -p decdvbt-tx-app                            # the TX window (own prefs: %APPDATA%\DecDVB-T-TX\prefs.txt, not the receiver's)
+cargo run --release -p decdvbt-tx-app -- clip.mp4 --sink null --start --run-secs 30   # a real session into nothing: prints CPU, counters, window cost (also --sink iq:PATH)
+cargo run --release -p decdvbt-tx-app -- --demo --state transmitting --screenshot out/tx.png   # a made-up status; states idle|preparing|ready|armed|transmitting|running|stuffing|trouble|failed|finished; --modes opens the mode list
+cargo run --release -p decdvbt-tx-app -- --selftest              # the safety logic of the built exe, no window
+cargo run -p decdvbt-tx-app --example make_icon                  # redraws apps/decdvbt-tx/assets/icon.ico and icon-256.png
+cargo run --release -p decdvbt-tx --example txfile -- clip.mp4 out.cs8 --null --paced --seconds 30   # the library alone: per-second status, totals, --save-ts, --stages
 # the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|maps|history|none,
 # --window ts|epg|sdr, --service ID (select), --play ID, --http 127.0.0.1:8001,
 # --udp 127.0.0.1:1234, --record, --fps N (the waterfall scrolls a pixel a frame: the rate is its speed), --video OUT.mp4 --video-secs N (with --screenshot and
@@ -72,3 +79,9 @@ package folder even before the PATH is refreshed).
 - DSP is unusably slow unoptimised. Use `--release` for anything that depends
   on timing.
 - Heavy test sweeps belong on CI, not on this machine.
+- **The transmitter never runs by itself** (docs/TX_DESIGN.md §6): no test,
+  example, demo or script opens the HackRF for transmit (they use the `Null` and
+  `IqFile` sinks and `DECDVBT_TX_NO_RADIO=1`), and `decdvbt-tx` keeps its own
+  settings in `%APPDATA%\DecDVB-T-TX\prefs.txt` (never the receiver's `prefs.txt`;
+  never the arm, TX VGA, amp or output). Its test hooks (`--demo`, `--screenshot`,
+  `--sink null|iq:PATH --start`) cannot reach the radio.

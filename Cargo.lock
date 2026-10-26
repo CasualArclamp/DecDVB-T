@@ -720,6 +720,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "decdvbt-tx"
+version = "0.1.2"
+dependencies = [
+ "decdvbt-core",
+ "decdvbt-dsp",
+ "decdvbt-io",
+ "decdvbt-mod",
+ "decdvbt-rx",
+ "decdvbt-ts",
+ "rustfft",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "decdvbt-tx-app"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "decdvbt-core",
+ "decdvbt-tx",
+ "eframe",
+ "image",
+ "rfd",
+ "windows-sys 0.61.2",
+ "winit",
+ "winresource",
+]
+
+[[package]]
 name = "decdvbt-video"
 version = "0.1.2"
 dependencies = [

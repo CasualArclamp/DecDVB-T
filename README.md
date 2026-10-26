@@ -98,12 +98,46 @@ decdvbt capture C23 --amp --lna 32 --vga 8 --record c23.cs8 --seconds 60
 decdvbt modulate --t2 uk --seconds 2.4 --cn 30 t2.cs8   # a DVB-T2 test signal through a simulated channel
 ```
 
+### Transmitter (`decdvbt-tx`)
+
+A second, separate program: `decdvbt-tx.exe` takes a **video file** and sends
+it as **DVB-T** through the HackRF One (64-QAM 2/3 8k 1/32 by default, 24.13
+Mbit/s; any DVB-T mode from 5 to 32 Mbit/s in the list). ffmpeg makes the
+transport stream at exactly the channel's rate and the radio's sample clock
+paces everything, so there is no buffer to drift. It is not a panel of the
+receiver: it has its own window, its own settings (`%APPDATA%\DecDVB-T-TX\`)
+and does not touch the receiver's.
+
+```bash
+cargo run --release -p decdvbt-tx-app                       # the window
+decdvbt-tx clip.mp4 --mode 16qam-1/2-8k-1/32 --channel C30   # fills in the form; nothing starts
+decdvbt-tx clip.mp4 --sink null --start --run-secs 30        # a real session into nothing: CPU and counters
+decdvbt-tx --demo --state transmitting --screenshot tx.png   # a made-up status, no session at all
+```
+
+It is built so that transmitting is hard to do by accident and easy to stop:
+
+- every start is **disarmed**, on the **test output** (nothing is sent), TX VGA
+  0 dB and the RF amp off; none of those is remembered;
+- the radio is reached by **PREPARE, then ARM** (tick that you have read the
+  licence and attenuator warning, which is always on screen), **then
+  TRANSMIT**. The arm lasts 60 s, is used up by one transmission and is
+  dropped when the window loses focus for 5 s;
+- while the radio is keyed the window has a red frame, a red TRANSMITTING
+  banner and title, and **STOP** (also Esc or Space) is the largest control;
+- the command-line hooks above can only reach the test output and an IQ file.
+
+Connect the HackRF to a receiver through a cable and an **attenuator** (30 dB
+or more) or a dummy load. Radiating on TV frequencies needs a licence, and the
+UHF channels are in use: [`docs/TX_DESIGN.md`](docs/TX_DESIGN.md) has the
+design and the safety model.
+
 ## Building from source
 
 Install Rust (stable) with [rustup](https://rustup.rs/), then:
 
 ```bash
-cargo build --release -p decdvbt-gui -p decdvbt-cli
+cargo build --release -p decdvbt-gui -p decdvbt-cli -p decdvbt-tx-app
 cargo test --workspace
 ```
 
@@ -123,9 +157,11 @@ unoptimised.
 | `decdvbt-ts` | transport stream: PSI/SI, the guide, DSM-CC carousels, outputs |
 | `decdvbt-mheg` | the MHEG-5 engine for Red Button |
 | `decdvbt-video`, `decdvbt-audio` | the player's ffmpeg pipeline and sound |
-| `decdvbt-mod` | DVB-T and T2 modulators and channel models, for tests |
+| `decdvbt-mod` | DVB-T and T2 modulators and channel models, for tests and the transmitter |
+| `decdvbt-tx` | the transmit engine: ffmpeg, the rate-exact transport stream, the modulator, the arm gate, the sinks |
 | `decdvbt-engine` | the receive thread that ties it together |
 | `apps/decdvbt-gui`, `apps/decdvbt-cli` | the app and the `decdvbt` tool |
+| `apps/decdvbt-tx` | the transmitter window (`decdvbt-tx.exe`, package `decdvbt-tx-app`) |
 
 [`docs/DESIGN.md`](docs/DESIGN.md) has the design and
 [`docs/STATUS.md`](docs/STATUS.md) the log of what was built and measured.
@@ -155,7 +191,7 @@ the GUI is [egui](https://github.com/emilk/egui).
 ## Licence
 
 [GPL-3.0-or-later](LICENSE). DecDVB-T is a receiver for free-to-air
-broadcasts. Its one transmit feature, the test-signal panel, does nothing
-until armed, starts at the HackRF's lowest power with the amp off, and is
-meant for a cable and attenuator into a receiver: radiating on TV frequencies
-needs a licence.
+broadcasts. Its transmitter, `decdvbt-tx`, is a separate program that does
+nothing until armed and then told to transmit, starts at the HackRF's lowest
+power with the amp off, and is meant for a cable and attenuator into a
+receiver: radiating on TV frequencies needs a licence.

@@ -36,6 +36,11 @@ pub struct HackRfTxSettings {
     pub txvga_db: u16,
     /// The +14 dB RF amplifier.
     pub amp: bool,
+    /// The baseband filter, Hz; `None` keeps the driver's automatic choice
+    /// (the widest setting not above 75 % of the sample rate, which cuts the
+    /// edges of a 7.61 MHz signal at 9.14 MS/s). The firmware rounds the value
+    /// to one of its settings (8 MHz for 8 000 000).
+    pub baseband_filter_hz: Option<u32>,
 }
 
 impl Default for HackRfTxSettings {
@@ -45,6 +50,7 @@ impl Default for HackRfTxSettings {
             sample_rate: 4_000_000,
             txvga_db: 0,
             amp: false,
+            baseband_filter_hz: None,
         }
     }
 }
@@ -70,6 +76,22 @@ pub struct HackRfTx {
 
 fn other(e: impl std::fmt::Display) -> Error {
     Error::Other(format!("HackRF: {e}"))
+}
+
+/// Run a driver call so that a panic inside it becomes an error. The driver's
+/// gain setters panic on a zero reply byte; with the radio keyed that must be
+/// an error shown to the user, not a crash.
+///
+/// Rust note: `catch_unwind` needs the closure to be "unwind safe"; the
+/// driver is only used through shared references and holds no lock across
+/// these calls, so `AssertUnwindSafe` is sound here.
+fn guarded<T>(f: impl FnOnce() -> std::result::Result<T, seify_hackrfone::Error>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r.map_err(other),
+        Err(_) => Err(Error::Other(
+            "HackRF: the driver failed on a bad reply".into(),
+        )),
+    }
 }
 
 impl HackRfTx {
@@ -114,6 +136,15 @@ impl HackRfTx {
             sample_rate_div: 1,
         };
         dev.start_tx(&config).map_err(other)?;
+        // `start_tx` set the sample rate, which set the automatic filter;
+        // an explicit one goes on after it. A failure here costs the signal's
+        // edges, not the transmission: carry on with the automatic one.
+        if let Some(hz) = settings.baseband_filter_hz {
+            let r = guarded(|| dev.set_baseband_filter_bandwidth(hz));
+            if let Err(e) = r {
+                tracing::warn!("HackRF baseband filter {hz} Hz not set: {e}");
+            }
+        }
         let mut stream = match dev.start_tx_stream() {
             Ok(s) => s,
             Err(e) => {
@@ -168,21 +199,21 @@ impl HackRfTx {
     /// Change the TX VGA while transmitting (0–47 dB).
     pub fn set_txvga(&self, db: u16) -> Result<()> {
         let db = db.min(TXVGA_MAX_DB);
-        self.dev.set_txvga_gain(db).map_err(other)?;
+        guarded(|| self.dev.set_txvga_gain(db))?;
         self.settings.lock().unwrap().txvga_db = db;
         Ok(())
     }
 
     /// The +14 dB RF amplifier on or off while transmitting.
     pub fn set_amp(&self, on: bool) -> Result<()> {
-        self.dev.set_amp_enable(on).map_err(other)?;
+        guarded(|| self.dev.set_amp_enable(on))?;
         self.settings.lock().unwrap().amp = on;
         Ok(())
     }
 
     /// Retune while transmitting.
     pub fn set_center(&self, hz: u64) -> Result<()> {
-        self.dev.set_freq(hz).map_err(other)?;
+        guarded(|| self.dev.set_freq(hz))?;
         self.settings.lock().unwrap().center_hz = hz;
         Ok(())
     }

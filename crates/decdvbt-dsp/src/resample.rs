@@ -56,12 +56,21 @@ pub struct Resampler {
     up: usize,
     down: usize,
     taps_per_phase: usize,
-    /// Polyphase branches: `phases[p][k]` = h[p + k·up].
+    /// Polyphase branches: `phases[p][k]` = h[p + k·up]. (The tests' reference
+    /// implementation reads these; the filter itself runs on `reversed`.)
+    #[cfg_attr(not(test), allow(dead_code))]
     phases: Vec<Vec<f32>>,
-    /// The most recent inputs, newest last.
-    hist: Vec<Iq>,
+    /// The same branches, each reversed, so an output is the dot product of
+    /// the branch with the `taps_per_phase` inputs ending at the newest, oldest
+    /// first: `reversed[p][j]` = `phases[p][taps_per_phase − 1 − j]`.
+    reversed: Vec<Vec<f32>>,
+    /// The last `taps_per_phase − 1` inputs of the previous call (zeros at the
+    /// start): the filter's memory, put in front of the next block so every
+    /// window is a slice of one buffer. (This replaced a history shifted along
+    /// by one sample for every input, which cost more than the filter.)
+    tail: Vec<Iq>,
     /// Position of the next output, in units of 1/up input samples, counted
-    /// from the first sample of `hist`'s newest input.
+    /// from the first sample of the newest input.
     next: usize,
 }
 
@@ -92,15 +101,20 @@ impl Resampler {
         for c in &mut h {
             *c *= up as f32;
         }
-        let phases = (0..up)
+        let phases: Vec<Vec<f32>> = (0..up)
             .map(|p| (0..taps_per_phase).map(|k| h[p + k * up]).collect())
+            .collect();
+        let reversed = phases
+            .iter()
+            .map(|ph| ph.iter().rev().copied().collect())
             .collect();
         Resampler {
             up,
             down,
             taps_per_phase,
             phases,
-            hist: vec![Iq::new(0.0, 0.0); taps_per_phase],
+            reversed,
+            tail: vec![Iq::new(0.0, 0.0); taps_per_phase - 1],
             next: 0,
         }
     }
@@ -135,23 +149,28 @@ impl Resampler {
 
     /// Resample `input`, appending to `out`.
     pub fn process(&mut self, input: &[Iq], out: &mut Vec<Iq>) {
-        for &x in input {
-            // `hist` holds the newest `taps_per_phase` inputs, x[n] last.
-            self.hist.rotate_left(1);
-            *self.hist.last_mut().unwrap() = x;
+        if input.is_empty() {
+            return;
+        }
+        let taps = self.taps_per_phase;
+        // The memory, then the block: input n's window of `taps` inputs ending
+        // at itself is `buf[n .. n + taps]`.
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.extend_from_slice(input);
+        out.reserve(input.len() * self.up / self.down + 1);
+        for n in 0..input.len() {
+            let window = &buf[n..n + taps];
             // Outputs due while this input is the newest: those whose time
             // falls in [n, n + 1), i.e. `next` < up.
             while self.next < self.up {
-                let phase = &self.phases[self.next];
-                let mut acc = Iq::new(0.0, 0.0);
-                for (k, &c) in phase.iter().enumerate() {
-                    acc += self.hist[self.taps_per_phase - 1 - k] * c;
-                }
-                out.push(acc);
+                out.push(crate::dot::dot_cr(window, &self.reversed[self.next]));
                 self.next += self.down;
             }
             self.next -= self.up;
         }
+        // Keep the last `taps − 1` inputs for the next call.
+        buf.drain(..input.len());
+        self.tail = buf;
     }
 }
 
@@ -239,6 +258,73 @@ mod tests {
     #[test]
     fn it_refuses_a_signal_wider_than_the_output() {
         assert!(Resampler::for_rates(64e6 / 7.0, 4e6, 7.61e6).is_err());
+    }
+
+    /// The implementation this one replaced: the history shifted along by one
+    /// sample for every input, and the sum in tap order. The golden standard
+    /// for the new one's output.
+    fn reference(r: &Resampler, input: &[Iq]) -> Vec<Iq> {
+        let mut hist = vec![Iq::new(0.0, 0.0); r.taps_per_phase];
+        let (mut next, mut out) = (0usize, Vec::new());
+        for &x in input {
+            hist.rotate_left(1);
+            *hist.last_mut().unwrap() = x;
+            while next < r.up {
+                let mut acc = Iq::new(0.0, 0.0);
+                for (k, &c) in r.phases[next].iter().enumerate() {
+                    acc += hist[r.taps_per_phase - 1 - k] * c;
+                }
+                out.push(acc);
+                next += r.down;
+            }
+            next -= r.up;
+        }
+        out
+    }
+
+    #[test]
+    fn the_ring_buffer_gives_the_old_implementations_output() {
+        // A tone, a chirp-ish sweep and noise, so every tap matters; ratios
+        // from the DVB-T to HackRF ones to an unrelated pair.
+        let t = 64e6 / 7.0;
+        let mut seed = 1u32;
+        let x: Vec<Iq> = (0..9_000)
+            .map(|n| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 9) as f32 / (1u32 << 23) as f32 - 0.5;
+                let p = TAU * (0.05 + 1e-5 * n as f64) * n as f64;
+                Iq::new(p.cos() as f32 + noise, p.sin() as f32 - noise)
+            })
+            .collect();
+        for (up, down, in_hz, bw) in [
+            (35usize, 32usize, t, 7.61e6),
+            (35, 16, t, 7.61e6),
+            (1, 2, 10e6, 3e6),
+            (3, 7, 7e6, 2e6),
+        ] {
+            let out_hz = in_hz * up as f64 / down as f64;
+            let mut r = Resampler::for_rates(in_hz, out_hz, bw).unwrap();
+            assert_eq!(r.ratio(), (up, down));
+            let want = reference(&r, &x);
+            // Blocks of awkward sizes, empty ones included.
+            let mut got = Vec::new();
+            let mut at = 0;
+            for size in [1usize, 0, 7, 100, 2113, 5, 3000].iter().cycle() {
+                if at >= x.len() {
+                    break;
+                }
+                let end = (at + size).min(x.len());
+                r.process(&x[at..end], &mut got);
+                at = end;
+            }
+            assert_eq!(got.len(), want.len(), "{up}/{down}");
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).norm())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 1e-6, "{up}/{down}: worst difference {worst}");
+        }
     }
 
     #[test]

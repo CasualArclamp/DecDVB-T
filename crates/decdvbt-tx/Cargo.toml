@@ -1,0 +1,38 @@
+# made by CasualArclamp
+[package]
+name = "decdvbt-tx"
+description = "DecDVB-T transmit engine: a video file to a DVB-T signal (ffmpeg, modulator, HackRF or IQ file)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# The HackRF driver is pure Rust (no SDK, no DLLs). Without it every type here
+# still compiles; opening the radio then fails with a clear error, and the IQ
+# file and null sinks work as ever.
+default = ["hackrf"]
+hackrf = ["decdvbt-io/hackrf"]
+
+[dependencies]
+decdvbt-core = { path = "../decdvbt-core" }
+decdvbt-io = { path = "../decdvbt-io" }
+decdvbt-mod = { path = "../decdvbt-mod" }
+decdvbt-dsp = { path = "../decdvbt-dsp" }
+rustfft.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+decdvbt-ts = { path = "../decdvbt-ts" }
+# The loopback tests decode what the transmitter makes (tests/pipeline.rs).
+decdvbt-rx = { path = "../decdvbt-rx" }
+
+# The process CPU meter (cpu.rs), the ffmpeg stdout pipe (feeder.rs) and the
+# PC's offset from UTC for the TOT (session.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Time"] }
+
+# Counting the process's threads in the stress tests (tests/stress.rs).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
