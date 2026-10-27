@@ -661,7 +661,10 @@ name = "decdvbt-io"
 version = "0.1.2"
 dependencies = [
  "decdvbt-core",
+ "futures-lite",
  "num-complex",
+ "nusb",
+ "rustfft",
  "seify-hackrfone",
  "thiserror 2.0.21",
  "tracing",
