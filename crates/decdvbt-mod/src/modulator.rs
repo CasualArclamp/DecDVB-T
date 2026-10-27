@@ -51,6 +51,9 @@ impl Modulator {
         cell_id: Option<u16>,
         ts: Box<dyn TsSource>,
     ) -> Result<Modulator, String> {
+        if !mode.bandwidth.dvbt() {
+            return Err(format!("DVB-T is not sent in {}", mode.bandwidth));
+        }
         let inner = InnerEncoder::new(mode)?;
         let n = mode.fft.n();
         let ifft = FftPlanner::new().plan_fft_inverse(n);

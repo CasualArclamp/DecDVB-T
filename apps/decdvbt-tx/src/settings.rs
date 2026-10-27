@@ -1,8 +1,9 @@
 // made by CasualArclamp
 //! The settings that are kept from run to run, and how they are written.
 //!
-//! Kept: window size, last folder, mode, centre frequency, loop, level,
-//! encoder, codecs, ffmpeg path, preview, radio rate.
+//! Kept: window size, last folder, mode (DVB-T's, and the 1.7 MHz DVB-T2
+//! one, and which is in use), centre frequency, loop, level, encoder, codecs,
+//! ffmpeg path, preview, radio rate.
 //!
 //! **Never kept** (docs/TX_DESIGN.md §6 and §7): the arm, TX VGA, the RF amp,
 //! the output (a start always begins on "test only") and the file itself. There
@@ -11,6 +12,7 @@
 use std::path::PathBuf;
 
 use decdvbt_core::dvbt::{Mode, Modulation};
+use decdvbt_tx::modes::{Qam, T2_FFTS, T2_QAMS, T2_RATES, T2Config, t2_guards, t2_mode, t2_rate};
 use decdvbt_tx::{AudioCodec, EncoderChoice, TxRate, VideoCodec};
 
 use crate::prefs;
@@ -20,6 +22,10 @@ pub struct Settings {
     pub window: Option<(u32, u32)>,
     pub folder: Option<PathBuf>,
     pub mode: Mode,
+    /// The DVB-T2 mode (1.7 MHz), and whether it is the one sent: the
+    /// Bandwidth box's 1.7 MHz picks it, its other widths DVB-T in `mode`.
+    pub t2: T2Config,
+    pub use_t2: bool,
     pub centre_hz: f64,
     pub loop_input: bool,
     pub level_dbfs: f32,
@@ -38,6 +44,8 @@ impl Default for Settings {
             window: None,
             folder: None,
             mode: crate::modeinfo::presets()[0].mode,
+            t2: crate::modeinfo::t2_default().expect("the default T2 mode"),
+            use_t2: false,
             centre_hz: 546_000_000.0,
             loop_input: true,
             level_dbfs: -12.0,
@@ -59,12 +67,54 @@ pub fn mode_text(m: &Mode) -> String {
         Modulation::Qam64 => "64qam",
     };
     format!(
-        "{c}-{}-{}-{}-{}mhz",
+        "{c}-{}-{}-{}-{}",
         m.rate_hp.name(),
         m.fft.name(),
         m.guard.name(),
-        m.bandwidth.mhz() as u32
+        m.bandwidth.token()
     )
+}
+
+fn qam_text(q: Qam) -> &'static str {
+    match q {
+        Qam::Qpsk => "qpsk",
+        Qam::Qam16 => "16qam",
+        Qam::Qam64 => "64qam",
+        Qam::Qam256 => "256qam",
+    }
+}
+
+/// A T2 mode as the prefs keep it: "8k-1/16-16qam-3/4" (the rest follows,
+/// `decdvbt_tx::modes::t2_mode`).
+pub fn t2_text(c: &T2Config) -> String {
+    let (n, d) = t2_rate(c);
+    format!(
+        "{}-{}-{}-{n}/{d}",
+        c.mode.fft.name().to_ascii_lowercase(),
+        c.mode.guard.name(),
+        qam_text(c.qam)
+    )
+}
+
+/// Read back [`t2_text`]: only a mode the app offers.
+pub fn parse_t2(s: &str) -> Option<T2Config> {
+    let mut p = s.split('-');
+    let f = p.next()?;
+    let fft = T2_FFTS
+        .into_iter()
+        .find(|x| x.name().eq_ignore_ascii_case(f))?;
+    let g = p.next()?;
+    let guard = t2_guards(fft).into_iter().find(|x| x.name() == g)?;
+    let q = p.next()?;
+    let qam = T2_QAMS.into_iter().find(|x| qam_text(*x) == q)?;
+    let r = p.next()?;
+    let rate = T2_RATES
+        .into_iter()
+        .find(|(n, d)| format!("{n}/{d}") == r)?;
+    if p.next().is_some() {
+        return None;
+    }
+    t2_mode(fft, guard, qam, rate)
 }
 
 pub fn rate_text(r: TxRate) -> String {
@@ -156,6 +206,8 @@ impl Settings {
                 .and_then(|s| Mode::parse(&s).ok())
                 .filter(|m| !m.hierarchical())
                 .unwrap_or(d.mode),
+            t2: get("t2").and_then(|s| parse_t2(&s)).unwrap_or(d.t2),
+            use_t2: get("standard").is_some_and(|s| s == "t2"),
             centre_hz: get("centre_hz")
                 .and_then(|s| s.parse::<f64>().ok())
                 .filter(|f| (1e6..=6e9).contains(f))
@@ -196,6 +248,8 @@ impl Settings {
                     .map_or(String::new(), |p| p.display().to_string()),
             ),
             ("mode", mode_text(&self.mode)),
+            ("t2", t2_text(&self.t2)),
+            ("standard", if self.use_t2 { "t2" } else { "dvbt" }.into()),
             ("centre_hz", format!("{:.0}", self.centre_hz)),
             ("loop", on(self.loop_input)),
             ("level", format!("{:.1}", self.level_dbfs)),
@@ -241,6 +295,8 @@ mod tests {
             window: Some((1200, 800)),
             folder: Some(PathBuf::from("C:/Videos")),
             mode: Mode::parse("16qam-3/4-2k-1/16-7mhz").unwrap(),
+            t2: parse_t2("2k-1/8-qpsk-3/5").unwrap(),
+            use_t2: true,
             centre_hz: 618_000_000.0,
             loop_input: false,
             level_dbfs: -9.5,
@@ -278,6 +334,12 @@ mod tests {
     fn mode_text_is_what_mode_parse_reads() {
         for p in crate::modeinfo::presets() {
             assert_eq!(Mode::parse(&mode_text(&p.mode)).unwrap(), p.mode);
+            if let Some(t2) = &p.t2 {
+                assert_eq!(parse_t2(&t2_text(t2)).as_ref(), Some(t2));
+            }
         }
+        // 1 MHz spells itself.
+        assert!(mode_text(&crate::modeinfo::presets()[3].mode).ends_with("-1mhz"));
+        assert!(parse_t2("32k-1/128-256qam-2/3").is_none());
     }
 }

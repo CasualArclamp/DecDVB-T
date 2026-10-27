@@ -1415,3 +1415,130 @@ that moves faster than ~16 symbols (carrier erasure) or ~0.5 kHz in a
 The detector's ON threshold (20 dB over the median) sits above the T2 continual
 pilots' own lines (seen to 17 dB in a simulated 8k signal), so a tone weaker than
 about −14 dB is left to the erasure.
+
+## Narrow channels: 1 MHz DVB-T and 1.7 MHz DVB-T2 (2026-10-27)
+
+Asked for: two narrow bandwidths end to end (modulator, transmitter,
+receiver), each proved in loopback. Done; the decisions are in DESIGN.md §8
+and TX_DESIGN.md §15. 547 tests pass (`cargo test --workspace`), clippy
+(`-D warnings`) is clean. All of it was checked offline (no HackRF in the
+build machine); what needs a live check is listed at the end.
+
+- **1 MHz DVB-T** (not a standard; narrowband amateur DATV runs DVB-T this
+  way): the 8 MHz mode with every clock divided by 8, T = 7/8 µs, 8/7 MS/s,
+  0.95 MHz occupied, 2k and 8k, every guard, constellation and rate, 0.62 to
+  3.96 Mbit/s. `--mode ...-1mhz`.
+- **1.7 MHz DVB-T2** (EN 302 755, T = 71/131 µs): every FFT size and pilot
+  pattern the 8 MHz receiver has; nothing in P1 or L1 carries the width
+  (L1-pre's BWT_EXT is the extended carrier mode), so the receiver is told
+  it. `--t2 ...-1.7mhz`; `T2Config::{frame_s, ts_rate_bps}` (the UK mux
+  checks at 40.0 Mbit/s).
+- **One `Bandwidth`** (1, 1.7, 6, 7, 8 MHz) for both standards, with
+  `dvbt()`/`t2()`; `AutoReceiver::with_bandwidth` runs only the standards
+  sent in the width; the engine takes `Command::Bandwidth`.
+- **What assumed 8 MHz**, found by going through `decdvbt-rx`,
+  `decdvbt-dsp::resample` and `decdvbt-engine`: the CW detector's ±3.75 MHz
+  band (now 0.41 of the signal's rate), T2's 2.5 M-sample acquisition window
+  (now 0.27 s), T2's `FS_NATIVE` in the receiver, its sounder, its card and
+  its measurements, the spectral C/N zones and the block-edge finder (now
+  scaled by `Bandwidth::scale`), the band view's brackets, the GUI's
+  "channel fits in the span" margin, the noise bandwidth of the T2 test
+  signal's C/N. Already in samples, carriers or symbols, so right at every
+  width: the cyclic-prefix search, the offset search (±(N−K)/2 + 8 carriers:
+  ±97 kHz at 1 MHz 8k, ±115 kHz for 1.7 MHz P1's 64 spacings), guard and mode
+  detection, the Doppler estimator and time filter (a given Hz of Doppler is
+  eight times harder at 1 MHz, which is the physics), the carrier notch, the
+  interpolator (the narrow signal is 0.48 of 2 MS/s against 0.76 of 10 MS/s at
+  8 MHz). The acquisition's 12 µs echo window stays a fixed share of the
+  symbol (96 µs at 1 MHz). The resampler has no 8 MHz in it (142/131 is
+  within its 256 phases).
+- **Radio**: 2 MS/s (the HackRF's lowest) and the 1.75 MHz baseband filter
+  (its narrowest) for both, TX and RX. 1 MHz is read directly by the receiver
+  (rho = 7/4: a 3584- or 14336-point transform), 1.7 MHz by interpolation.
+- **SI**: 1 MHz DVB-T's terrestrial descriptor carries the reserved bandwidth
+  code 7 (read back as 1 MHz); 1.7 MHz T2 a T2_delivery_system_descriptor
+  (bandwidth 0101 = 1.712 MHz), which `decdvbt-ts` now parses
+  (`Transponder::t2`); `Terrestrial::bandwidth_khz` replaces `bandwidth_mhz`.
+- **TX**: the Bandwidth box (1, 1.7, 6, 7, 8 MHz), T2 controls and an All
+  modes table at 1.7 MHz (`modes::t2_mode`, 24 rows per FFT size and guard),
+  two narrow presets, CIF video (352x288) under 1.5 Mbit/s, the tables' 39
+  kbit/s taken out of the low rates' budget. **RX GUI**: a width box beside
+  the source, the channel box takes a frequency in MHz too (or `--freq`), 2
+  and 4 MS/s offered for the narrow widths, the width remembered.
+  **CLI**: `modulate --freq`, default 2 MS/s for narrow modes;
+  `decode --bandwidth 1|1.7|6|7|8 [--freq MHZ]`, `decode hackrf --freq`.
+
+**Loopback tests** (`crates/decdvbt-rx/tests/narrow.rs`): each mode modulated,
+through the channel models (white noise, three static paths at 0, 6 and 21 µs,
+a carrier offset of several carriers, a clock error of 5 to 25 ppm), resampled
+to 2 MS/s and decoded; from the first packet received every packet equals the
+modulator's, byte for byte, none missing:
+
+| mode | C/N | CFO | clock | packets matched | SNR read |
+|---|---|---|---|---|---|
+| 1 MHz QPSK 1/2 2k 1/8 | 14 dB | +2.3 kHz | +12 ppm | 603 of 735 (1.6 s) | 13.7 dB |
+| 1 MHz 16-QAM 3/4 8k 1/32 | 22 dB | −5.1 kHz | −15 ppm | 3308 of 4812 (3.2 s) | 20.3 dB |
+| 1 MHz 64-QAM 2/3 2k 1/4 | 27 dB | +731 Hz | +25 ppm | 2143 of 2647 (1.6 s) | 25.8 dB |
+| 1 MHz 64-QAM 5/6 8k 1/16 | 30 dB | +12 kHz | +5 ppm | 5302 of 7785 (3.2 s) | 28.6 dB |
+| 1.7 MHz T2 2K 1/8 PP2 QPSK 1/2 rot. (closing symbol) | 12 dB | −1.8 kHz | −10 ppm | 1035, 224/224 blocks | 9.6 dB |
+| 1.7 MHz T2 4K 1/32 PP7 64-QAM 2/3 rot., 64K LDPC | 26 dB | +650 Hz | +20 ppm | 3994, 140/140 | 24.1 dB |
+| 1.7 MHz T2 8K 1/16 PP4 16-QAM 3/4 ext, 16K LDPC | 24 dB | +3.5 kHz | +8 ppm | 2822, 365/365 | 19.5 dB |
+
+The rest of each run is the lock (acquisition, a TPS frame of 68 symbols, half
+a second at 1 MHz 8k, or two T2 frames). The **TX pipeline**
+(`crates/decdvbt-tx/tests/pipeline.rs`) writes a 1 MHz (QPSK 2/3 2k 1/8, CIF)
+and a 1.7 MHz (T2 8K 1/16 16-QAM 3/4) IQ file at 2 MS/s from a real ffmpeg clip;
+the receiver decodes both with no lost block, every packet equal to what the
+modulator was given (6936 and 14459 compared), and reads the NIT's width and
+centre back; the slowest mode's stream (0.62 Mbit/s) holds 8.8 % nulls, PCR
+every 26.6 ms, no "dts < pcr". Before the low-rate budget it held 4.7 % nulls.
+
+**CPU** (release, one core, per second of signal, best of three on this
+4-core cloud machine, which is slower than the Ryzen: the 8 MHz UK mode at 10
+MS/s took 45 % here, against 30 % in the CPU pass above):
+
+| receiver, `decode` on 10 s at 2 MS/s | total | where |
+|---|---|---|
+| 1 MHz QPSK 1/2 2k 1/8 | 3.3 % | read 1.1, equalise 0.7, demap 0.5, Viterbi 0.6 |
+| 1 MHz 16-QAM 3/4 8k 1/32 | 4.8 % | read 1.0, equalise 0.8, demap 0.7, Viterbi 1.7 |
+| 1 MHz 64-QAM 2/3 8k 1/32 | 5.7 % | read 1.0, equalise 0.7, demap 0.8, Viterbi 2.2 |
+| 1 MHz 64-QAM 7/8 8k 1/32 | 6.7 % | Viterbi 2.9 |
+| 8 MHz 64-QAM 2/3 8k 1/32 at 10 MS/s (reference) | 45 % | an eighth of it is 5.6 % |
+| 1.7 MHz T2 2K QPSK 1/2 | 7.2 % | read 3.5 (resample 1.8), equalise 2.8, FEC 2.5 |
+| 1.7 MHz T2 8K 16-QAM 3/4 | 6.8 % | read 3.7 (resample 1.9), equalise 2.2, FEC 5.8 (LDPC 3.1) |
+| 1.7 MHz T2 8K 1/128 256-QAM 5/6 (9.5 Mbit/s) | 26 % | FEC 25 (LDPC 19, 2.5 iterations at 24 dB) |
+
+| transmitter, `txfile --stages` | modulator | resampler to 2 MS/s | pack |
+|---|---|---|---|
+| 1 MHz QPSK 1/2 2k | 0.6 % | 3.0 % | 0.1 % |
+| 1 MHz 64-QAM 2/3 8k 1/32 | 1.2 % | 2.8 % | 0.1 % |
+| 1 MHz 64-QAM 7/8 8k 1/32 | 1.2 % | 2.7 % | 0.1 % |
+| 1.7 MHz T2 1K QPSK 1/2 | 4.2 % | 3.0 % | 0.2 % |
+| 1.7 MHz T2 8K 16-QAM 3/4 | 8.8 % | 3.0 % | 0.2 % |
+| 1.7 MHz T2 8K 1/128 256-QAM 5/6 | 16.3 % | 3.0 % | 0.2 % |
+
+1 MHz DVB-T costs an eighth of 8 MHz, as it should; at 2 MS/s the resampler is
+now the transmitter's largest stage (3 %), and the receiver's T2 interpolation
+(2 %) its largest fixed one. The T2 modulator (frame at a time, allocating) is
+the one thing heavier than its DVB-T counterpart; at these rates it is well
+inside the budget and was left alone.
+
+**Needs the HackRF** (not checkable here): the 1.75 MHz baseband filter's
+response at the edges of a 1.54 MHz T2 signal (RX and TX), the TX's DAC
+images at ±2 MS/s (only that filter attenuates them: look at a spectrum
+before going on air), the HackRF's LO leak at the centre against 1 MHz
+DVB-T's centre carrier (139.5 Hz carriers in 8k: the DC canceller and the
+tone canceller should take it, unmeasured), real lock times and the clock
+loops on a live narrow signal, and that receivers other than ours accept
+the reserved bandwidth code 7 (a standard set-top box will not tune 1 MHz
+anyway).
+
+**Not done / limits.** The DVB-T lock's health and quality looks count
+symbols, so at 1 MHz a dead lock is dropped after about 15 s (8k) instead of
+2. The DVB-T sounder runs (and finds nothing) on a 1.7 MHz channel when the
+channel panels are open (under 1 % of a core). T2 at 1.7 MHz is offered by
+the TX with normal carriers only (whether the extended carrier mode applies
+at 1.7 MHz was not checked against the spec text); the receiver reads either.
+The T2 channel view's impulse response is drawn from the symbols' early
+window start (128 samples: 69 µs at 1.7 MHz, 14 µs at 8 MHz), as before; the
+echoes' relative delays are right.

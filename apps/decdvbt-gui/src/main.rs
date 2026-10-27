@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_channels};
-use decdvbt_core::dvbt::Mode;
+use decdvbt_core::dvbt::{Bandwidth, Mode};
 use decdvbt_engine::{
     Command, CpuGauge, FrontEndSettings, Outputs, Row, Stats, TsView, signal_block, spectral_cn_db,
 };
@@ -72,13 +72,29 @@ const SNAP_HZ: f64 = 40e3;
 const FPS_CHOICES: [f64; 6] = [5.0, 10.0, 15.0, 20.0, 30.0, 60.0];
 /// HackRF sample rates with the least clock jitter that hold a channel.
 const RATES_MSPS: [f64; 4] = [10.0, 12.5, 16.0, 20.0];
-/// Half a channel plus a margin: a channel is received without retuning only
-/// if all of this is inside the span.
+/// The same for the narrow channels (1 MHz DVB-T, 1.7 MHz DVB-T2): the
+/// radio's lowest, which holds them, and twice it.
+const NARROW_RATES_MSPS: [f64; 2] = [2.0, 4.0];
+/// Half an 8 MHz channel plus a margin: a channel is received without
+/// retuning only if all of this (scaled to its width) is inside the span.
 const CHANNEL_HALF_NEEDED_HZ: f64 = 4.1e6;
+
+/// The rates the radio is offered for a channel `bw` wide.
+fn rates_for(bw: Bandwidth) -> &'static [f64] {
+    if bw.narrow() {
+        &NARROW_RATES_MSPS
+    } else {
+        &RATES_MSPS
+    }
+}
 
 struct Options {
     file: Option<PathBuf>,
     channel: Option<u8>,
+    /// `--freq MHZ`: a free frequency instead of a channel.
+    freq_hz: Option<f64>,
+    /// `--bandwidth`: the channel's width (nothing in the signal says it).
+    bandwidth: Option<Bandwidth>,
     rate_msps: Option<f64>,
     screenshot: Option<PathBuf>,
     after: f64,
@@ -165,6 +181,8 @@ impl Options {
         let mut o = Options {
             file: None,
             channel: None,
+            freq_hz: None,
+            bandwidth: None,
             rate_msps: None,
             screenshot: None,
             after: 4.0,
@@ -197,6 +215,15 @@ impl Options {
                 }
                 "--rate" => {
                     o.rate_msps = Some(value("MS/s")?.parse().map_err(|_| "bad --rate")?);
+                }
+                "--freq" => {
+                    let f: f64 = value("MHz")?.parse().map_err(|_| "bad --freq")?;
+                    o.freq_hz = Some(f * 1e6);
+                }
+                "--bandwidth" => {
+                    let v = value("MHz: 1, 1.7, 6, 7 or 8")?;
+                    o.bandwidth =
+                        Some(Bandwidth::parse(&v).ok_or(format!("not a bandwidth: {v}"))?);
                 }
                 "--screenshot" => o.screenshot = Some(value("a .png path")?.into()),
                 "--assume" => {
@@ -340,7 +367,8 @@ fn main() -> eframe::Result {
         Err(e) => {
             eprintln!("decdvbt-gui: {e}");
             eprintln!(
-                "usage: decdvbt-gui [capture.cs8] [--channel C26] [--rate MSPS] \
+                "usage: decdvbt-gui [capture.cs8] [--channel C26 | --freq MHZ] \
+                 [--bandwidth 8|7|6|1.7|1] [--rate MSPS] \
                  [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] \
                  [--bottom scopes|channel|heat|none] [--window ts|epg|sdr] [--service ID] [--play ID] [--subs] \
                  [--http ADDR] [--udp ADDR] [--record] [--no-decode]"
@@ -448,6 +476,10 @@ struct App {
 
     session: Option<Session>,
     kind: SourceKind,
+    /// The channel's width (1 and 1.7 MHz are the narrow ones, off the UHF
+    /// raster), and what the engine was last told of it.
+    bandwidth: Bandwidth,
+    bandwidth_sent: Option<Bandwidth>,
     /// The channel being received (the VFO), by number.
     channel: u8,
     channel_text: String,
@@ -525,7 +557,8 @@ impl App {
     fn new(mut opts: Options) -> App {
         let kept = std::mem::take(&mut opts.kept);
         // Where the radio was left, unless the command line says where to go.
-        let by_hand = opts.channel.is_some() || opts.file.is_some();
+        let by_hand = opts.channel.is_some() || opts.file.is_some() || opts.freq_hz.is_some();
+        let bandwidth = opts.bandwidth.or(kept.bandwidth).unwrap_or(Bandwidth::Mhz8);
         let mut channel = opts.channel.or(kept.channel).unwrap_or(26);
         let sdr = sdr::SdrSettings::load();
         let offsets = load_offsets();
@@ -539,6 +572,10 @@ impl App {
         if !by_hand && let Some(h) = kept.tune_hz {
             tune_hz = h;
             channel = uhf_channel_at(h).unwrap_or(channel);
+        }
+        if let Some(f) = opts.freq_hz {
+            tune_hz = f;
+            channel = uhf_channel_at(f).unwrap_or(channel);
         }
         // The capture last opened (offered again, not opened).
         let file = kept.file.clone().filter(|f| f.exists());
@@ -560,12 +597,14 @@ impl App {
             delay_ms: 1000.0 / 15.0,
             session: None,
             kind,
+            bandwidth,
+            bandwidth_sent: None,
             channel,
             channel_text: format!("C{channel}"),
             rate_msps: opts
                 .rate_msps
-                .or(kept.rate_msps.filter(|r| RATES_MSPS.contains(r)))
-                .unwrap_or(10.0),
+                .or(kept.rate_msps.filter(|r| rates_for(bandwidth).contains(r)))
+                .unwrap_or(rates_for(bandwidth)[0]),
             gains: kept.gains.unwrap_or_default(),
             file,
             file_centre_mhz: kept.file_centre_mhz.unwrap_or(0.0),
@@ -658,7 +697,7 @@ impl App {
         // Started from the command line: begin at once.
         if let Some(f) = app.opts.file.clone() {
             app.open_file(f);
-        } else if app.opts.channel.is_some() {
+        } else if app.opts.channel.is_some() || app.opts.freq_hz.is_some() {
             app.start();
         }
         // From here what changes is kept (not by a screenshot: a test run
@@ -693,6 +732,7 @@ impl App {
             fps: self.opts.fps as u32,
             doppler_hz: self.chan_view.doppler_view as u32,
             window: self.window_size,
+            bandwidth: self.bandwidth.token().to_string(),
         }
     }
 
@@ -742,7 +782,10 @@ impl App {
                     center_hz: self.file_centre_mhz * 1e6,
                     rate_hz: self.file_rate_msps * 1e6,
                 };
+                // A capture's signal is in its channel; a narrow one is
+                // taken at the capture's centre (it is off the UHF raster).
                 let vfo = uhf_channel_at(self.file_centre_mhz * 1e6)
+                    .filter(|_| !self.bandwidth.narrow())
                     .and_then(uhf_centre_hz)
                     .or((self.file_centre_mhz > 0.0).then_some(self.file_centre_mhz * 1e6));
                 self.begin(spec, vfo);
@@ -754,6 +797,7 @@ impl App {
         match Session::open(&spec) {
             Ok(s) => {
                 self.session = Some(s);
+                self.bandwidth_sent = None;
                 self.sounder_sent = None;
                 self.decoder_sent = None;
                 self.dec = ReceiverStatus::default();
@@ -854,6 +898,58 @@ impl App {
         }
     }
 
+    /// Tell the engine the channel's width when it changes (it restarts the
+    /// receiver and the sounder for it).
+    fn sync_bandwidth(&mut self) {
+        let Some(s) = &self.session else { return };
+        if self.bandwidth_sent != Some(self.bandwidth) {
+            s.rx.send(Command::Bandwidth(self.bandwidth));
+            self.bandwidth_sent = Some(self.bandwidth);
+        }
+    }
+
+    /// A new width: the receiver starts again, the radio's rate follows (2
+    /// MS/s for the narrow channels, 10 for the others) and the services go.
+    fn set_bandwidth(&mut self, bw: Bandwidth) {
+        if bw == self.bandwidth {
+            return;
+        }
+        self.bandwidth = bw;
+        self.reset_stream();
+        self.dec = ReceiverStatus::default();
+        (self.standard, self.dec2) = (Standard::Searching, None);
+        let rates = rates_for(bw);
+        if !rates.contains(&self.rate_msps) {
+            self.rate_msps = rates[0];
+            if self.session.is_some() && self.kind == SourceKind::HackRf {
+                self.start();
+            }
+        }
+    }
+
+    /// Half the band a channel of this width needs inside the span, Hz.
+    fn channel_half_needed_hz(&self) -> f64 {
+        CHANNEL_HALF_NEEDED_HZ * self.bandwidth.scale()
+    }
+
+    /// The name outputs and recordings give the channel: "C26", or the
+    /// frequency of a narrow one ("433.250MHz").
+    fn channel_name(&self) -> String {
+        match self.vfo_hz {
+            Some(v) if self.bandwidth.narrow() => format!("{:.3}MHz", v / 1e6),
+            v => v
+                .and_then(uhf_channel_at)
+                .map_or_else(|| format!("C{}", self.channel), |c| format!("C{c}")),
+        }
+    }
+
+    /// The UHF channel of the VFO for the card (none for a narrow signal).
+    fn card_channel(&self) -> Option<u8> {
+        self.vfo_hz
+            .and_then(uhf_channel_at)
+            .filter(|_| !self.bandwidth.narrow())
+    }
+
     /// Ask the engine to decode the signal under the VFO while the decode
     /// switch is on, and to stop when it is not.
     fn sync_decoder(&mut self) {
@@ -897,10 +993,7 @@ impl App {
     /// Tell the hub where the stream goes, when that has changed.
     fn sync_outputs(&mut self) {
         let Some(s) = &self.session else { return };
-        let name = self
-            .vfo_hz
-            .and_then(uhf_channel_at)
-            .map_or_else(|| format!("C{}", self.channel), |c| format!("C{c}"));
+        let name = self.channel_name();
         let mut o = self
             .outputs_ui
             .outputs(&name, self.tap.clone(), self.pending_vlc.is_some());
@@ -1036,7 +1129,7 @@ impl App {
         self.centre_checked = false;
         self.centre_tries = 0;
         let fits = self.span_hz > 0.0
-            && (fc - self.centre_hz).abs() + CHANNEL_HALF_NEEDED_HZ <= self.span_hz / 2.0;
+            && (fc - self.centre_hz).abs() + self.channel_half_needed_hz() <= self.span_hz / 2.0;
         match &self.session {
             Some(s) if s.live && !fits => {
                 s.rx.send(Command::Retune(fc));
@@ -1098,7 +1191,8 @@ impl App {
             }
             Some(_) => {
                 let fits = self.span_hz > 0.0
-                    && (hz - self.centre_hz).abs() + CHANNEL_HALF_NEEDED_HZ <= self.span_hz / 2.0;
+                    && (hz - self.centre_hz).abs() + self.channel_half_needed_hz()
+                        <= self.span_hz / 2.0;
                 if fits {
                     self.vfo_hz = Some(hz);
                     self.reset_stream();
@@ -1143,6 +1237,12 @@ impl App {
         if !self.sdr.auto_centre || self.centre_checked || self.session.is_none() {
             return;
         }
+        // The plan's offsets are the UHF raster's: a narrow signal is where
+        // it is tuned.
+        if self.bandwidth.narrow() {
+            self.centre_checked = true;
+            return;
+        }
         if self.tuned_at.elapsed() < Duration::from_secs(2) || self.span_hz <= 0.0 {
             return;
         }
@@ -1164,8 +1264,14 @@ impl App {
             let off = self.centre_hz + self.dec.cfo_hz - nominal;
             Some(snap(off).unwrap_or(off))
         } else {
-            signal_block(&self.smooth, self.centre_hz, self.span_hz, nominal)
-                .and_then(|(centre, _)| snap(centre - nominal))
+            signal_block(
+                &self.smooth,
+                self.centre_hz,
+                self.span_hz,
+                nominal,
+                self.bandwidth,
+            )
+            .and_then(|(centre, _)| snap(centre - nominal))
         };
         let Some(off) = found.filter(|o| o.abs() < 600e3) else {
             // Nothing to go on yet: look again, a few times.
@@ -1341,7 +1447,9 @@ impl App {
         }
         let name = format!(
             "c{}_{:.3}MHz_{}Msps_{}.cs8",
-            uhf_channel_at(self.centre_hz).unwrap_or(0),
+            uhf_channel_at(self.centre_hz)
+                .filter(|_| !self.bandwidth.narrow())
+                .unwrap_or(0),
             self.centre_hz / 1e6,
             self.stats.sample_rate / 1e6,
             utc_stamp()
@@ -1470,9 +1578,9 @@ impl App {
 
     /// Fold one row's spectral C/N estimate into the smoothed reading.
     fn estimate_cn(&mut self, row: &Row) {
-        let est = self
-            .vfo_hz
-            .and_then(|v| spectral_cn_db(&row.db, row.center_hz, row.sample_rate, v));
+        let est = self.vfo_hz.and_then(|v| {
+            spectral_cn_db(&row.db, row.center_hz, row.sample_rate, v, self.bandwidth)
+        });
         match est {
             Some(e) => {
                 self.cn_misses = 0;
@@ -1499,6 +1607,12 @@ impl App {
         let tps = self.dec.tps.filter(|_| self.dec.tps_synced && self.decode);
         let read: Option<Mode> = tps.map(|t| {
             let mut m = Mode::uk(t.modulation, t.rate_hp);
+            // The TPS does not say the width: it is the one the receiver runs at.
+            m.bandwidth = if self.bandwidth.dvbt() {
+                self.bandwidth
+            } else {
+                Bandwidth::Mhz8
+            };
             m.fft = t.fft;
             m.guard = t.guard;
             m.rate_lp = t.rate_lp;
@@ -1555,7 +1669,7 @@ impl App {
             details,
             cn_db,
             cn_source,
-            channel: self.vfo_hz.and_then(uhf_channel_at),
+            channel: self.card_channel(),
             freq_hz: self.vfo_hz,
             active: self.session.is_some(),
         }
@@ -1583,7 +1697,7 @@ impl App {
                 self.cn_db
             },
             cn_source: if measured { "effective" } else { "spectrum" },
-            channel: self.vfo_hz.and_then(uhf_channel_at),
+            channel: self.card_channel(),
             freq_hz: self.vfo_hz,
             active: self.session.is_some(),
         }
@@ -1716,31 +1830,67 @@ impl App {
                 self.stop();
             }
 
+            // The channel's width: what the receiver looks for (both
+            // sources).
+            let mut bw = self.bandwidth;
+            egui::ComboBox::from_id_salt("bandwidth")
+                .selected_text(bw.name())
+                .width(70.0)
+                .show_ui(ui, |ui| {
+                    for b in Bandwidth::ALL {
+                        let label = match b {
+                            Bandwidth::Mhz1 => "1 MHz (DVB-T)",
+                            Bandwidth::Mhz1_7 => "1.7 MHz (T2)",
+                            _ => b.name(),
+                        };
+                        ui.selectable_value(&mut bw, b, label);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "The channel's width: the receiver must be told it. 1 MHz is DVB-T with \
+                     every clock of 8 MHz divided by 8 (DecDVB-T's narrow mode); 1.7 MHz is \
+                     DVB-T2's narrow channel. Both run the radio at 2 MS/s.",
+                );
+            self.set_bandwidth(bw);
+
             if self.kind == SourceKind::HackRf {
                 ui.label("channel");
                 if ui.small_button("◀").clicked() {
                     self.step_channel(false);
                 }
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.channel_text)
-                        .desired_width(44.0)
-                        .hint_text("C26"),
-                );
+                let edit = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.channel_text)
+                            .desired_width(56.0)
+                            .hint_text("C26 / MHz"),
+                    )
+                    .on_hover_text("A UHF channel (C26), or any frequency in MHz (433.25)");
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    match parse_channel(&self.channel_text) {
-                        Some(n) => self.tune_channel(n),
-                        None => {
-                            self.note = format!("not a UHF channel (21–69): {}", self.channel_text)
+                    let text = self.channel_text.trim().to_string();
+                    match (parse_channel(&text), text.parse::<f64>()) {
+                        (Some(n), _) if !text.contains('.') => self.tune_channel(n),
+                        (_, Ok(mhz)) if (1.0..=6000.0).contains(&mhz) => {
+                            self.set_frequency(mhz * 1e6)
+                        }
+                        _ => {
+                            self.note =
+                                format!("not a UHF channel (21–69) or a frequency in MHz: {text}")
                         }
                     }
-                    self.channel_text = format!("C{}", self.channel);
+                    self.channel_text = match self.vfo_hz {
+                        Some(v) if uhf_channel_at(v).is_none() || self.bandwidth.narrow() => {
+                            format!("{:.3}", v / 1e6)
+                        }
+                        _ => format!("C{}", self.channel),
+                    };
                 }
                 if ui.small_button("▶").clicked() {
                     self.step_channel(true);
                 }
                 ui.label(format!(
                     "{:.3} MHz",
-                    uhf_centre_hz(self.channel).unwrap_or(0.0) / 1e6
+                    self.vfo_hz.or(uhf_centre_hz(self.channel)).unwrap_or(0.0) / 1e6
                 ));
 
                 ui.separator();
@@ -1750,7 +1900,7 @@ impl App {
                     .selected_text(format!("{} MS/s", self.rate_msps))
                     .width(90.0)
                     .show_ui(ui, |ui| {
-                        for r in RATES_MSPS {
+                        for &r in rates_for(self.bandwidth) {
                             ui.selectable_value(&mut self.rate_msps, r, format!("{r} MS/s"));
                         }
                     });
@@ -2040,6 +2190,7 @@ impl eframe::App for App {
             self.open_file(p);
         }
         self.take_rows();
+        self.sync_bandwidth();
         self.sync_sounder();
         self.sync_decoder();
         self.sync_scopes();
@@ -2131,6 +2282,8 @@ impl eframe::App for App {
                     levels: self.history.levels(),
                     waterfall: tex,
                     vfo_hz: self.vfo_hz,
+                    occupied_half_hz: band::OCCUPIED_HALF_HZ * self.bandwidth.scale(),
+                    raster: !self.bandwidth.narrow(),
                 };
                 if let Some(band::Action::Tune(n)) = band::show(ui, &inp) {
                     tune = Some(n);
@@ -2232,7 +2385,7 @@ fn mode_details(m: &Mode) -> Vec<(String, String)> {
             "guard",
             format!("{} ({:.0} µs)", m.guard.name(), m.guard_s() * 1e6),
         ),
-        kv("bandwidth", format!("{} MHz", m.bandwidth.mhz())),
+        kv("bandwidth", m.bandwidth.name().to_string()),
         kv("symbol", format!("{:.0} µs", m.symbol_s() * 1e6)),
         kv(
             "carriers",

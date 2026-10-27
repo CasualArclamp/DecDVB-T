@@ -20,6 +20,9 @@ decdvbt-core = { path = "../decdvbt-core" }
 decdvbt-io = { path = "../decdvbt-io" }
 decdvbt-mod = { path = "../decdvbt-mod" }
 decdvbt-dsp = { path = "../decdvbt-dsp" }
+# DVB-T2 at 1.7 MHz: its constellations and thresholds (modes.rs).
+decdvbt-fec = { path = "../decdvbt-fec" }
+decdvbt-ofdm = { path = "../decdvbt-ofdm" }
 rustfft.workspace = true
 tracing.workspace = true
 

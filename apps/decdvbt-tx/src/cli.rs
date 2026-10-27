@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! decdvbt-tx [FILE] [--mode 64qam-2/3-8k-1/32] [--channel C30]
+//!            [--t2 8k-1/16-16qam-3/4] [--freq-mhz 433.25]
 //!            [--sink null|iq:PATH [--start] [--run-secs N]]
 //!            [--demo [--state ready]] [--screenshot OUT.png [--after SECS]]
 //!            [--selftest] [--version]
@@ -19,9 +20,11 @@ use decdvbt_core::channel::{parse_channel, uhf_centre_hz};
 use decdvbt_core::dvbt::Mode;
 
 use crate::demo::DemoState;
+use decdvbt_tx::modes::T2Config;
 
 pub const USAGE: &str = concat!(
     "usage: decdvbt-tx [FILE] [--mode 64qam-2/3-8k-1/32] [--channel C30]\n",
+    "                  [--t2 8k-1/16-16qam-3/4] [--freq-mhz 433.25]\n",
     "                  [--sink null|iq:PATH [--start] [--run-secs N]]\n",
     "                  [--demo [--state STATE]] [--screenshot OUT.png [--after SECS]]\n",
     "                  [--size WxH] [--modes] [--selftest] [--version]\n",
@@ -31,6 +34,9 @@ pub const USAGE: &str = concat!(
     "  --demo         draw a made-up status and spectrum; no session, no ffmpeg, no radio\n",
     "  --state STATE  with --demo: idle|preparing|ready|armed|transmitting|running|\n",
     "                 stuffing|trouble|failed|finished\n",
+    "  --mode M       a DVB-T mode; ...-1mhz is DVB-T at 1 MHz\n",
+    "  --t2 M         DVB-T2 at 1.7 MHz: FFT-GUARD-CONSTELLATION-RATE (1k to 8k)\n",
+    "  --freq-mhz F   the centre, MHz (anywhere 1 MHz to 6 GHz)\n",
     "  --modes        open the All modes window at the start\n",
     "  --selftest     check the safety logic and the defaults, print the result, exit"
 );
@@ -46,6 +52,8 @@ pub enum SinkArg {
 pub struct Options {
     pub file: Option<PathBuf>,
     pub mode: Option<Mode>,
+    /// `--t2`: send DVB-T2 at 1.7 MHz in this mode.
+    pub t2: Option<T2Config>,
     pub centre_hz: Option<f64>,
     pub sink: Option<SinkArg>,
     pub start: bool,
@@ -74,6 +82,22 @@ impl Options {
                         return Err("hierarchical modes are not supported".into());
                     }
                     o.mode = Some(m);
+                }
+                "--t2" => {
+                    let t = value("a T2 mode, like 8k-1/16-16qam-3/4")?;
+                    o.t2 = Some(
+                        crate::settings::parse_t2(&t)
+                            .ok_or(format!("not a 1.7 MHz T2 mode the app offers: {t}"))?,
+                    );
+                }
+                "--freq-mhz" => {
+                    let f: f64 = value("MHz")?
+                        .parse()
+                        .map_err(|_| "--freq-mhz needs a number".to_string())?;
+                    if !(1.0..=6000.0).contains(&f) {
+                        return Err("--freq-mhz must be 1 to 6000".into());
+                    }
+                    o.centre_hz = Some(f * 1e6);
                 }
                 "--channel" => {
                     let t = value("a channel, like C30")?;
@@ -174,6 +198,23 @@ mod tests {
         assert_eq!(o.file, Some(PathBuf::from("clip.mp4")));
         assert!(!o.start);
         assert!(o.sink.is_none());
+    }
+
+    #[test]
+    fn the_narrow_channels_and_a_free_frequency() {
+        let o = parse("--mode qpsk-1/2-2k-1/8-1mhz --freq-mhz 433.25").unwrap();
+        assert_eq!(
+            o.mode.unwrap().bandwidth,
+            decdvbt_core::dvbt::Bandwidth::Mhz1
+        );
+        assert_eq!(o.centre_hz, Some(433.25e6));
+        let o = parse("--t2 8k-1/16-16qam-3/4").unwrap();
+        assert_eq!(
+            o.t2.unwrap().bandwidth,
+            decdvbt_core::dvbt::Bandwidth::Mhz1_7
+        );
+        assert!(parse("--t2 32k-1/128-256qam-2/3").is_err());
+        assert!(parse("--freq-mhz 0.5").is_err());
     }
 
     #[test]

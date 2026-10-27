@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use decdvbt_core::channel::{uhf_centre_hz, uhf_channel_at};
+use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_rx::auto::{AutoReceiver, Standard};
 use decdvbt_ts::TS_LEN;
 use decdvbt_ts::dsmcc::ObjectCarousel;
@@ -20,9 +21,17 @@ use crate::source;
 
 #[derive(clap::Args)]
 pub struct DecodeArgs {
-    /// An IQ file, a transport stream (`.ts`), or a UHF channel ("C26") for
-    /// the HackRF.
+    /// An IQ file, a transport stream (`.ts`), a UHF channel ("C26") for
+    /// the HackRF, or `hackrf` with `--freq`.
     source: String,
+    /// The channel's width, MHz: 8 (default), 7, 6, 1.7 (DVB-T2 only) or 1
+    /// (DecDVB-T's 1 MHz DVB-T). Nothing in the signal says it.
+    #[arg(long, default_value = "8")]
+    bandwidth: String,
+    /// The signal's centre, MHz: for `hackrf` the radio's tuning; for a file
+    /// whose name gives its centre, where the signal is in it.
+    #[arg(long)]
+    freq: Option<f64>,
     /// Write the transport stream here.
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -181,6 +190,9 @@ pub fn run(a: DecodeArgs) -> Result<()> {
     if a.source.to_ascii_lowercase().ends_with(".ts") {
         return run_ts(&a, dump);
     }
+    let bandwidth = Bandwidth::parse(&a.bandwidth)
+        .with_context(|| format!("not a bandwidth: {} (8, 7, 6, 1.7 or 1)", a.bandwidth))?;
+    let freq_hz = a.freq.map(|f| f * 1e6);
     let mut src = source::open(
         &a.source,
         a.file_rate,
@@ -189,10 +201,18 @@ pub fn run(a: DecodeArgs) -> Result<()> {
             lna: a.lna,
             vga: a.vga,
         }),
+        source::Tuning { freq_hz, bandwidth },
     )?;
     let fs = src.sample_rate();
     let centre = src.center_freq();
-    let channel_centre = uhf_channel_at(centre).and_then(uhf_centre_hz);
+    // Where the signal is: as given; else the UHF channel the centre falls
+    // in (an 8 MHz raster: a narrow signal is taken at the centre).
+    let channel_centre = match freq_hz {
+        Some(f) if centre > 0.0 => Some(f),
+        Some(_) => None,
+        None if bandwidth.narrow() => None,
+        None => uhf_channel_at(centre).and_then(uhf_centre_hz),
+    };
     println!(
         "{} (centre {:.3} MHz{})",
         src.describe(),
@@ -206,7 +226,11 @@ pub fn run(a: DecodeArgs) -> Result<()> {
         None => None,
     };
 
-    let mut rx = AutoReceiver::new(fs, a.offset + channel_centre.map_or(0.0, |c| c - centre));
+    let mut rx = AutoReceiver::with_bandwidth(
+        fs,
+        a.offset + channel_centre.map_or(0.0, |c| c - centre),
+        bandwidth,
+    );
     rx.set_plp(a.plp);
     rx.set_realtime(src.is_live());
     let mut analyser = TsAnalyser::new();

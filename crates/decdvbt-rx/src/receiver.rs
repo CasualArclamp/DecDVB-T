@@ -349,7 +349,7 @@ impl Receiver {
             interp: Interpolator::new(),
             win: Window::new(),
             track: None,
-            tone: ToneCanceller::new(cfg.fs_in, cfg.vfo_offset_hz),
+            tone: ToneCanceller::new(cfg.fs_in, cfg.vfo_offset_hz, fs_native),
             status: ReceiverStatus::default(),
             next_attempt: 0,
             ts: Vec::new(),

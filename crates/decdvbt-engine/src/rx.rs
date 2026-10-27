@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_core::{Iq, SampleFormat};
 use decdvbt_io::{IqFileWriter, IqSource};
 
@@ -121,6 +122,10 @@ pub enum Command {
     FrontEnd(FrontEndSettings),
     /// Start recording to this file (cs8), or stop with `None`.
     Record(Option<PathBuf>),
+    /// The channel's width (8 MHz until told): nothing in the signal says it,
+    /// and it sets the signal's sample rate. The receiver and the sounder start
+    /// again for it; 1 MHz looks for DVB-T only, 1.7 MHz for DVB-T2 only.
+    Bandwidth(Bandwidth),
 }
 
 /// What the sounder has made, waiting for the GUI.
@@ -445,28 +450,37 @@ fn run(
     let mut map_at = Instant::now();
     let started = Instant::now();
     let set_error = |e: String| sh.stats.lock().unwrap().error = Some(e);
+    let mut bandwidth = Bandwidth::Mhz8;
     // A sounder for the signal at `vfo_hz`, for a source tuned to `centre`.
-    let new_sounder = |vfo_hz: f64, centre: f64, rate: f64| {
+    let new_sounder = |vfo_hz: f64, centre: f64, rate: f64, bw: Bandwidth| {
         // A file without a centre in its name has none to measure from.
         let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
-        Sounder::new(SounderConfig::new(rate, offset))
+        let mut c = SounderConfig::new(rate, offset);
+        // DVB-T's sounder; a width DVB-T is not sent in leaves it searching
+        // (T2's rows come from the receiver).
+        if bw.dvbt() {
+            c.bandwidth = bw;
+        }
+        Sounder::new(c)
     };
-    let new_decoder = |vfo_hz: f64, centre: f64, rate: f64, heat: Option<f64>, sound: bool| {
-        let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
-        let mut d = AutoReceiver::new(rate, offset);
-        // A T2 lock's sounder is the receiver's own (DVB-T's cannot read it).
-        d.set_sounding(sound);
-        // A file is held to real time here too.
-        d.set_realtime(true);
-        d.set_heat(heat.unwrap_or(0.0));
-        d
-    };
+    let new_decoder =
+        |vfo_hz: f64, centre: f64, rate: f64, heat: Option<f64>, sound: bool, bw: Bandwidth| {
+            let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
+            let mut d = AutoReceiver::with_bandwidth(rate, offset, bw);
+            // A T2 lock's sounder is the receiver's own (DVB-T's cannot read it).
+            d.set_sounding(sound);
+            // A file is held to real time here too.
+            d.set_realtime(true);
+            d.set_heat(heat.unwrap_or(0.0));
+            d
+        };
 
     while !sh.stop.load(Ordering::Relaxed) {
         loop {
             match cmds.try_recv() {
                 Ok(Command::Sounder(vfo)) => {
-                    sounder = vfo.map(|v| (new_sounder(v, source.center_freq(), rate), v));
+                    sounder =
+                        vfo.map(|v| (new_sounder(v, source.center_freq(), rate, bandwidth), v));
                     *sh.sounder.lock().unwrap() = SounderOut::default();
                     if let Some((d, _)) = &mut decoder {
                         d.set_sounding(sounder.is_some());
@@ -480,6 +494,7 @@ fn run(
                             rate,
                             heat_rate,
                             sounder.is_some(),
+                            bandwidth,
                         );
                         (d, v)
                     });
@@ -507,7 +522,7 @@ fn run(
                         sh.rows.lock().unwrap().clear();
                         wf.clear();
                         if let Some((s, v)) = &mut sounder {
-                            *s = new_sounder(*v, source.center_freq(), rate);
+                            *s = new_sounder(*v, source.center_freq(), rate, bandwidth);
                         }
                         if let Some((d, v)) = &mut decoder {
                             *d = new_decoder(
@@ -516,6 +531,7 @@ fn run(
                                 rate,
                                 heat_rate,
                                 sounder.is_some(),
+                                bandwidth,
                             );
                             ts_scratch.clear();
                             feeder.reset();
@@ -524,6 +540,27 @@ fn run(
                     Ok(false) => {}
                     Err(e) => set_error(e.to_string()),
                 },
+                Ok(Command::Bandwidth(bw)) if bw != bandwidth => {
+                    bandwidth = bw;
+                    if let Some((s, v)) = &mut sounder {
+                        *s = new_sounder(*v, source.center_freq(), rate, bandwidth);
+                        *sh.sounder.lock().unwrap() = SounderOut::default();
+                    }
+                    if let Some((d, v)) = &mut decoder {
+                        *d = new_decoder(
+                            *v,
+                            source.center_freq(),
+                            rate,
+                            heat_rate,
+                            sounder.is_some(),
+                            bandwidth,
+                        );
+                        *sh.decoder.lock().unwrap() = DecoderOut::default();
+                        ts_scratch.clear();
+                        feeder.reset();
+                    }
+                }
+                Ok(Command::Bandwidth(_)) => {}
                 Ok(Command::Record(path)) => {
                     if let Some((w, ..)) = writer.take()
                         && let Err(e) = w.finish()

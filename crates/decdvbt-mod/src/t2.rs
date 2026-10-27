@@ -1,6 +1,8 @@
 // made by CasualArclamp
 //! The DVB-T2 modulator (EN 302 755): transport packets in, T2 frames out at
-//! the sample rate 1/T (64/7 MS/s for 8 MHz), one P1 symbol, the P2 symbols and
+//! the sample rate 1/T (64/7 MS/s for 8 MHz, 131/71 MS/s for 1.7 MHz: the
+//! samples are the same at every bandwidth, only their clock differs, §9.5
+//! Table 66), one P1 symbol, the P2 symbols and
 //! the data symbols of each frame at a time. One data PLP of type 1 (the
 //! layout of the UK's multiplexes and of gr-dtv's modulator), constant coding
 //! and modulation, time interleaving within a frame (TIME_IL_TYPE 0).
@@ -17,6 +19,7 @@
 
 use std::sync::Arc;
 
+use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_core::{CodeRate, FecFrame, Iq};
 use decdvbt_fec::t2::bbframe::NmPacker;
 use decdvbt_fec::t2::l1::{L1Coder, L1Mod, PostLayout, post_cells, pre_cells};
@@ -36,9 +39,14 @@ use crate::ts::{TS_LEN, TsSource};
 pub const SAMPLE_RATE_HZ: f64 = 64e6 / 7.0;
 
 /// Everything that makes a T2 signal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct T2Config {
     pub mode: Mode,
+    /// The channel's width: only the sample clock (and so every duration)
+    /// follows it. Nothing in P1 or L1 says it (L1-pre's BWT_EXT is the
+    /// extended carrier mode, not the width): a receiver must be told, and a
+    /// network says it in the T2 delivery system descriptor.
+    pub bandwidth: Bandwidth,
     pub frame: FecFrame,
     pub rate: CodeRate,
     pub qam: Qam,
@@ -66,6 +74,7 @@ impl T2Config {
     pub fn uk() -> T2Config {
         T2Config {
             mode: Mode::new(Fft::K32, Guard::G1_128, PilotPattern::Pp7, true),
+            bandwidth: Bandwidth::Mhz8,
             frame: FecFrame::Normal,
             rate: CodeRate::new(2, 3),
             qam: Qam::Qam256,
@@ -88,6 +97,7 @@ impl T2Config {
     pub fn small(qam: Qam, rotated: bool) -> T2Config {
         T2Config {
             mode: Mode::new(Fft::K2, Guard::G1_8, PilotPattern::Pp2, false),
+            bandwidth: Bandwidth::Mhz8,
             frame: FecFrame::Short,
             rate: CodeRate::new(1, 2),
             qam,
@@ -118,7 +128,8 @@ impl T2Config {
     /// any of `ext` (extended carriers), `rot` (rotated constellation),
     /// `short` (16K LDPC frames), `ti=N` (time interleaving blocks), `blocks=N`
     /// (FEC blocks a frame; by default as many as fit), `syms=N` (data
-    /// symbols a frame; by default about 217 ms of them, the UK's).
+    /// symbols a frame; by default about 217 ms of them, the UK's) and the
+    /// channel's width (`1.7mhz`, `6mhz`, `7mhz`, `8mhz`; 8 by default).
     /// `uk` is the UK's multiplex.
     pub fn parse(spec: &str) -> Result<T2Config, String> {
         if spec == "uk" {
@@ -131,9 +142,15 @@ impl T2Config {
         let mut rate = CodeRate::new(2, 3);
         let (mut ext, mut rot, mut short) = (false, false, false);
         let (mut ti, mut blocks, mut syms) = (3usize, None, None);
+        let mut bandwidth = Bandwidth::Mhz8;
         for tok in spec.split('-') {
             let t = tok.to_ascii_lowercase();
             match t.as_str() {
+                b if b.ends_with("mhz") => {
+                    bandwidth = Bandwidth::parse(b)
+                        .filter(|b| b.t2())
+                        .ok_or(format!("not a DVB-T2 bandwidth: {b}"))?;
+                }
                 "1k" => fft = Fft::K1,
                 "2k" => fft = Fft::K2,
                 "4k" => fft = Fft::K4,
@@ -182,11 +199,12 @@ impl T2Config {
         let mode = Mode::new(fft, guard, pp, ext);
         let n_p2 = fft.p2_symbols();
         let data_symbols = syms.unwrap_or_else(|| {
-            let ts = mode.symbol_samples() as f64 / SAMPLE_RATE_HZ;
+            let ts = mode.symbol_samples() as f64 / bandwidth.sample_rate_hz();
             ((0.217 / ts).round() as usize).saturating_sub(n_p2).max(3)
         });
         let mut cfg = T2Config {
             mode,
+            bandwidth,
             frame: if short {
                 FecFrame::Short
             } else {
@@ -213,6 +231,27 @@ impl T2Config {
         };
         cfg.ti_blocks = cfg.ti_blocks.min(cfg.fec_blocks);
         Ok(cfg)
+    }
+
+    /// The sample rate 1/T, Hz.
+    pub fn sample_rate_hz(&self) -> f64 {
+        self.bandwidth.sample_rate_hz()
+    }
+
+    /// A frame's duration, seconds (the P1 symbol and the OFDM symbols).
+    pub fn frame_s(&self) -> f64 {
+        let symbols = self.mode.fft.p2_symbols() + self.data_symbols;
+        (p1::SAMPLES + symbols * self.mode.symbol_samples()) as f64 / self.sample_rate_hz()
+    }
+
+    /// The transport stream rate the PLP carries, bit/s: each FEC block's
+    /// BBFRAME holds DFL = K_bch − 80 bits of packets (normal mode, no null
+    /// packet deletion, no ISSY: EN 302 755 §5.1.7), `fec_blocks` a frame.
+    pub fn ts_rate_bps(&self) -> f64 {
+        let k_bch_bytes = PlpCoder::new(self.frame, self.rate, self.qam, self.rotated)
+            .map_or(0, |p| p.bbframe_bytes());
+        let dfl_bits = k_bch_bytes.saturating_sub(decdvbt_fec::t2::bbframe::HEADER_BYTES) * 8;
+        (self.fec_blocks * dfl_bits) as f64 / self.frame_s()
     }
 
     /// Cells in a FEC block of the PLP (0 for a code that does not exist).
@@ -350,6 +389,9 @@ pub struct T2Modulator {
 
 impl T2Modulator {
     pub fn new(cfg: T2Config, ts: Box<dyn TsSource>) -> Result<T2Modulator, String> {
+        if !cfg.bandwidth.t2() {
+            return Err(format!("DVB-T2 is not sent in {}", cfg.bandwidth));
+        }
         let layout = FrameLayout::new(&cfg.mode, cfg.data_symbols)?;
         let plp = PlpCoder::new(cfg.frame, cfg.rate, cfg.qam, cfg.rotated).ok_or("no such code")?;
         let cs = plp.cells();
@@ -742,6 +784,37 @@ mod tests {
         // It builds.
         T2Modulator::new(small, Box::<TestStream>::default()).unwrap();
         assert!(T2Config::parse("32k-9/9").is_err());
+    }
+
+    #[test]
+    fn the_1_7_mhz_channel_has_its_own_clock_and_rate() {
+        // The UK multiplex: 40.2 Mbit/s in its frame of 217 ms at 8 MHz.
+        let uk = T2Config::uk();
+        assert!((uk.frame_s() - 0.21694).abs() < 1e-4, "{}", uk.frame_s());
+        assert!(
+            (uk.ts_rate_bps() / 1e6 - 40.0).abs() < 0.1,
+            "{}",
+            uk.ts_rate_bps()
+        );
+        // 1.7 MHz: T = 71/131 µs, frames still about 217 ms (fewer symbols).
+        let c = T2Config::parse("8k-1/16-pp4-16qam-3/4-short-ext-1.7mhz").unwrap();
+        assert_eq!(c.bandwidth, Bandwidth::Mhz1_7);
+        assert!((c.sample_rate_hz() - 131e6 / 71.0).abs() < 1e-3);
+        assert!((c.frame_s() - 0.217).abs() < 0.005, "{}", c.frame_s());
+        let at_8 = T2Config::parse("8k-1/16-pp4-16qam-3/4-short-ext").unwrap();
+        assert!(c.data_symbols < at_8.data_symbols);
+        // DVB-T's 1 MHz is not DVB-T2's.
+        assert!(T2Config::parse("8k-1/16-pp4-16qam-3/4-1mhz").is_err());
+        let mut one = c.clone();
+        one.bandwidth = Bandwidth::Mhz1;
+        assert!(T2Modulator::new(one, Box::<TestStream>::default()).is_err());
+        // The samples do not depend on the width: a frame is the same.
+        let mut same = c.clone();
+        same.bandwidth = Bandwidth::Mhz8;
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        modulator(c).next_frame(&mut a);
+        modulator(same).next_frame(&mut b);
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use decdvbt_dsp::Resampler;
 
 use crate::channel::{Channel, ChannelSim, RadioSim};
 use crate::modulator::Modulator;
-use crate::t2::{self, T2Config, T2Modulator};
+use crate::t2::{T2Config, T2Modulator};
 use crate::ts::{FileTs, TestStream, TsSource};
 
 /// The occupied bandwidth of an 8 MHz channel's block, Hz (§4.7: 6817 × 1/Tu).
@@ -23,7 +23,8 @@ pub struct SimOptions {
     /// A `.ts` file to send, looped; the test stream when `None`.
     pub ts_file: Option<PathBuf>,
     pub seconds: f64,
-    /// The output sample rate, Hz; `None` is the native 64/7 MS/s (8 MHz).
+    /// The output sample rate, Hz; `None` is the mode's native rate (64/7
+    /// MS/s for 8 MHz, 8/7 for 1 MHz).
     pub out_rate_hz: Option<f64>,
     /// The rms level of the output, dBFS (full scale is a component of ±1).
     pub level_dbfs: f64,
@@ -172,13 +173,18 @@ fn run_t2_chain(
     mut each: impl FnMut(&[Iq]) -> Result<(), String>,
 ) -> Result<f64, String> {
     let mut m = T2Modulator::new(o.cfg.clone(), t2_source(o)?)?;
-    let fs_in = t2::SAMPLE_RATE_HZ;
+    let fs_in = o.cfg.sample_rate_hz();
     let mut sim = ChannelSim::new(&o.channel, fs_in, m.mean_power());
     let fs_out = o.out_rate_hz.unwrap_or(fs_in);
     let mode = o.cfg.mode;
     // The occupied band: the carriers' span.
     let occupied = mode.c_ps() as f64 * fs_in / mode.fft.n() as f64;
-    let mut radio = RadioSim::new(&o.channel, fs_out, sim.carrier_power(), 8e6);
+    let mut radio = RadioSim::new(
+        &o.channel,
+        fs_out,
+        sim.carrier_power(),
+        o.cfg.bandwidth.mhz() * 1e6,
+    );
     let mut rs = match o.out_rate_hz {
         Some(r) if (r - fs_in).abs() > 1.0 => Some(Resampler::for_rates(fs_in, r, occupied)?),
         _ => None,
@@ -217,7 +223,7 @@ pub fn generate_t2(
     let mut s = Summary {
         symbols: o.frames * (o.cfg.mode.fft.p2_symbols() + o.cfg.data_symbols),
         gain,
-        out_rate_hz: o.out_rate_hz.unwrap_or(t2::SAMPLE_RATE_HZ),
+        out_rate_hz: o.out_rate_hz.unwrap_or_else(|| o.cfg.sample_rate_hz()),
         ..Default::default()
     };
     let mut scaled = Vec::new();

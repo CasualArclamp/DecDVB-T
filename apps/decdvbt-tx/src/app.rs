@@ -11,7 +11,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use decdvbt_core::channel::{UHF_FIRST, UHF_LAST, uhf_centre_hz, uhf_channel_at};
-use decdvbt_core::dvbt::Rate;
+use decdvbt_core::dvbt::{Bandwidth, Rate};
+use decdvbt_tx::modes::{
+    T2_FFTS, T2_QAMS, T2_RATES, T2Config, baseband_filter_hz, qam_name, t2_guards, t2_mode,
+    t2_mode_table, t2_rate,
+};
 use decdvbt_tx::{
     AudioCodec, EncoderChoice, HackRfTxConfig, LICENCE_WARNING, LicenceAck, ServiceInfo, TxConfig,
     TxRate, TxSink, TxState, TxStatus, VideoCodec, VideoSettings, mode_table,
@@ -157,6 +161,11 @@ impl App {
         };
         if let Some(m) = opts.mode {
             set.mode = m;
+            set.use_t2 = false;
+        }
+        if let Some(t2) = &opts.t2 {
+            set.t2 = t2.clone();
+            set.use_t2 = true;
         }
         if let Some(c) = opts.centre_hz {
             set.centre_hz = c;
@@ -252,9 +261,24 @@ impl App {
         self.session || self.stopping
     }
 
+    /// The DVB-T2 mode while 1.7 MHz is chosen; `None` is DVB-T.
+    fn tx_t2(&self) -> Option<T2Config> {
+        self.set.use_t2.then(|| self.set.t2.clone())
+    }
+
+    /// The channel's width the form says.
+    fn bandwidth(&self) -> Bandwidth {
+        if self.set.use_t2 {
+            self.set.t2.bandwidth
+        } else {
+            self.set.mode.bandwidth
+        }
+    }
+
     fn idle_cfg(&self) -> TxConfig {
         let mut c = TxConfig::new(self.file.clone().unwrap_or_else(|| "none.mp4".into()));
         c.mode = self.set.mode;
+        c.t2 = self.tx_t2();
         c.centre_hz = self.set.centre_hz;
         c.rate = self.set.rate;
         c
@@ -270,6 +294,7 @@ impl App {
         let mut c = TxConfig::new(file.clone());
         c.loop_input = self.set.loop_input;
         c.mode = self.set.mode;
+        c.t2 = self.tx_t2();
         c.centre_hz = self.set.centre_hz;
         c.rate = self.set.rate;
         c.level_dbfs = self.set.level_dbfs;
@@ -307,8 +332,9 @@ impl App {
             SinkKind::HackRf => TxSink::HackRf(HackRfTxConfig {
                 txvga_db: self.txvga,
                 amp: self.amp,
-                // The filter follows the channel: 8 MHz for an 8 MHz channel.
-                baseband_filter_hz: Some((self.set.mode.bandwidth.mhz() * 1e6) as u32),
+                // The filter follows the channel: 8 MHz for an 8 MHz channel,
+                // the radio's narrowest (1.75 MHz) for 1 and 1.7 MHz.
+                baseband_filter_hz: Some(baseband_filter_hz(self.bandwidth())),
             }),
         };
         Some(c)
@@ -604,7 +630,7 @@ impl App {
         } else {
             ((t * 20.0) as u64).saturating_sub(self.demo_rows).min(60)
         };
-        let occupied = self.set.mode.bandwidth.mhz() * 1e6 * 0.951;
+        let occupied = self.idle_cfg().occupied_hz();
         let rate = self.status.sample_rate_hz as f64;
         let first = self.demo_rows;
         for k in 0..want {
@@ -1023,7 +1049,7 @@ impl App {
         let locked = self.locked();
         let r = ui.add_enabled_ui(!locked, |ui| {
             let presets = modeinfo::presets();
-            let current = modeinfo::preset_of(&self.set.mode);
+            let current = modeinfo::preset_of(&self.set.mode, self.tx_t2().as_ref());
             ui.horizontal(|ui| {
                 ui.label("Preset");
                 egui::ComboBox::from_id_salt("preset")
@@ -1037,10 +1063,18 @@ impl App {
                                 .clicked()
                             {
                                 self.set.mode = p.mode;
+                                self.set.use_t2 = p.t2.is_some();
+                                if let Some(t2) = &p.t2 {
+                                    self.set.t2 = t2.clone();
+                                }
                             }
                         }
                     });
             });
+            if self.set.use_t2 {
+                self.t2_controls(ui);
+                return;
+            }
             let mut m = self.set.mode;
             // Two lines: what the signal carries, then how it is laid out.
             ui.horizontal(|ui| {
@@ -1086,16 +1120,13 @@ impl App {
                     })
                     .response
                     .on_hover_text("FFT size");
-                egui::ComboBox::from_id_salt("bw")
-                    .selected_text(format!("{} MHz", m.bandwidth.mhz()))
-                    .width(70.0)
-                    .show_ui(ui, |ui| {
-                        for b in modeinfo::BANDWIDTHS {
-                            ui.selectable_value(&mut m.bandwidth, b, format!("{} MHz", b.mhz()));
-                        }
-                    })
-                    .response
-                    .on_hover_text("Channel bandwidth");
+                if let Some(b) = self.bandwidth_box(ui, m.bandwidth) {
+                    if b.dvbt() {
+                        m.bandwidth = b;
+                    } else {
+                        self.set.use_t2 = true;
+                    }
+                }
             });
             // The low-priority code rate is not used (non-hierarchical).
             m.rate_lp = m.rate_hp;
@@ -1104,11 +1135,107 @@ impl App {
         if locked {
             r.response.on_hover_text(STOP_FIRST);
         }
-        let sum = modeinfo::summary(&self.set.mode);
+        let sum = match self.tx_t2() {
+            Some(t2) => modeinfo::t2_summary(&t2),
+            None => modeinfo::summary(&self.set.mode),
+        };
         ui.label(RichText::new(format!("-> {}", sum.rate_line())).strong());
         ui.label(RichText::new(format!("   {}", sum.picture_line(25))).weak());
         if ui.small_button("All modes...").clicked() {
             self.show_modes = !self.show_modes;
+        }
+    }
+
+    /// The Bandwidth box: every width, DVB-T's and DVB-T2's 1.7 MHz. The width
+    /// picked, if one was.
+    fn bandwidth_box(&self, ui: &mut egui::Ui, now: Bandwidth) -> Option<Bandwidth> {
+        let mut pick = now;
+        egui::ComboBox::from_id_salt("bw")
+            .selected_text(now.name())
+            .width(80.0)
+            .show_ui(ui, |ui| {
+                for b in modeinfo::BANDWIDTHS {
+                    let label = match b {
+                        Bandwidth::Mhz1 => "1 MHz (DVB-T / 8)",
+                        Bandwidth::Mhz1_7 => "1.7 MHz (DVB-T2)",
+                        _ => b.name(),
+                    };
+                    ui.selectable_value(&mut pick, b, label);
+                }
+            })
+            .response
+            .on_hover_text(
+                "Channel bandwidth. 1 MHz is DVB-T with every clock of 8 MHz divided by 8 \
+                 (not a broadcast standard; receivers must be told the width); 1.7 MHz is \
+                 DVB-T2's narrow channel. Both run the radio at 2 MS/s.",
+            );
+        (pick != now).then_some(pick)
+    }
+
+    /// The DVB-T2 (1.7 MHz) mode's controls: constellation, rate, guard; FFT
+    /// size, bandwidth. The pilot pattern follows the guard.
+    fn t2_controls(&mut self, ui: &mut egui::Ui) {
+        let c = self.set.t2.clone();
+        let (mut fft, mut guard, mut qam, mut rate) =
+            (c.mode.fft, c.mode.guard, c.qam, t2_rate(&c));
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("t2mod")
+                .selected_text(qam_name(qam))
+                .width(70.0)
+                .show_ui(ui, |ui| {
+                    for q in T2_QAMS {
+                        ui.selectable_value(&mut qam, q, qam_name(q));
+                    }
+                })
+                .response
+                .on_hover_text("Constellation (rotated)");
+            egui::ComboBox::from_id_salt("t2rate")
+                .selected_text(format!("{}/{}", rate.0, rate.1))
+                .width(40.0)
+                .show_ui(ui, |ui| {
+                    for r in T2_RATES {
+                        ui.selectable_value(&mut rate, r, format!("{}/{}", r.0, r.1));
+                    }
+                })
+                .response
+                .on_hover_text("LDPC code rate (64800-bit frames)");
+            egui::ComboBox::from_id_salt("t2guard")
+                .selected_text(guard.name())
+                .width(56.0)
+                .show_ui(ui, |ui| {
+                    for g in t2_guards(fft) {
+                        ui.selectable_value(&mut guard, g, g.name());
+                    }
+                })
+                .response
+                .on_hover_text("Guard interval (the pilot pattern follows it)");
+        });
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("t2fft")
+                .selected_text(fft.name())
+                .width(40.0)
+                .show_ui(ui, |ui| {
+                    for f in T2_FFTS {
+                        ui.selectable_value(&mut fft, f, f.name());
+                    }
+                })
+                .response
+                .on_hover_text("FFT size");
+            ui.label(RichText::new(c.mode.pp.to_string()).weak())
+                .on_hover_text("Scattered pilot pattern");
+            if let Some(b) = self.bandwidth_box(ui, Bandwidth::Mhz1_7) {
+                // A DVB-T width: back to DVB-T, at that width.
+                self.set.use_t2 = false;
+                self.set.mode.bandwidth = b;
+            }
+        });
+        // A guard the new FFT size does not have: the nearest it has.
+        let guards = t2_guards(fft);
+        if !guards.contains(&guard) {
+            guard = guards[guards.len() / 2];
+        }
+        if let Some(t2) = t2_mode(fft, guard, qam, rate) {
+            self.set.t2 = t2;
         }
     }
 
@@ -1224,6 +1351,11 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label("Radio sample rate");
                         let text = match self.set.rate {
+                            // The narrow channels' own rates are under the
+                            // radio's 2 MS/s: native is 2 MS/s for them.
+                            TxRate::Native if self.bandwidth().narrow() => {
+                                "native (2 MS/s)".to_string()
+                            }
                             TxRate::Native => "native".to_string(),
                             TxRate::Fixed(hz) => format!("{} MS/s", hz / 1_000_000),
                         };
@@ -1339,7 +1471,7 @@ impl App {
         let span = if self.span_hz > 0.0 {
             self.span_hz
         } else {
-            self.set.rate.hz(&self.set.mode) as f64
+            self.set.rate.hz(self.bandwidth()) as f64
         };
         ui.allocate_ui(vec2(ui.available_width(), sig_h), |ui| {
             signal_view::show(
@@ -1348,7 +1480,7 @@ impl App {
                     spectrum_db: &self.smooth,
                     centre_hz: centre,
                     span_hz: span,
-                    occupied_hz: self.set.mode.bandwidth.mhz() * 1e6 * 0.951,
+                    occupied_hz: self.idle_cfg().occupied_hz(),
                     levels: self.history.levels(),
                     waterfall: tex,
                     readout,
@@ -1530,7 +1662,7 @@ impl App {
                     ui.add_enabled_ui(!locked, |ui| {
                         let hint = source::iq_file_name(
                             self.set.centre_hz,
-                            self.set.rate.hz(&self.set.mode),
+                            self.set.rate.hz(self.bandwidth()),
                         );
                         ui.add(
                             egui::TextEdit::singleline(&mut self.iq_path)
@@ -1564,17 +1696,58 @@ impl App {
         let locked = self.locked();
         let mut open = true;
         let mut pick = None;
+        let mut pick_t2 = None;
         egui::Window::new("All modes")
             .open(&mut open)
             .default_width(520.0)
             .default_height(480.0)
             .show(ctx, |ui| {
+                if self.set.use_t2 {
+                    let c = self.set.t2.clone();
+                    ui.label(
+                        RichText::new(format!(
+                            "DVB-T2 {} {} {} at 1.7 MHz, rotated, 64800-bit LDPC. Click a row \
+                             to use it.",
+                            c.mode.fft, c.mode.guard, c.mode.pp
+                        ))
+                        .weak(),
+                    );
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::Grid::new("t2modes")
+                            .striped(true)
+                            .num_columns(4)
+                            .spacing([14.0, 3.0])
+                            .show(ui, |ui| {
+                                for h in ["mode", "Mbit/s", "needs C/N", "picture"] {
+                                    ui.label(RichText::new(h).strong());
+                                }
+                                ui.end_row();
+                                for row in t2_mode_table(c.mode.fft, c.mode.guard) {
+                                    let sel = row.config == c;
+                                    let r = ui.add_enabled(
+                                        !locked,
+                                        egui::Button::selectable(sel, &row.label)
+                                            .frame_when_inactive(false),
+                                    );
+                                    if r.clicked() {
+                                        pick_t2 = Some(row.config.clone());
+                                    }
+                                    ui.label(format!("{:.2}", row.bitrate / 1e6));
+                                    ui.label(format!("{:.1} dB", row.qef_cn_db));
+                                    let s = modeinfo::t2_summary(&row.config);
+                                    ui.label(format!("{}p", s.profile.height));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                    return;
+                }
                 let m = self.set.mode;
                 ui.label(
                     RichText::new(format!(
-                        "{} {} MHz, non-hierarchical. Click a row to use it.",
+                        "{} {}, non-hierarchical. Click a row to use it.",
                         m.fft.name(),
-                        m.bandwidth.mhz()
+                        m.bandwidth
                     ))
                     .weak(),
                 );
@@ -1609,6 +1782,9 @@ impl App {
             });
         if let Some(m) = pick {
             self.set.mode = m;
+        }
+        if let Some(t2) = pick_t2 {
+            self.set.t2 = t2;
         }
         self.show_modes = open;
     }

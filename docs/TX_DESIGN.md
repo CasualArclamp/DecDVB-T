@@ -43,12 +43,12 @@ Hard rules for everyone working on this (they come from the user):
                process)    PCR exact, null padded)        one core)     radio's clock)
 ```
 
-Scope: DVB-T, 6/7/8 MHz, 2k/8k, non-hierarchical, any constellation, code rate and
-guard. One service. Video file in; looped or played once. Not in scope: DVB-T2
-(the T2 modulator exists but is 217 ms frame granular and needs 40 Mbit/s CBR; a
-later project), hierarchical, MISO, live capture inputs, multiple services, EIT
-schedules, subtitles, a CLI transmitter (the example in §11 is the headless test
-tool and refuses the radio).
+Scope: DVB-T, 1/6/7/8 MHz, 2k/8k, non-hierarchical, any constellation, code rate
+and guard; and (since 2026-10-27, §15) DVB-T2 at 1.7 MHz. One service. Video file
+in; looped or played once. Not in scope: DVB-T2 at the wide bandwidths (the
+modulator could, but 40 Mbit/s CBR at 8 MHz is another project), hierarchical,
+MISO, live capture inputs, multiple services, EIT schedules, subtitles, a CLI
+transmitter (the example in §11 is the headless test tool and refuses the radio).
 
 Package names: the library is `decdvbt-tx` (`crates/decdvbt-tx`, Rust name
 `decdvbt_tx`); the app is the package `decdvbt-tx-app` (`apps/decdvbt-tx`) with the
@@ -160,7 +160,7 @@ message.
 
 The useful TS rate is `data carriers x bits x code rate x 188/204 / Ts`
 (EN 300 744 Table 17), the same for 2k and 8k at the same guard. 8 MHz, Mbit/s;
-6 MHz x 6/8, 7 MHz x 7/8. `mux_rate_bps(mode)` is the floor of the exact figure
+6 MHz x 6/8, 7 MHz x 7/8, 1 MHz x 1/8 (0.62 to 3.96 Mbit/s; §15). `mux_rate_bps(mode)` is the floor of the exact figure
 (64-QAM 2/3 1/32: 4512000000/187 = 24 128 342.246 -> 24 128 342).
 
 | Constellation, rate | guard 1/4 | 1/8 | 1/16 | 1/32 |
@@ -333,7 +333,8 @@ swaps packets **in place** (no position changes, so CBR and PCR are untouched):
 
 - PID 0x10 packet -> our NIT (one packet; ffmpeg's continuity counter kept): network
   name, one transport stream loop, service list (0x41), and the
-  terrestrial_delivery_system_descriptor (0x5A: centre in 10 Hz units, bandwidth,
+  terrestrial_delivery_system_descriptor (0x5A: centre in 10 Hz units, bandwidth
+  (1 MHz: the reserved code 7; T2 has its own descriptor, §15),
   constellation, hierarchy, code rates, guard, transmission mode) so a receiver
   scan learns the frequency and mode;
 - null packets, when due: TDT every 1 s and TOT every 1 s (PID 0x14, own continuity
@@ -348,7 +349,8 @@ CRC-32 is `decdvbt_core::crc::crc32_mpeg2`. No EIT in v1.
 
 ### 5.1 Rate
 
-Default **native rate**: 64/7 MS/s for 8 MHz (48/7 for 6 MHz, 8 MS/s for 7 MHz),
+Default **native rate**: 64/7 MS/s for 8 MHz (48/7 for 6 MHz, 8 MS/s for 7 MHz;
+the narrow channels' are under the radio's lowest, so 2 MS/s by the resampler, §15),
 passed to the radio as whole hertz (9 142 857; 0.016 ppm off, i.e. nothing;
 `sample_rate_div` stays 1). No resampler, so none of its 18 to 25 % of a core.
 `TxRate::Fixed(10_000_000 | 20_000_000)` (35/32 and 35/16, exact ratios) is offered
@@ -376,7 +378,8 @@ Q), `ring::pack_cs8`, which also counts clipped samples.
 `seify-hackrfone`'s `set_sample_rate` sets the filter to at most 75 % of the rate:
 by the libhackrf table about 6 MHz at 9.14 MS/s, narrower than the 7.61 MHz signal
 (the RX notes in STATUS.md record the same band-edge loss). `HackRfTxConfig` carries
-`baseband_filter_hz` (default **8 MHz** for 8 MHz channels, scaled by bandwidth) and
+`baseband_filter_hz` (default **8 MHz** for 8 MHz channels, scaled by bandwidth;
+1.75 MHz, the narrowest, for 1 and 1.7 MHz, §15) and
 the library builder adds the matching `baseband_filter_hz: Option<u32>` to
 `decdvbt_io::HackRfTxSettings`, applied through the driver's
 `set_baseband_filter_bandwidth` after the sample rate is set (§9). The filter table
@@ -752,7 +755,8 @@ tested); (e) icon, `build.rs`, README, CLAUDE.md, `exe/` copy, T13.
 - **Null packets for stuffing**, not repeating the last packets: the receiver
   gets a valid, rate-correct stream.
 - **Private-use network ids** (0xFF01): the app cannot impersonate a real mux.
-- **No T2** in this project.
+- **No T2** in this project, but for the narrow channel (2026-10-27, §15): 1.7 MHz
+  T2 is 0.6 to 9.5 Mbit/s, where its frame granularity costs nothing.
 
 ## 14. Builder notes
 
@@ -835,3 +839,65 @@ Notes for the library builder (nothing to change, please keep):
   "close whatever holds the HackRF" advice). Both messages exist today.
 - `TxStatus::level_rms_dbfs` as `-inf` before the first block is handled (the
   readout is hidden).
+
+## 15. Narrow channels: 1 MHz DVB-T and 1.7 MHz DVB-T2 (2026-10-27)
+
+Added after the first release of the transmitter; docs/DESIGN.md §8 has the
+receiver's side. What changed here, and why:
+
+- **Modes.** The Bandwidth box offers 1, 1.7, 6, 7 and 8 MHz. 1 MHz is DVB-T
+  with every clock of the 8 MHz mode divided by 8 (not a broadcast standard;
+  narrowband amateur DATV runs DVB-T this way): the same 60 modes, rates
+  times 1/8. 1.7 MHz switches the mode controls to DVB-T2 (EN 302 755's
+  narrow channel): constellation (QPSK to 256-QAM, rotated), LDPC rate (1/2
+  to 5/6, 64800-bit frames), guard and FFT size (1K to 8K; 1/128, 19/256 and
+  19/128 from 8K), the pilot pattern following the guard (PP7 for 1/128, PP4
+  for 1/32, 1/16 and 19/256, PP2 for 1/8 and 19/128, PP1 for 1/4), normal
+  carriers, frames of about 217 ms holding as many FEC blocks as fit
+  (`decdvbt_tx::modes::t2_mode`, `t2_mode_table`: 24 rows per FFT size and
+  guard). Presets "1 MHz QPSK 2/3 2k" (0.92 Mbit/s) and "1.7 MHz T2 16-QAM
+  3/4" (8K 1/16, 3.99 Mbit/s) join the three of §3. `TxConfig` keeps `mode`
+  (DVB-T) and gains `t2: Option<T2Config>`; `bandwidth()`, `ts_rate_bps()`,
+  `mux_rate_bps()`, `native_rate_hz()` and `occupied_hz()` answer for
+  whichever is sent. The prefs keep the T2 mode (`t2=8k-1/16-16qam-3/4`) and
+  which standard is in use (`standard=dvbt|t2`).
+- **Rate and filter.** The narrow signals' own rates (8/7 and 131/71 MS/s)
+  are under the HackRF's 2 MS/s, so `TxRate::Native` is 2 MS/s for them and the
+  resampler takes them there (7/4 and 142/131, 70 dB of image rejection, 3 to 4
+  % of a core). The baseband filter is 1.75 MHz, the radio's narrowest
+  (`modes::baseband_filter_hz`); the 1.54 MHz of carriers of 1.7 MHz 8K fit
+  inside it with 0.1 MHz either side. **Not verified on hardware**: the
+  filter's response at the edges of a 1.7 MHz signal, and the DAC images at
+  ±2 MHz, which the 1.75 MHz filter is all that attenuates (§11's first-light
+  checklist applies: look at the spectrum).
+- **DVB-T2 in the pipeline.** `iq.rs` holds either modulator; T2's
+  `next_frame` makes a frame (about 400 000 samples at 1.7 MHz) that is handed
+  out in 8192-sample steps, so a ring block stays about `IQ_BLOCK_MIN_BYTES`
+  and the lead-in and prefill sums of §2 still hold. T2 needs no warm-up
+  (no start-up pulse). Its packet rate is the PLP's: FEC blocks a frame x
+  (K_bch - 80) bits / the frame's duration (`T2Config::ts_rate_bps`); ffmpeg
+  muxes at its floor, as for DVB-T.
+- **SI.** 1 MHz DVB-T: the terrestrial_delivery_system_descriptor's bandwidth
+  field has no code for it (EN 300 468 Table 46: 0-3 are 8, 7, 6, 5 MHz; 4-7
+  reserved). We send **7**, the last reserved value, and the analyser reads 7
+  back as 1 MHz (`Bandwidth::terrestrial_code`). 1.7 MHz T2: a
+  T2_delivery_system_descriptor (tag 0x7F, extension 0x04) instead, with PLP 0,
+  the T2_system_id, SISO, bandwidth 0101 (1.712 MHz), guard, FFT size and one
+  cell with its centre; `decdvbt_ts::psi` parses it (`Transponder::t2`).
+  `Terrestrial::bandwidth_khz` replaces `bandwidth_mhz`.
+- **Low rates.** Under 1.5 Mbit/s the video profile is CIF (352x288, its
+  pixels 16/11 for 16:9) with 64 kbit/s audio, and the budget takes off the
+  tables' fixed 39 kbit/s (PAT and PMT ten times a second, SDT and NIT twice,
+  TDT and TOT once): at 0.62 Mbit/s they are 6 %, and without that the stream
+  kept only 4.7 % of nulls. Measured at the slowest mode (1 MHz QPSK 1/2 1/4,
+  0.62 Mbit/s), paced: 8.8 % nulls, PCR every 26.6 ms at most, no "dts <
+  pcr", no stuffing; PAT/PMT within 2.6 packets (6.4 ms) of their 100 ms.
+- **Tests** (`crates/decdvbt-tx/tests/pipeline.rs`): a 1 MHz DVB-T and a 1.7
+  MHz T2 IQ file at 2 MS/s, from a real ffmpeg clip through the whole
+  pipeline, each decoded by the receiver told the width, every packet after
+  the lock identical to the dump of what the modulator was given, the NIT read
+  back with the width and the centre; and the slowest mode's stream checked as
+  in T2 of §11.
+- The window: the Bandwidth box, the T2 controls, the All modes window's T2
+  table, "native (2 MS/s)" in the rate box, `--t2 8k-1/16-16qam-3/4` and
+  `--freq-mhz F` on the command line.
