@@ -2,7 +2,7 @@
 //! DecDVB-T command line.
 //!
 //! - `channels`, `channel`: the UHF channel plan.
-//! - `scan`: step the HackRF over the UK channels and say which look like
+//! - `scan`: step the radio (`--radio hackrf|airspy`) over the UK channels and say which look like
 //!   digital TV (a flat 7.6 MHz block with steep shoulders).
 //! - `modulate`: a DVB-T test signal as an IQ file, through a channel with
 //!   multipath, fading, noise and the radio's faults.
@@ -46,7 +46,7 @@ enum Command {
     /// One channel's centre frequency ("C34", "34"), or the channel holding a
     /// frequency in MHz ("578").
     Channel { which: String },
-    /// Step the HackRF over the UK channels and report each one's level and
+    /// Step the radio over the UK channels and report each one's level and
     /// whether it looks like a DVB-T/T2 block.
     Scan {
         #[arg(long, default_value_t = 24)]
@@ -55,6 +55,8 @@ enum Command {
         vga: u16,
         #[arg(long)]
         amp: bool,
+        #[command(flatten)]
+        radio: source::RadioArgs,
         /// Dwell on each channel, seconds.
         #[arg(long, default_value_t = 0.6)]
         dwell: f64,
@@ -72,9 +74,9 @@ enum Command {
     Modulate(Box<modulate::ModulateArgs>),
     /// Run the receive engine for a few seconds and report what it sees.
     Capture {
-        /// A UHF channel ("C34") for the HackRF, or an IQ file to replay.
+        /// A UHF channel ("C34") for the radio, or an IQ file to replay.
         source: String,
-        /// HackRF sample rate, MS/s (10 holds one 8 MHz channel).
+        /// Sample rate, MS/s (10 holds one 8 MHz channel; the Airspy has only 10).
         #[arg(long, default_value_t = 10.0)]
         rate: f64,
         /// Seconds to run.
@@ -92,6 +94,8 @@ enum Command {
         /// HackRF RF amplifier (+14 dB).
         #[arg(long)]
         amp: bool,
+        #[command(flatten)]
+        radio: source::RadioArgs,
         /// Sample rate of a raw IQ file, MS/s, when its name does not say.
         #[arg(long, default_value_t = 10.0)]
         file_rate: f64,
@@ -124,9 +128,10 @@ fn main() -> Result<()> {
             lna,
             vga,
             amp,
+            radio,
             dwell,
             classify,
-        } => scan(lna, vga, amp, dwell, classify)?,
+        } => scan(lna, vga, amp, &radio, dwell, classify)?,
         Command::Capture {
             source,
             rate,
@@ -135,8 +140,11 @@ fn main() -> Result<()> {
             lna,
             vga,
             amp,
+            radio,
             file_rate,
-        } => capture(&source, rate, seconds, record, lna, vga, amp, file_rate)?,
+        } => capture(
+            &source, rate, seconds, record, lna, vga, amp, &radio, file_rate,
+        )?,
     }
     Ok(())
 }
@@ -150,11 +158,12 @@ fn capture(
     lna: u16,
     vga: u16,
     amp: bool,
+    radio: &source::RadioArgs,
     file_rate: f64,
 ) -> Result<()> {
     let (src, drops): (Box<dyn IqSource>, Option<decdvbt_engine::DropProbe>) =
         match parse_channel(source) {
-            Some(n) => live(n, rate, lna, vga, amp)?,
+            Some(n) => live(n, rate, lna, vga, amp, radio)?,
             None => {
                 let path = PathBuf::from(source);
                 let fmt = format_from_path(&path).unwrap_or(SampleFormat::Cs8);
@@ -256,9 +265,16 @@ fn look(db: &[f32], rate: f64) -> ChannelLook {
     }
 }
 
-fn scan(lna: u16, vga: u16, amp: bool, dwell: f64, classify: f64) -> Result<()> {
+fn scan(
+    lna: u16,
+    vga: u16,
+    amp: bool,
+    radio: &source::RadioArgs,
+    dwell: f64,
+    classify: f64,
+) -> Result<()> {
     let first = uk_channels().next().unwrap();
-    let (src, drops) = live(first, 10.0, lna, vga, amp)?;
+    let (src, drops) = live(first, 10.0, lna, vga, amp, radio)?;
     let rx = Rx::start(src, RxOptions::default(), drops);
     println!("chan   MHz     inband   ripple  shoulder  over floor");
     let mut looks = Vec::new();
@@ -362,35 +378,15 @@ fn classify_channel(rx: &Rx, n: u8, seconds: f64) -> String {
     verdict
 }
 
-#[cfg(feature = "hackrf")]
+/// A live radio at channel `n` with the HackRF's `lna/vga/amp` (the Airspy
+/// uses its own flags in `radio`).
 fn live(
     n: u8,
     rate: f64,
     lna: u16,
     vga: u16,
     amp: bool,
+    radio: &source::RadioArgs,
 ) -> Result<(Box<dyn IqSource>, Option<decdvbt_engine::DropProbe>)> {
-    use decdvbt_io::{HackRfGains, HackRfSettings, HackRfSource};
-    let s = HackRfSource::open(HackRfSettings {
-        center_hz: uhf_centre_hz(n).unwrap().round() as u64,
-        sample_rate: (rate * 1e6).round() as u32,
-        gains: HackRfGains {
-            amp,
-            lna_db: lna,
-            vga_db: vga,
-        },
-    })?;
-    let ctl = s.control();
-    Ok((Box::new(s), Some(Box::new(move || ctl.overflows()))))
-}
-
-#[cfg(not(feature = "hackrf"))]
-fn live(
-    _: u8,
-    _: f64,
-    _: u16,
-    _: u16,
-    _: bool,
-) -> Result<(Box<dyn IqSource>, Option<decdvbt_engine::DropProbe>)> {
-    bail!("built without the hackrf feature")
+    source::open_live(n, rate, Some(source::Gains { amp, lna, vga }), radio)
 }

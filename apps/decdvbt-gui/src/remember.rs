@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::prefs;
-use crate::source::Gains;
+use crate::source::{AirGains, Gains, Preset};
 
 /// How long a change has to hold still before it is written.
 const SETTLE: Duration = Duration::from_millis(800);
@@ -28,8 +28,15 @@ pub struct Snapshot {
     pub channel: u8,
     pub tune_hz: i64,
     pub file_source: bool,
+    /// The radio is the Airspy R2 (else the HackRF, when not a file).
+    pub airspy: bool,
     pub rate_khz: i64,
     pub gains: Gains,
+    /// The Airspy's stages, the libairspy preset they were set from (`None`:
+    /// set by hand) and whether it uses the packed transfers.
+    pub air: AirGains,
+    pub air_preset: Option<Preset>,
+    pub air_packed: bool,
     /// The capture last opened, its centre and rate.
     pub file: String,
     pub file_centre_hz: i64,
@@ -49,11 +56,28 @@ impl Snapshot {
         prefs::set_many(&[
             ("channel", &self.channel.to_string()),
             ("tune_hz", &self.tune_hz.to_string()),
-            ("source", if self.file_source { "file" } else { "hackrf" }),
+            (
+                "source",
+                if self.file_source {
+                    "file"
+                } else if self.airspy {
+                    "airspy"
+                } else {
+                    "hackrf"
+                },
+            ),
             ("rate_khz", &self.rate_khz.to_string()),
             ("lna", &self.gains.lna.to_string()),
             ("vga", &self.gains.vga.to_string()),
             ("amp", b(self.gains.amp)),
+            ("air_lna", &self.air.lna.to_string()),
+            ("air_mixer", &self.air.mixer.to_string()),
+            ("air_vga", &self.air.vga.to_string()),
+            (
+                "air_preset",
+                &self.air_preset.map_or(String::new(), Preset::key),
+            ),
+            ("air_packed", b(self.air_packed)),
             ("file", &self.file),
             ("file_centre_hz", &self.file_centre_hz.to_string()),
             ("file_rate_khz", &self.file_rate_khz.to_string()),
@@ -73,8 +97,12 @@ pub struct Saved {
     pub channel: Option<u8>,
     pub tune_hz: Option<f64>,
     pub file_source: bool,
+    pub airspy: bool,
     pub rate_msps: Option<f64>,
     pub gains: Option<Gains>,
+    pub air: Option<AirGains>,
+    pub air_preset: Option<Preset>,
+    pub air_packed: Option<bool>,
     pub file: Option<PathBuf>,
     pub file_centre_mhz: Option<f64>,
     pub file_rate_msps: Option<f64>,
@@ -102,6 +130,17 @@ impl Saved {
             }),
             _ => None,
         };
+        // The Airspy's stages, as far as they are in range.
+        let air = match (
+            prefs::number::<u8>("air_lna"),
+            prefs::number::<u8>("air_mixer"),
+            prefs::number::<u8>("air_vga"),
+        ) {
+            (Some(lna), Some(mixer), Some(vga)) if lna <= 14 && mixer <= 15 && vga <= 15 => {
+                Some(AirGains { lna, mixer, vga })
+            }
+            _ => None,
+        };
         let window = prefs::get("window").and_then(|v| {
             let (w, h) = v.split_once('x')?;
             let (w, h): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
@@ -114,8 +153,12 @@ impl Saved {
             channel: prefs::number("channel").filter(|c| (21..=69).contains(c)),
             tune_hz: prefs::number("tune_hz").filter(|h: &f64| *h >= 1e6),
             file_source: prefs::get("source").is_some_and(|v| v == "file"),
+            airspy: prefs::get("source").is_some_and(|v| v == "airspy"),
             rate_msps: prefs::number::<i64>("rate_khz").map(|k| k as f64 / 1e3),
             gains,
+            air,
+            air_preset: prefs::get("air_preset").and_then(|v| Preset::parse(&v)),
+            air_packed: flag("air_packed"),
             file: prefs::get("file")
                 .filter(|f| !f.is_empty())
                 .map(PathBuf::from),
@@ -190,12 +233,16 @@ mod tests {
             channel: 26,
             tune_hz: 514_000_000,
             file_source: false,
+            airspy: false,
             rate_khz: 10_000,
             gains: Gains {
                 amp: true,
                 lna,
                 vga: 8,
             },
+            air: AirGains::default(),
+            air_preset: Some(Preset::DEFAULT),
+            air_packed: false,
             file: String::new(),
             file_centre_hz: 0,
             file_rate_khz: 10_000,

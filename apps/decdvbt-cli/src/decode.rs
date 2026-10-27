@@ -21,8 +21,9 @@ use crate::source;
 
 #[derive(clap::Args)]
 pub struct DecodeArgs {
-    /// An IQ file, a transport stream (`.ts`), a UHF channel ("C26") for
-    /// the HackRF, or `hackrf` with `--freq`.
+    /// An IQ file, a transport stream (`.ts`), a UHF channel ("C26") for the
+    /// HackRF or (with `--radio airspy`) the Airspy R2, or `hackrf` with
+    /// `--freq`.
     source: String,
     /// The channel's width, MHz: 8 (default), 7, 6, 1.7 (DVB-T2 only) or 1
     /// (DecDVB-T's 1 MHz DVB-T). Nothing in the signal says it.
@@ -54,6 +55,8 @@ pub struct DecodeArgs {
     /// HackRF VGA gain, dB (0-62, steps of 2).
     #[arg(long, default_value_t = 8)]
     vga: u16,
+    #[command(flatten)]
+    radio: source::RadioArgs,
     /// Print the guide: this many events of each service (of every
     /// multiplex the stream's guide covers), with their details.
     #[arg(long, default_value_t = 0)]
@@ -202,6 +205,7 @@ pub fn run(a: DecodeArgs) -> Result<()> {
             vga: a.vga,
         }),
         source::Tuning { freq_hz, bandwidth },
+        &a.radio,
     )?;
     let fs = src.sample_rate();
     let centre = src.center_freq();

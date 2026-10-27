@@ -50,7 +50,7 @@ use decdvbt_rx::sounder::Geometry;
 use decdvbt_rx::t2::receiver::T2Status;
 use decdvbt_ts::{Epg, TsTap};
 use eframe::egui::{self, Color32, RichText};
-use source::{Gains, Session, Spec};
+use source::{AirGains, Gains, Preset, Session, Spec};
 use waterfall::{History, RingImage};
 
 const AMBER: Color32 = Color32::from_rgb(255, 176, 40);
@@ -126,6 +126,8 @@ struct Options {
     record: bool,
     /// Run the gain optimiser once the receiver has locked (a test aid).
     optimise: bool,
+    /// The radio to use (`--radio hackrf|airspy`), else the one last used.
+    radio: Option<SourceKind>,
     /// Which view settings the command line gave: what it did not is what
     /// was kept from the last run (but a screenshot, which has to come out
     /// the same each time, keeps nothing).
@@ -200,6 +202,7 @@ impl Options {
             udp: None,
             record: false,
             optimise: false,
+            radio: None,
             bottom_given: false,
             fps_given: false,
             decode_given: false,
@@ -246,6 +249,13 @@ impl Options {
                 "--udp" => o.udp = Some(value("an address, e.g. 127.0.0.1:1234")?),
                 "--record" => o.record = true,
                 "--optimise" => o.optimise = true,
+                "--radio" => {
+                    o.radio = Some(match value("hackrf or airspy")?.as_str() {
+                        "hackrf" => SourceKind::HackRf,
+                        "airspy" => SourceKind::Airspy,
+                        v => return Err(format!("--radio is hackrf or airspy, not {v}")),
+                    });
+                }
                 "--subs" => o.subs = true,
                 "--play" => {
                     o.play = Some(value("a service id")?.parse().map_err(|_| "bad --play")?)
@@ -410,7 +420,16 @@ fn main() -> eframe::Result {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
     HackRf,
+    /// The Airspy R2 (10 MS/s only; its own gain stages).
+    Airspy,
     File,
+}
+
+impl SourceKind {
+    /// A radio, as against a capture file.
+    fn live(self) -> bool {
+        self != SourceKind::File
+    }
 }
 
 struct App {
@@ -485,6 +504,11 @@ struct App {
     channel_text: String,
     rate_msps: f64,
     gains: Gains,
+    /// The Airspy's stages, the libairspy preset they came from (`None`: set
+    /// by hand) and whether it uses the packed transfers.
+    air: AirGains,
+    air_preset: Option<Preset>,
+    air_packed: bool,
     /// A file source: its path, centre (MHz) and rate (MS/s), editable
     /// because a raw file has no header.
     file: Option<PathBuf>,
@@ -520,6 +544,10 @@ struct App {
     /// Hz; when the tuning was last changed and whether the carrier has been
     /// looked for since.
     offsets: HashMap<u8, f64>,
+    /// The same for the Airspy, kept for this run only: the learned offsets
+    /// in the prefs include the HackRF's own clock error, which the Airspy
+    /// does not share.
+    air_offsets: HashMap<u8, f64>,
     tuned_at: Instant,
     centre_checked: bool,
     centre_tries: u8,
@@ -581,6 +609,10 @@ impl App {
         let file = kept.file.clone().filter(|f| f.exists());
         let kind = if !by_hand && kept.file_source && file.is_some() {
             SourceKind::File
+        } else if let Some(k) = opts.radio {
+            k
+        } else if kept.airspy {
+            SourceKind::Airspy
         } else {
             SourceKind::HackRf
         };
@@ -606,6 +638,14 @@ impl App {
                 .or(kept.rate_msps.filter(|r| rates_for(bandwidth).contains(r)))
                 .unwrap_or(rates_for(bandwidth)[0]),
             gains: kept.gains.unwrap_or_default(),
+            air: kept.air.unwrap_or_default(),
+            // Old prefs have no preset: the default gains are its.
+            air_preset: if kept.air.is_some() {
+                kept.air_preset
+            } else {
+                Some(Preset::DEFAULT)
+            },
+            air_packed: kept.air_packed.unwrap_or(false),
             file,
             file_centre_mhz: kept.file_centre_mhz.unwrap_or(0.0),
             file_rate_msps: kept.file_rate_msps.unwrap_or(10.0),
@@ -667,6 +707,7 @@ impl App {
             dial_hz: tune_hz,
             dial_edit: None,
             offsets,
+            air_offsets: HashMap::new(),
             tuned_at: Instant::now(),
             centre_checked: false,
             centre_tries: 0,
@@ -710,7 +751,7 @@ impl App {
 
     /// What is kept from run to run, as the app is now.
     fn snapshot(&self) -> remember::Snapshot {
-        let (channel, tune_hz) = if self.kind == SourceKind::HackRf {
+        let (channel, tune_hz) = if self.kind.live() {
             (self.channel, self.tune_hz)
         } else {
             self.radio
@@ -719,8 +760,12 @@ impl App {
             channel,
             tune_hz: tune_hz.round() as i64,
             file_source: self.kind == SourceKind::File,
+            airspy: self.kind == SourceKind::Airspy,
             rate_khz: (self.rate_msps * 1e3).round() as i64,
             gains: self.gains,
+            air: self.air,
+            air_preset: self.air_preset,
+            air_packed: self.air_packed,
             file: self
                 .file
                 .as_ref()
@@ -744,7 +789,7 @@ impl App {
         if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
             self.window_size = (r.width().round() as u32, r.height().round() as u32);
         }
-        if self.kind == SourceKind::HackRf {
+        if self.kind.live() {
             self.radio = (self.channel, self.tune_hz);
         }
         let now = self.snapshot();
@@ -769,6 +814,18 @@ impl App {
                     center_hz: fc,
                     rate_hz: self.rate_msps * 1e6,
                     gains: self.gains,
+                };
+                self.begin(spec, Some(fc));
+            }
+            SourceKind::Airspy => {
+                let fc = self.tune_hz;
+                if fc <= 0.0 {
+                    return;
+                }
+                let spec = Spec::Airspy {
+                    center_hz: fc,
+                    gains: self.air,
+                    packed: self.air_packed,
                 };
                 self.begin(spec, Some(fc));
             }
@@ -1159,12 +1216,21 @@ impl App {
         self.tune_channel(next);
     }
 
+    /// The learned carrier offsets of the radio in use.
+    fn cur_offsets(&self) -> &HashMap<u8, f64> {
+        if self.kind == SourceKind::Airspy {
+            &self.air_offsets
+        } else {
+            &self.offsets
+        }
+    }
+
     /// Where channel `n` is tuned: its place in the plan, and, with centring
     /// on, the offset found for it.
     fn channel_hz(&self, n: u8) -> Option<f64> {
         let nominal = uhf_centre_hz(n)?;
         let off = if self.sdr.auto_centre {
-            self.offsets.get(&n).copied().unwrap_or(0.0)
+            self.cur_offsets().get(&n).copied().unwrap_or(0.0)
         } else {
             0.0
         };
@@ -1281,8 +1347,12 @@ impl App {
             return;
         };
         let ch = self.channel;
-        self.offsets.insert(ch, off);
-        prefs::set(&format!("offset_C{ch}"), &format!("{off:.0}"));
+        if self.kind == SourceKind::Airspy {
+            self.air_offsets.insert(ch, off);
+        } else {
+            self.offsets.insert(ch, off);
+            prefs::set(&format!("offset_C{ch}"), &format!("{off:.0}"));
+        }
         let target = nominal + off;
         if (target - self.tune_hz).abs() > 25e3 {
             self.set_frequency(target);
@@ -1363,6 +1433,11 @@ impl App {
             self.note = "Optimising the gain needs a live radio".into();
             return;
         }
+        if self.kind == SourceKind::Airspy {
+            self.note =
+                "The gain optimiser is for the HackRF; set the Airspy's gain by hand".into();
+            return;
+        }
         self.opt_result = None;
         self.optimiser = Some(sdr::Optimiser::new(self.gains));
     }
@@ -1420,9 +1495,12 @@ impl App {
     }
 
     fn change_gains(&mut self) {
-        if let Some(s) = &self.session
-            && let Err(e) = s.set_gains(self.gains)
-        {
+        let Some(s) = &self.session else { return };
+        let r = match self.kind {
+            SourceKind::Airspy => s.set_air_gains(self.air),
+            _ => s.set_gains(self.gains),
+        };
+        if let Err(e) = r {
             self.note = e;
         }
     }
@@ -1816,18 +1894,27 @@ impl App {
     fn control_rows(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             let running = self.session.is_some();
-            let live = self.kind == SourceKind::HackRf;
-
+            let live = self.kind.live();
             let before = self.kind;
             egui::ComboBox::from_id_salt("source")
-                .selected_text(if live { "HackRF" } else { "IQ file" })
-                .width(80.0)
+                .selected_text(match self.kind {
+                    SourceKind::HackRf => "HackRF",
+                    SourceKind::Airspy => "Airspy R2",
+                    SourceKind::File => "IQ file",
+                })
+                .width(90.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.kind, SourceKind::HackRf, "HackRF");
+                    ui.selectable_value(&mut self.kind, SourceKind::Airspy, "Airspy R2");
                     ui.selectable_value(&mut self.kind, SourceKind::File, "IQ file");
                 });
             if before != self.kind && running {
                 self.stop();
+            }
+            // The Airspy's lowest rate is 10 MS/s, and the narrow channels
+            // need the radio at 2 MS/s: it offers only the wide ones.
+            if self.kind == SourceKind::Airspy && self.bandwidth.narrow() {
+                self.set_bandwidth(Bandwidth::Mhz8);
             }
 
             // The channel's width: what the receiver looks for (both
@@ -1838,6 +1925,9 @@ impl App {
                 .width(70.0)
                 .show_ui(ui, |ui| {
                     for b in Bandwidth::ALL {
+                        if self.kind == SourceKind::Airspy && b.narrow() {
+                            continue;
+                        }
                         let label = match b {
                             Bandwidth::Mhz1 => "1 MHz (DVB-T)",
                             Bandwidth::Mhz1_7 => "1.7 MHz (T2)",
@@ -1854,7 +1944,7 @@ impl App {
                 );
             self.set_bandwidth(bw);
 
-            if self.kind == SourceKind::HackRf {
+            if self.kind.live() {
                 ui.label("channel");
                 if ui.small_button("◀").clicked() {
                     self.step_channel(false);
@@ -1895,31 +1985,43 @@ impl App {
 
                 ui.separator();
                 ui.label("rate");
-                let before = self.rate_msps;
-                egui::ComboBox::from_id_salt("rate")
-                    .selected_text(format!("{} MS/s", self.rate_msps))
-                    .width(90.0)
-                    .show_ui(ui, |ui| {
-                        for &r in rates_for(self.bandwidth) {
-                            ui.selectable_value(&mut self.rate_msps, r, format!("{r} MS/s"));
-                        }
-                    });
-                if before != self.rate_msps && running {
-                    self.start();
+                if self.kind == SourceKind::Airspy {
+                    // The R2 has one rate here (its ADC runs at 20 MS/s and
+                    // the host makes 10 MS/s IQ).
+                    ui.label("10 MS/s");
+                } else {
+                    let before = self.rate_msps;
+                    egui::ComboBox::from_id_salt("rate")
+                        .selected_text(format!("{} MS/s", self.rate_msps))
+                        .width(90.0)
+                        .show_ui(ui, |ui| {
+                            for &r in rates_for(self.bandwidth) {
+                                ui.selectable_value(&mut self.rate_msps, r, format!("{r} MS/s"));
+                            }
+                        });
+                    if before != self.rate_msps && running {
+                        self.start();
+                    }
                 }
 
                 ui.separator();
-                let mut g = self.gains;
-                ui.label("LNA");
-                ui.add(egui::DragValue::new(&mut g.lna).range(0..=40).speed(0.2));
-                ui.label("VGA");
-                ui.add(egui::DragValue::new(&mut g.vga).range(0..=62).speed(0.2));
-                ui.checkbox(&mut g.amp, "amp");
-                g.lna = g.lna / 8 * 8;
-                g.vga = g.vga / 2 * 2;
-                if g != self.gains {
-                    self.gains = g;
-                    self.change_gains();
+                if self.kind == SourceKind::Airspy {
+                    if sdr::airspy_gain_row(ui, &mut self.air, &mut self.air_preset) {
+                        self.change_gains();
+                    }
+                } else {
+                    let mut g = self.gains;
+                    ui.label("LNA");
+                    ui.add(egui::DragValue::new(&mut g.lna).range(0..=40).speed(0.2));
+                    ui.label("VGA");
+                    ui.add(egui::DragValue::new(&mut g.vga).range(0..=62).speed(0.2));
+                    ui.checkbox(&mut g.amp, "amp");
+                    g.lna = g.lna / 8 * 8;
+                    g.vga = g.vga / 2 * 2;
+                    if g != self.gains {
+                        self.gains = g;
+                        self.change_gains();
+                    }
                 }
             } else {
                 match &self.file {
@@ -2167,7 +2269,7 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.kind == SourceKind::HackRf {
+        if self.kind.live() {
             self.radio = (self.channel, self.tune_hz);
         }
         let now = self.snapshot();
@@ -2299,15 +2401,27 @@ impl eframe::App for App {
                 sdr::SdrView {
                     settings: &mut self.sdr,
                     gains: &mut self.gains,
+                    air: &mut self.air,
+                    air_preset: &mut self.air_preset,
+                    air_packed: &mut self.air_packed,
+                    airspy: self.kind == SourceKind::Airspy,
                     live,
                     front_end: self.stats.front_end,
                     optimiser: self.optimiser.as_ref(),
                     last_result: self.opt_result.as_deref(),
-                    offsets: &self.offsets,
+                    offsets: if self.kind == SourceKind::Airspy {
+                        &self.air_offsets
+                    } else {
+                        &self.offsets
+                    },
                 },
             );
             if asks.gains_changed {
                 self.change_gains();
+            }
+            if asks.restart && self.session.is_some() {
+                // The transfer format is fixed when the stream starts.
+                self.start();
             }
             if asks.optimise {
                 self.start_optimiser();
@@ -2324,6 +2438,8 @@ impl eframe::App for App {
             if asks.reset {
                 self.sdr = sdr::SdrSettings::default();
                 self.gains = Gains::default();
+                self.air = AirGains::default();
+                self.air_preset = Some(Preset::DEFAULT);
                 self.change_gains();
             }
         }
@@ -2341,7 +2457,7 @@ impl eframe::App for App {
             None => {}
         }
         if let Some(n) = tune {
-            if self.session.is_none() && self.kind == SourceKind::HackRf {
+            if self.session.is_none() && self.kind.live() {
                 self.channel = n;
                 self.channel_text = format!("C{n}");
                 self.vfo_hz = uhf_centre_hz(n);

@@ -1416,6 +1416,146 @@ The detector's ON threshold (20 dB over the median) sits above the T2 continual
 pilots' own lines (seen to 17 dB in a simulated 8k signal), so a tone weaker than
 about −14 dB is left to the erasure.
 
+## Airspy R2 front end (2026-10-27)
+
+**Done offline, not yet seen on a radio.** The cloud session that wrote this
+had no Airspy; everything below is checked by unit tests and a synthetic
+signal, and the list at the end is what only the owner's machine can settle.
+
+- **`decdvbt-io` feature `airspy`** (on by default in the CLI and the GUI,
+  like `hackrf`): `airspy.rs` (device, reader thread, `AirspySource`,
+  `AirspyControl`, `airspy_info()` for the board id / firmware string / rate
+  list), `airspy/proto.rs` (every USB request as a pure `Command`: request,
+  value, index, payload), `airspy/convert.rs` (the converter). Pure Rust on
+  `nusb` 0.1.14, no libairspy / libusb / DLLs; the protocol, the start
+  sequence, the gain presets and the packed-sample layout are libairspy's
+  (BSD-3-Clause), credited in the module comment.
+- **Bias tee is never on**: the only GPIO write is `proto::bias_tee_off()`
+  (no argument), sent at every open; a test checks that no start sequence can
+  carry a 1 there.
+- **10 MS/s only**: other rates are refused with a clear error (before any USB
+  access). The ADC runs at 20 MS/s and the bulk stream is that real signal.
+- **Reader thread** (as `hackrf.rs`): 8 bulk transfers of 262 144 bytes in
+  flight, converted to IQ *in the reader thread* (so the receive thread does
+  no extra work), a bounded queue of 64 buffers, whole buffers dropped and
+  counted (`overflows()`) when the consumer is behind, `retune` drains the
+  queue and skips the next 9 buffers (the in-flight transfers + one),
+  receiver mode off on stop and in `Drop`. Converted buffers are recycled
+  between the threads, so there is no allocation per buffer in steady state.
+- **Gains**: both AGCs off. `AirspyGains {lna 0–14, mixer 0–15, vga 0–15}`
+  with libairspy's `linearity(n)` and `sensitivity(n)` presets (n 0–21);
+  default is sensitivity 10, **untested** on a roof.
+- **Packed transfers** (`AirspySettings::packed`, CLI `--airspy-packed`, GUI
+  SDR window): 8 samples in 12 bytes, 30 instead of 40 MB/s. The unpacker is
+  tested bit-exact against a packer written in the test (every 12-bit value
+  in every position).
+- **CLI**: `--radio hackrf|airspy` (default `hackrf`) on `scan`, `capture` and
+  `decode`; `--airspy-preset KIND:N`, `--airspy-lna/-mixer/-vga`,
+  `--airspy-packed`. The HackRF flags and defaults are untouched.
+- **GUI**: "Airspy R2" in the source list; the gain row shows preset + LNA /
+  mixer / VGA; the rate is fixed at 10 MS/s; the SDR window shows the same
+  gains and the packed option, its baseband-filter / ppm block is disabled
+  ("HackRF only") and the gain optimiser (HackRF's LNA/VGA grid) says so.
+  Persisted in `prefs.txt` (`source=airspy`, `air_lna/mixer/vga/preset/packed`;
+  old files load unchanged; screenshot runs write nothing). Carrier offsets
+  learned while on the Airspy are kept for the run only: the ones in the prefs
+  include the HackRF's own clock error.
+- **Not done**: the Airspy Mini and the 2.5 MS/s rate; the gain optimiser for
+  the Airspy; AGC.
+
+**The converter** (after libairspy `iqconverter_float.c`): remove the DC, the
+fs/4 translate with signs (−1, −hbc, +1, +hbc), a 31-tap half-band
+(equiripple, 16 non-zero taps, centre 0.5; the taps sum to 0.99963), decimate
+by 2. Only the even lane needs the FIR (8 multiplies a sample, the taps being
+symmetric) and the odd lane is delayed and times the centre tap. Written as
+fixed-size blocks (4096 real samples, no allocation) of slice loops that LLVM
+vectorises; the DC is the block mean followed slowly (libairspy's per-sample
+one-pole cannot be vectorised, and the offset lands on the half-band's
+transition at 5 MHz if left in). Measured in `--release` with
+`cargo run --release -p decdvbt-io --features airspy --example
+airspy_convert_bench` (Xeon 2.8 GHz, plain x86-64 build, SSE2 only):
+
+| input | ns per output sample | % of one core at 10 MS/s out |
+|---|---|---|
+| unpacked | 3.97 | 4.0 % |
+| packed | 5.87 | 5.9 % |
+
+(`-C target-cpu=native`, AVX2: 2.83 / 3.58 ns. Not built in: the project's
+exe is a plain x86-64 build and the gain was about one point of a core.) It
+runs on the reader thread, not the receive thread.
+
+**Level.** A full-scale real tone (ADC swinging ±2048 about the midpoint)
+gives a complex tone of magnitude 1.0, I and Q each peaking at ±1, the same
+full scale as the HackRF's cs8, so the engine's level and clip logic read
+alike (the engine counts a sample as clipped at 0.99). libairspy's own output
+is half of that. A signal at the same fraction of the ADC's range as on the
+HackRF reads the same dBFS.
+
+**Tests** (`cargo test -p decdvbt-io --features airspy`, 25, one of them
+`#[ignore]`d and live): command encoding for every request, rate-list
+parsing, gain clamps and preset tables, the bias-tee check, the start
+sequence's order, the half-band's response with `rustfft` (passband ripple
+0.010 dB to 3.9 MHz, stopband −58.7 dB from 6.1 MHz, not the −62 dB the design note
+gave: in a half-band the two ripples are tied; a DVB-T channel is ±3.81 MHz), the converter against a direct 31-tap complex FIR on a mix of
+tones and noise (agrees to 1e-4), a full-scale tone = 1.0, DC removal, block
+boundaries, packed = unpacked, a fake reader into the consumer (hand-over,
+buffer recycling, the retune skip, a stalled stream). The orientation test
+puts a real tone at 5 MHz − d on the IF and asserts the output lands at +d
+(and the mirror IF at −d), for d = ±1, 2.5, −3.5 MHz.
+
+### Live results, 2026-10-27 (Airspy R2, aerial, in a moving vehicle)
+
+- `live_airspy` passes: board, firmware string and rate list read, 10 MS/s
+  delivered with no dropped buffers. It first failed on the firmware string
+  (the R2 returns 48 of the 127 bytes asked for); a short reply is now accepted
+  for that one request.
+- **Orientation is right** (`IF_SPECTRUM_INVERTED` stays `true`): a DVB-T2
+  mux (32K ext, PP7, 256-QAM 2/3 rotated) acquired and read L1, and a DVB-T
+  mux (8k 1/32 64-QAM 2/3) decoded 25 services with a clean constellation.
+- **Tuning is right**: both muxes sat on their channel centre; carrier offsets
+  within a few hundred Hz of the plan.
+- **Streaming**: 0 dropped buffers over minutes of live use (unpacked, 40 MB/s).
+- **Gain**: with the signal fading as the vehicle moved, MER swung by 20 dB
+  between runs of the same preset, more than any preset differs from another,
+  so no preset was shown better. Sensitivity 10 gave 15 dB MER on the DVB-T mux
+  against 9 dB for linearity 16 in one pair of runs, and the opposite order in
+  another: only a steady signal can settle it. Linearity 20 (LNA 14, mixer 12,
+  VGA 12) looked worse in the first rounds, perhaps overloaded.
+- Not shown: an error-free decode (the signal was too poor while moving) and a
+  retune soak.
+
+### Needs a live check on the owner's machine
+
+Run `cargo test -p decdvbt-io --features airspy live_airspy -- --ignored
+--nocapture` first (opens the radio at 100 MHz for 2 s, receive only, prints
+the firmware string, rate, rms and dropped buffers).
+
+1. **Spectral orientation (the likeliest thing to be wrong).** The sign
+   pattern decides whether the band is mirrored. It is libairspy's, which
+   assumes a tone at *centre + d* sits at *5 MHz − d* on the R820T's IF.
+   Cannot be checked without the radio. Check: decode a real mux
+   (`decdvbt decode C23 --radio airspy -o out/c23.ts`); a mirrored spectrum
+   will not lock (the TPS / pilots are conjugated), or the waterfall shows
+   the channel's pilots on the wrong side. **To flip it**: set
+   `IF_SPECTRUM_INVERTED` to `false` in `crates/decdvbt-io/src/airspy/convert.rs`
+   (the one named constant; it negates Q) and the orientation tests follow it.
+2. **Tuned frequency accuracy**: tune a known UHF mux; its carrier offset
+   (the GUI's CFO, `decode`'s report) should be within the plan's offsets
+   (±167 kHz steps) plus a couple of kHz. A larger constant offset would mean
+   the tuner's centre is not where `SET_FREQ` says.
+3. **40 MB/s unpacked streaming without dropped buffers** on the owner's USB
+   port (the `capture` / `decode --progress` drop count; GUI drop warning).
+   If it drops, try `--airspy-packed` (30 MB/s).
+4. **Gain preset for the aerial**: the default, sensitivity 10, is a guess.
+   Watch the level / OVERLOAD notes and MER; try `--airspy-preset
+   sensitivity:N` / `linearity:N` or the single-stage flags.
+5. **Retune soak**: tune between channels in the GUI (and `scan --radio
+   airspy`) many times; each lock should take about as long as on the HackRF,
+   with no stale lock. (`retune_soak` is HackRF-only.)
+6. **A DVB-T decode of a real mux**, e.g. `decdvbt decode C23 --radio airspy -o
+   out/c23.ts` (and C26): compare MER and pre-RS errors with the HackRF, which
+   gets about 32 dB C/N on C23/C26 with `--amp --lna 32 --vga 8`.
+
 ## Narrow channels: 1 MHz DVB-T and 1.7 MHz DVB-T2 (2026-10-27)
 
 Asked for: two narrow bandwidths end to end (modulator, transmitter,

@@ -57,7 +57,13 @@ fn peaks(m: &DelayDoppler, floor: f32, max: usize) -> Vec<(f64, f64, f32)> {
 }
 
 pub fn run(a: SoundArgs) -> Result<()> {
-    let mut src = source::open(&a.source, a.file_rate, None, source::Tuning::default())?;
+    let mut src = source::open(
+        &a.source,
+        a.file_rate,
+        None,
+        source::Tuning::default(),
+        &source::RadioArgs::default(),
+    )?;
     let fs = src.sample_rate();
     let centre = src.center_freq();
     let channel_centre = uhf_channel_at(centre).and_then(uhf_centre_hz);

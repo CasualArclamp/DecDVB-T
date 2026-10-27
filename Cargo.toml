@@ -42,6 +42,9 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.decdvbt-dsp]
 opt-level = 3
+# The Airspy real-to-IQ converter is DSP too.
+[profile.dev.package.decdvbt-io]
+opt-level = 3
 
 [profile.release]
 debug = "line-tables-only"

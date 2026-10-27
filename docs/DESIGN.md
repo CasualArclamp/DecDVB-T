@@ -40,7 +40,7 @@ ring overflow on one DVB-T mux). Every design choice is weighed against this:
 | Standards (first release) | **DVB-T** (EN 300 744) and **DVB-T2 base** (EN 302 755). T2-Lite, MISO, FEF and full multi-PLP are not in the first release. |
 | Order | **DVB-T first**, then T2 on the proven OFDM front end. |
 | Region / targets | **UK Freeview**, 8 MHz channels, UHF. Transmitter unknown; a band scan and the NIT will tell us which. Since 2026-10-27 also the **narrow channels** (§8): DVB-T scaled to 1 MHz and DVB-T2 at 1.7 MHz, anywhere from 1 MHz to 6 GHz. |
-| Front ends | **HackRF One** (live; plugged into this PC), **Airspy R2/Mini**, IQ files. |
+| Front ends | **HackRF One** (live; plugged into this PC), **Airspy R2** (live, 10 MS/s; Mini not supported), IQ files. |
 | Antenna | Rooftop aerial with a TV-band band-pass filter. **Heavy multipath on some channels.** |
 | Robustness | **Robust from the start**: SFN and long echoes (beyond the guard), Doppler and impulsive noise taken into account in the first design. |
 | Real time | **Real-time DVB-T2 HD mux** (~40 Mbit/s, 256-QAM, 32k, LDPC 64800). |
@@ -96,7 +96,7 @@ ring overflow on one DVB-T mux). Every design choice is weighed against this:
 
 | DecSAT crate | Use here |
 |---|---|
-| `decsat-io` | HackRF RX/TX, IQ files, extension sniffing. Add Airspy. |
+| `decsat-io` | HackRF RX/TX, IQ files, extension sniffing. Airspy R2 added as `airspy.rs` (pure Rust over `nusb`, host-side real-to-IQ; 2026-10-27). |
 | `decsat-dsp` | AGC, DC, FIR, DDC. |
 | `decsat-fec` | DVB-S2 LDPC + BCH: **T2 uses the same codes** (64800/16200), plus the bit interleaver ideas. The AVX2 kernels matter here (see §6). |
 | `decsat-modem` (`conv`, `rs`, `dvbs`) | K = 7 Viterbi and RS(204,188) for DVB-T. |
@@ -133,7 +133,10 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
   Live Freeview HD. *(done, 2026-10-23: C30 decodes live from the HackRF, 13
   services, in real time; the LDPC runs on a hand-written AVX2 kernel)*
 - **M7** — band scan with T2, the UK EPG's Huffman text, Airspy, release; the
-  CPU work that is left (resampling, LDPC).
+  CPU work that is left (resampling, LDPC). *(Airspy R2 front end in, 2026-10-27:
+  `decdvbt-io` feature `airspy`, `--radio airspy` in the CLI, "Airspy R2" in the
+  GUI's source list; unit-tested offline, still to be checked on the radio, see
+  STATUS.md.)*
 
 ## 6. Constraints found at kickoff
 
@@ -155,7 +158,11 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
 ## 7. Open questions
 
 - Ron Economos's DVB-T2 receiver: which repository exactly.
-- Airspy R2 real-IF mode (10 MS/s real) or IQ only.
+- ~~Airspy R2 real-IF mode (10 MS/s real) or IQ only.~~ Resolved (2026-10-27):
+  the R2 streams a real 20 MS/s signal on a 5 MHz IF; the **host** turns it into
+  10 MS/s IQ (`decdvbt-io::airspy::convert`, after libairspy: fs/4 translate and
+  a half-band filter, ~4 % of a core), in the reader thread so the receive
+  thread pays nothing. 10 MS/s is the only rate; the Mini is not supported.
 - Automatic gain (LNA/VGA) from ADC level and MER: wanted?
 
 ## 8. Narrow channels: 1 MHz DVB-T and 1.7 MHz DVB-T2 (2026-10-27)

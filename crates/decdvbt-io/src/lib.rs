@@ -3,11 +3,13 @@
 //!
 //! Everything upstream of the demodulator talks to an [`IqSource`]: an IQ file
 //! (replay) or
-//! the live HackRF One. Recording goes out through [`IqFileWriter`].
+//! the live HackRF One or Airspy R2. Recording goes out through [`IqFileWriter`].
 
 pub mod file;
 pub mod wav;
 
+#[cfg(feature = "airspy")]
+pub mod airspy;
 #[cfg(feature = "hackrf")]
 pub mod hackrf;
 #[cfg(feature = "hackrf")]
@@ -16,6 +18,10 @@ pub mod hackrf_tx;
 pub use file::{IqFileReader, IqFileWriter, NameHint, format_from_path, name_hint};
 pub use wav::{CaptureInfo, WavIq, probe_capture};
 
+#[cfg(feature = "airspy")]
+pub use airspy::{
+    AirspyControl, AirspyGains, AirspyInfo, AirspyPreset, AirspySettings, AirspySource, airspy_info,
+};
 #[cfg(feature = "hackrf")]
 pub use hackrf::{HackRfControl, HackRfGains, HackRfSettings, HackRfSource};
 #[cfg(feature = "hackrf")]

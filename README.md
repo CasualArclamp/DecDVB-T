@@ -10,7 +10,7 @@
 </p>
 
 **DecDVB-T** is a software-defined digital TV receiver. It takes raw radio
-samples from a **HackRF One** (or an IQ recording) and does the whole job in
+samples from a **HackRF One** or an **Airspy R2** (or an IQ recording) and does the whole job in
 software: OFDM demodulation, equalisation, error correction, the transport
 stream, the programme guide, video and audio, and the BBC's Red Button. It
 receives both of the UK's Freeview standards, **DVB-T** and **DVB-T2** (the HD
@@ -87,7 +87,17 @@ main requirement: a DVB-T multiplex decodes in about a third of one core, a
    [latest release](https://github.com/CasualArclamp/DecDVB-T/releases/latest),
    run it, pick a channel and tick **decode**.
 
-No HackRF? The GUI and the CLI also read IQ recordings (8-bit complex `.cs8`
+**Airspy R2 instead?** Bind it to the WinUSB driver the same way (USB ID
+`1D50:60A1`), pick **Airspy R2** in the GUI's source list, or add `--radio
+airspy` to `scan`, `capture` or `decode`. It has no RF amp switch: its gain is
+three stages (LNA, mixer, VGA, 0–15) with libairspy's presets
+(`--airspy-preset sensitivity:10`, `linearity:N`; `--airspy-lna/-mixer/-vga`
+override single stages). It runs at 10 MS/s only. The driver is pure Rust like
+the HackRF's, and the radio's real 20 MS/s stream is turned into IQ on the
+host (about 4 % of a core). The Airspy front end is new and has not yet been
+tried on the radio; see `docs/STATUS.md` for what is still to be checked.
+
+No radio? The GUI and the CLI also read IQ recordings (8-bit complex `.cs8`
 and others), and the CLI's `modulate` makes DVB-T and DVB-T2 test signals to
 play with.
 
@@ -98,6 +108,7 @@ decdvbt scan --amp --lna 32 --vga 8 --classify 5        # which channels carry a
 decdvbt decode C30 --amp --lna 32 --vga 8 -o c30.ts     # decode live to a transport stream
 decdvbt decode capture.cs8 --guide 3                    # decode a recording and print the guide
 decdvbt capture C23 --amp --lna 32 --vga 8 --record c23.cs8 --seconds 60
+decdvbt decode C23 --radio airspy --airspy-preset sensitivity:10 -o c23.ts   # the same on an Airspy R2
 decdvbt modulate --t2 uk --seconds 2.4 --cn 30 t2.cs8   # a DVB-T2 test signal through a simulated channel
 ```
 
@@ -153,7 +164,7 @@ unoptimised.
 |---|---|
 | `decdvbt-core` | shared types: modes, code rates, channels |
 | `decdvbt-dsp` | filters, resamplers, DC and AGC |
-| `decdvbt-io` | the HackRF (pure Rust over USB) and IQ files |
+| `decdvbt-io` | the HackRF and Airspy R2 (pure Rust over USB) and IQ files |
 | `decdvbt-ofdm` | DVB-T and T2 pilots, interleavers, L1 signalling |
 | `decdvbt-fec` | Viterbi, Reed–Solomon, LDPC (AVX2), BCH, the T2 demappers |
 | `decdvbt-rx` | the receivers: acquisition, tracking, equalisers, the sounder |
@@ -176,8 +187,8 @@ and DVB-T2 256-QAM rotated). The code is portable Rust, but other platforms
 have not been tried yet.
 
 Not done yet: DVB-T2 MISO, FEF parts, T2-Lite, time interleaving over several
-frames, and more than one PLP at a time (choosing one works); Airspy and other
-radios.
+frames, and more than one PLP at a time (choosing one works); other radios
+(the Airspy Mini, SDRplay, RTL-SDR).
 
 ## Credits
 
@@ -189,7 +200,9 @@ Economos's DVB-T2 work, [MythTV](https://github.com/MythTV/mythtv) (the
 Freesat/Freeview Huffman tables, and freemheg as the reference for the MHEG-5
 engine), OnAir, and the author's own DecSAT and DecDRM. The HackRF driver is
 FutureSDR's [`seify-hackrfone`](https://crates.io/crates/seify-hackrfone);
-the GUI is [egui](https://github.com/emilk/egui).
+the Airspy R2's USB protocol and real-to-IQ conversion follow
+[libairspy](https://github.com/airspy/airspyone_host) (BSD-3-Clause), over
+[`nusb`](https://crates.io/crates/nusb); the GUI is [egui](https://github.com/emilk/egui).
 
 ## Licence
 

@@ -13,7 +13,7 @@ use eframe::egui::{
 };
 
 use crate::prefs;
-use crate::source::Gains;
+use crate::source::{AirGains, Gains, Preset};
 
 /// Baseband filter bandwidths the radio has that are worth offering, MHz.
 pub const FILTERS_MHZ: [f32; 14] = [
@@ -329,12 +329,71 @@ impl Optimiser {
     }
 }
 
+/// The Airspy's gain controls: the libairspy preset (kind and step) and the
+/// three stages it sets, which can then be changed by hand. True if a stage
+/// changed.
+pub fn airspy_gain_row(ui: &mut Ui, air: &mut AirGains, preset: &mut Option<Preset>) -> bool {
+    let before = *air;
+    // Choosing or stepping a preset sets the stages; changing a stage makes
+    // the setting "custom".
+    let mut p = preset.unwrap_or(Preset::DEFAULT);
+    let mut from_preset = false;
+    ui.label("preset");
+    egui::ComboBox::from_id_salt("air_preset_kind")
+        .selected_text(match (*preset, p.linearity) {
+            (None, _) => "custom",
+            (_, true) => "linearity",
+            (_, false) => "sensitivity",
+        })
+        .width(96.0)
+        .show_ui(ui, |ui| {
+            from_preset |= ui
+                .selectable_value(&mut p.linearity, false, "sensitivity")
+                .changed();
+            from_preset |= ui
+                .selectable_value(&mut p.linearity, true, "linearity")
+                .changed();
+        })
+        .response
+        .on_hover_text(
+            "libairspy's gain presets: sensitivity favours weak signals, linearity strong ones",
+        );
+    from_preset |= ui
+        .add(egui::DragValue::new(&mut p.step).range(0..=21).speed(0.1))
+        .on_hover_text("preset step, 0 (least gain) to 21 (most)")
+        .changed();
+    if from_preset {
+        *preset = Some(p);
+        *air = p.gains();
+    }
+    ui.label("LNA");
+    ui.add(egui::DragValue::new(&mut air.lna).range(0..=14).speed(0.1));
+    ui.label("mixer");
+    ui.add(
+        egui::DragValue::new(&mut air.mixer)
+            .range(0..=15)
+            .speed(0.1),
+    );
+    ui.label("VGA");
+    ui.add(egui::DragValue::new(&mut air.vga).range(0..=15).speed(0.1));
+    if !from_preset && *air != before {
+        *preset = None;
+    }
+    *air != before
+}
+
 // ---- the window -----------------------------------------------------------
 
 /// What the window edits and shows.
 pub struct SdrView<'a> {
     pub settings: &'a mut SdrSettings,
     pub gains: &'a mut Gains,
+    /// The Airspy's stages, its preset and packing; shown instead of the
+    /// HackRF's gains when `airspy`.
+    pub air: &'a mut AirGains,
+    pub air_preset: &'a mut Option<Preset>,
+    pub air_packed: &'a mut bool,
+    pub airspy: bool,
     pub live: bool,
     pub front_end: FrontEndReading,
     pub optimiser: Option<&'a Optimiser>,
@@ -347,6 +406,8 @@ pub struct SdrView<'a> {
 #[derive(Default)]
 pub struct SdrAsks {
     pub gains_changed: bool,
+    /// The stream has to be started again (the Airspy's transfer format).
+    pub restart: bool,
     pub optimise: bool,
     pub cancel: bool,
     pub clear_offsets: bool,
@@ -369,13 +430,43 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
     let SdrView {
         settings,
         gains,
+        air,
+        air_preset,
+        air_packed,
+        airspy,
         live,
         front_end,
         optimiser,
         last_result,
         offsets,
     } = v;
-    ui.add_enabled_ui(live, |ui| {
+    if airspy {
+        ui.add_enabled_ui(live, |ui| {
+            ui.label(RichText::new("Gain").strong());
+            ui.horizontal_wrapped(|ui| {
+                asks.gains_changed |= airspy_gain_row(ui, air, air_preset);
+            });
+            ui.label(
+                RichText::new(
+                    "Both AGCs are off. The presets are libairspy's; sensitivity 10, the default, is a first guess not yet tried on a roof.",
+                )
+                .small()
+                .weak(),
+            );
+            if ui
+                .checkbox(air_packed, "packed transfers (30 MB/s instead of 40)")
+                .on_hover_text("Try this if the USB port drops buffers. Restarts the stream.")
+                .changed()
+            {
+                asks.restart = true;
+            }
+        });
+        if !live {
+            ui.label(RichText::new("The radio's settings apply to a live Airspy.").weak());
+        }
+    }
+    if !airspy {
+        ui.add_enabled_ui(live, |ui| {
         ui.label(RichText::new("Gain").strong());
         egui::Grid::new("sdr_gain").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
             let before = *gains;
@@ -429,8 +520,9 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
             sweep_plot(ui, &o.points, None);
         }
     });
-    if !live {
-        ui.label(RichText::new("The radio's settings apply to a live HackRF.").weak());
+        if !live {
+            ui.label(RichText::new("The radio's settings apply to a live HackRF.").weak());
+        }
     }
 
     ui.add_space(6.0);
@@ -463,8 +555,9 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
     );
 
     ui.add_space(6.0);
-    ui.add_enabled_ui(live, |ui| {
-        ui.label(RichText::new("Radio").strong());
+    // The baseband filter and clock trim are the HackRF's.
+    ui.add_enabled_ui(live && !airspy, |ui| {
+        ui.label(RichText::new(if airspy { "Radio (HackRF only)" } else { "Radio" }).strong());
         egui::Grid::new("sdr_radio").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
             ui.label("baseband filter");
             let label = settings.filter_mhz.map_or("auto".to_string(), |f| format!("{f} MHz"));
