@@ -262,7 +262,10 @@ impl Usb {
                 }))
                 .into_result()
                 .map_err(what)?;
-                if reply.len() < c.reply_len as usize {
+                // The firmware's version string is shorter than the 127 bytes
+                // asked for (libairspy asks for the same and takes what comes).
+                let may_be_short = c.request == proto::REQ_VERSION_STRING_READ;
+                if reply.len() < c.reply_len as usize && !may_be_short {
                     return Err(Error::Other(format!(
                         "Airspy: short reply to request {} ({} of {} bytes)",
                         c.request,
