@@ -1503,6 +1503,27 @@ buffer recycling, the retune skip, a stalled stream). The orientation test
 puts a real tone at 5 MHz − d on the IF and asserts the output lands at +d
 (and the mirror IF at −d), for d = ±1, 2.5, −3.5 MHz.
 
+### Live results, 2026-10-27 (Airspy R2, aerial, in a moving vehicle)
+
+- `live_airspy` passes: board, firmware string and rate list read, 10 MS/s
+  delivered with no dropped buffers. It first failed on the firmware string
+  (the R2 returns 48 of the 127 bytes asked for); a short reply is now accepted
+  for that one request.
+- **Orientation is right** (`IF_SPECTRUM_INVERTED` stays `true`): a DVB-T2
+  mux (32K ext, PP7, 256-QAM 2/3 rotated) acquired and read L1, and a DVB-T
+  mux (8k 1/32 64-QAM 2/3) decoded 25 services with a clean constellation.
+- **Tuning is right**: both muxes sat on their channel centre; carrier offsets
+  within a few hundred Hz of the plan.
+- **Streaming**: 0 dropped buffers over minutes of live use (unpacked, 40 MB/s).
+- **Gain**: with the signal fading as the vehicle moved, MER swung by 20 dB
+  between runs of the same preset, more than any preset differs from another,
+  so no preset was shown better. Sensitivity 10 gave 15 dB MER on the DVB-T mux
+  against 9 dB for linearity 16 in one pair of runs, and the opposite order in
+  another: only a steady signal can settle it. Linearity 20 (LNA 14, mixer 12,
+  VGA 12) looked worse in the first rounds, perhaps overloaded.
+- Not shown: an error-free decode (the signal was too poor while moving) and a
+  retune soak.
+
 ### Needs a live check on the owner's machine
 
 Run `cargo test -p decdvbt-io --features airspy live_airspy -- --ignored
