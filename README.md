@@ -57,6 +57,11 @@ main requirement: a DVB-T multiplex decodes in about a third of one core, a
   **delay–Doppler maps** (see each echo's delay and how fast it moves), heat
   maps of the channel over time, the error cloud and the MER of every
   constellation point.
+- A [**field guide to the channel plots**](https://casualarclamp.github.io/DecDVB-T/multipath-field-guide.html):
+  nineteen simulated conditions, from a single echo to an SFN, flat fading,
+  swaying aerials, impulsive noise and dropped buffers, each drawn live as
+  the impulse response, SNR per carrier, constellation and waterfall, with
+  what causes it and what it does to decoding.
 - A **margin** worked out from the *effective* SNR (each carrier's capacity
   averaged), so a channel with deep notches does not look healthier than it
   decodes.

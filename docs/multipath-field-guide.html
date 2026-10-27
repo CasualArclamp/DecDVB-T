@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>html{color-scheme:light dark}body{margin:0;font-size:14px}img{max-width:100%}[hidden]{display:none!important}</style>
+<title>Multipath Field Guide</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* layout: a scrolling list of ten channel cases; each case = prose column + the three scope panels DecLAB draws */
+:root{
+  --bg:#f2f3f6; --fg:#1b1e25; --muted:#5d6472; --panel:#ffffff; --edge:#d7dbe3; --grid:#e4e7ee;
+  --trace:#1f6fd1; --snr:#1e9449; --marker:#d47a12; --accent:#1f6fd1; --guard:rgba(31,111,209,.09);
+  --good:#1e9449; --warn:#c27a0c; --bad:#c8352b;
+  --font-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-mono:"IBM Plex Mono",ui-monospace,Consolas,"Courier New",monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#0f1115; --fg:#e3e6ed; --muted:#8c93a3; --panel:#161a21; --edge:#272d38; --grid:#222834;
+  --trace:#5aa0ff; --snr:#4fd37a; --marker:#ffb347; --accent:#5aa0ff; --guard:rgba(90,160,255,.10);
+  --good:#4fd37a; --warn:#ffb347; --bad:#ff6b5e; color-scheme:dark } }
+:root[data-theme="dark"]{
+  --bg:#0f1115; --fg:#e3e6ed; --muted:#8c93a3; --panel:#161a21; --edge:#272d38; --grid:#222834;
+  --trace:#5aa0ff; --snr:#4fd37a; --marker:#ffb347; --accent:#5aa0ff; --guard:rgba(90,160,255,.10);
+  --good:#4fd37a; --warn:#ffb347; --bad:#ff6b5e; color-scheme:dark }
+
+body{ background:var(--bg); color:var(--fg); font-family:var(--font-body); font-size:15px; line-height:1.5;
+  padding-left:max(16px,env(safe-area-inset-left,0px)); padding-right:max(16px,env(safe-area-inset-right,0px)); padding-block:2rem 4rem }
+.wrap{ max-width:1180px; margin:0 auto }
+h1{ font-size:2rem; font-weight:600; letter-spacing:-.01em; margin:0 0 .5rem; text-wrap:balance }
+.lede{ max-width:62ch; color:var(--muted); margin:0 0 1rem }
+.assume{ font-family:var(--font-mono); font-size:.8rem; color:var(--muted); display:flex; flex-wrap:wrap; gap:.4rem 1.2rem; margin:0 0 1.5rem; padding:.75rem 1rem; border:1px solid var(--edge); border-radius:4px; background:var(--panel) }
+.assume span b{ color:var(--fg); font-weight:500 }
+
+.case{ display:grid; grid-template-columns:minmax(0,22rem) minmax(0,1fr); gap:1.5rem 2rem; padding-block:1.75rem; border-top:1px solid var(--edge) }
+.case h2{ font-size:1.15rem; font-weight:600; margin:0 0 .35rem; text-wrap:balance }
+.case h2 small{ font-family:var(--font-mono); font-weight:400; color:var(--muted); font-size:.75rem; letter-spacing:.06em; display:block; margin-bottom:.2rem }
+.chips{ display:flex; flex-wrap:wrap; gap:.4rem; margin:0 0 .9rem; font-family:var(--font-mono); font-size:.75rem; font-variant-numeric:tabular-nums }
+.chip{ padding:.15rem .5rem; border:1px solid var(--edge); border-radius:3px; background:var(--panel) }
+.chip.v{ border-color:transparent; color:var(--bg); font-weight:500 }
+.chip.good{ background:var(--good) } .chip.warn{ background:var(--warn) } .chip.bad{ background:var(--bad) }
+.prose p{ margin:0 0 .6rem } .prose p b{ font-weight:600 }
+.prose{ min-width:0 }
+
+.scopes{ display:grid; grid-template-columns:1.35fr 1.35fr 1fr; gap:.75rem; min-width:0; align-content:start }
+.panel{ margin:0; min-width:0; background:var(--panel); border:1px solid var(--edge); border-radius:4px; padding:.4rem .5rem .5rem }
+.panel figcaption{ font-family:var(--font-mono); font-size:.72rem; color:var(--muted); margin-bottom:.3rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+.panel canvas{ display:block; width:100%; max-width:100%; aspect-ratio:1.55 }
+.panel.con canvas{ aspect-ratio:1 }
+.panel.wf{ grid-column:1/-1 } .panel.wf canvas{ aspect-ratio:3.4; image-rendering:auto }
+.anim{ font-family:var(--font-mono); font-size:.72rem; color:var(--accent) }
+
+@media (max-width:960px){ .case{ grid-template-columns:1fr } .scopes{ grid-template-columns:1fr 1fr } .panel.con{ grid-column:span 2 } .panel.con canvas{ aspect-ratio:1.55 } }
+@media (max-width:520px){ .scopes{ grid-template-columns:1fr } .panel.con{ grid-column:auto } }
+@media (prefers-reduced-motion: reduce){ .anim::after{ content:" · static under reduced motion" } }
+</style>
+
+<div class="wrap">
+  <h1>Multipath Field Guide</h1>
+  <p class="lede">Nineteen channel and interference conditions, each drawn the way DecLAB shows them: impulse response, SNR per carrier, the equalised 64-QAM constellation, and the waterfall of the raw spectrum over the last 30 seconds. The channel taps are simulated, the plots are computed from them.</p>
+  <div class="assume">
+    <span>mode <b>8k · 8 MHz · 6817 carriers · 1.116 kHz spacing</b></span>
+    <span>guard <b>1/32 = 28 µs</b></span>
+    <span>modulation <b>64-QAM 2/3, QEF ≈ 16.5 dB</b></span>
+    <span>thermal C/N <b>28 dB unless stated</b></span>
+    <span>1 µs <b>= 300 m of extra path</b></span>
+    <span>display <b>every panel live at the screen's frame rate <span class="anim">· channel time at 6×</span></b></span>
+  </div>
+  <div id="cases"></div>
+</div>
+
+<script>
+const GUARD = 28, NF = 2048, CN_DEFAULT = 28;
+
+const CASES = [
+{ name:"Line of sight", sub:"case 1 · the reference", taps:[{d:0,g:0}], cn:CN_DEFAULT,
+  verdict:["good","decodes, MER = C/N"],
+  text:`<p><b>Cause.</b> One path. A rooftop Yagi pointed at the mast, nothing reflecting worth mentioning.</p>
+<p><b>What you see.</b> A single spike on a flat noise floor. SNR per carrier is flat across all 8 MHz. Sixty-four tight dots. The waterfall is even speckle with no structure: OFDM data makes every bin look like noise around the same level.</p>
+<p><b>Decoder.</b> Nothing to equalise. MER equals the C/N. The other nine are measured against this.</p>` },
+
+{ name:"One short echo", sub:"case 2 · 1 µs at −6 dB", taps:[{d:0,g:0},{d:1.0,g:-6,ph:0.8}], cn:CN_DEFAULT,
+  verdict:["good","decodes"],
+  text:`<p><b>Cause.</b> A single reflection from something a few hundred metres off the direct path: the building next door, a hillside behind the house.</p>
+<p><b>What you see.</b> A second spike close to the main one. The channel ripples slowly, eight cycles across the band (period is 1/τ = 1 MHz). Peaks +3.5 dB, dips −6 dB, so the SNR trace is a gentle wave. The constellation stays clean with a faint halo from the dip carriers.</p>
+<p><b>Decoder.</b> Trivial. The equaliser divides each carrier by its channel estimate; the dips cost a few dB on a few carriers and the code never notices.</p>` },
+
+{ name:"One long echo inside the guard", sub:"case 3 · 20 µs at −3 dB", taps:[{d:0,g:0},{d:20,g:-3,ph:2.1}], cn:CN_DEFAULT,
+  verdict:["good","decodes, a few dB of margin lost"],
+  text:`<p><b>Cause.</b> A strong reflection from far off axis: a ridge, a tower block across the valley. 20 µs is 6 km of extra path.</p>
+<p><b>What you see.</b> Two spikes, well separated. The ripple is now fast: 50 kHz period, 160 cycles across the band, so it reads as a dense comb, and the waterfall turns into fine horizontal pinstripes because the nulls hold still in time. Nulls reach −10.7 dB. The constellation grows a soft halo, because carriers in the nulls have their noise amplified when equalised.</p>
+<p><b>Decoder.</b> No ISI, since 20 µs is inside the 28 µs guard. The only cost is noise enhancement in the nulls, a couple of dB of extra C/N. This is what healthy, classic multipath looks like.</p>` },
+
+{ name:"Equal-strength echo", sub:"case 4 · 0 dB at 15 µs, SFN or two equal paths", taps:[{d:0,g:0},{d:15,g:0,ph:3.14159}], cn:CN_DEFAULT,
+  verdict:["warn","decodes with 4–6 dB more C/N"],
+  text:`<p><b>Cause.</b> Two arrivals of equal strength. In a single frequency network that is two transmitters at similar distance. On one transmitter it is a reflection as strong as the direct path, usually because the aerial points between them.</p>
+<p><b>What you see.</b> Two equal spikes. The frequency response has true nulls: every 67 kHz the paths cancel and SNR drops to the floor, between nulls it sits at +6 dB. The SNR trace is a comb that touches zero. The constellation has a dense core from the good carriers and a wide diffuse cloud from the nulled ones.</p>
+<p><b>Decoder.</b> The mean MER undersells it. A fraction of carriers carry nothing and the 2/3 code recovers them from parity. 64-QAM 2/3 survives a 0 dB echo inside the guard for roughly 4 to 6 dB more C/N than the Gaussian figure. Beyond the guard it is hopeless.</p>` },
+
+{ name:"Pre-echo", sub:"case 5 · your C24 geometry at good C/N", taps:[{d:-6.0,g:-8,ph:1.2},{d:0,g:0},{d:-9.7,g:-20,ph:2.5},{d:-9.5,g:-21,ph:0.4},{d:11.7,g:-24,ph:1.9}], cn:CN_DEFAULT,
+  verdict:["good","decodes"],
+  text:`<p><b>Cause.</b> The strongest arrival is not the earliest. A weaker direct path at −8 dB arrives 6 µs before the dominant reflection, with a small pair near −9.6 µs. Typical when the aerial points at a reflecting building rather than the transmitter, or indoors.</p>
+<p><b>What you see.</b> Spikes to the left of zero. The decoder times its FFT window from the strongest path, so earlier arrivals show as negative delay. Ripple and halo look like case 3.</p>
+<p><b>Decoder.</b> The guard has to cover the spread from earliest to latest arrival, not just what follows the main peak. Here that spread is about 21 µs, still inside 28. A receiver may nudge its window earlier to centre the spread. A pre-echo stronger than about −3 dB can make sync hunt between the two peaks.</p>` },
+
+{ name:"Echo beyond the guard", sub:"case 6 · 40 µs at −10 dB", taps:[{d:0,g:0},{d:40,g:-10,ph:1.0}], cn:CN_DEFAULT, isi:15,
+  verdict:["bad","error floor, gain will not help"],
+  text:`<p><b>Cause.</b> A reflection from a long way off, 12 km of extra path: a mountain, a distant mast. Also what an SFN looks like when you sit between two transmitters that are far apart.</p>
+<p><b>What you see.</b> A spike outside the shaded guard window. The channel still ripples (25 kHz period, very fine), but the SNR trace has a hard ceiling around 15 dB no matter how strong the signal. The constellation is uniformly fuzzy rather than cored with a halo.</p>
+<p><b>Decoder.</b> The one gain cannot fix. Energy arriving after the guard spills from one symbol into the next and breaks the orthogonality between carriers. It behaves like a noise floor that scales with the signal. Fix the geometry: re-aim, move the aerial, or on DVB-T2 use a longer guard.</p>` },
+
+{ name:"Dense urban cluster", sub:"case 7 · eight taps within 3 µs", taps:[{d:0,g:0},{d:0.3,g:-2,ph:2.0},{d:0.7,g:-4,ph:4.1},{d:1.1,g:-5,ph:0.6},{d:1.6,g:-8,ph:5.2},{d:2.0,g:-11,ph:1.7},{d:2.5,g:-13,ph:3.3},{d:3.1,g:-16,ph:0.2}], cn:26,
+  verdict:["warn","position dependent"],
+  text:`<p><b>Cause.</b> Many reflections within a few microseconds: an indoor aerial, a street canyon, a city rooftop with buildings all round. No single dominant echo.</p>
+<p><b>What you see.</b> A cluster of spikes decaying over 0 to 3 µs. The frequency response is irregular, with no fixed period and deep notches in random places, and the waterfall shows broad uneven horizontal bands, like your C24 capture at MER 15. This is the one that changes when you move the aerial 10 cm, because each tap's phase shifts by a different amount.</p>
+<p><b>Decoder.</b> Usually fine on a rooftop. Indoors it is the main reason set-top aerials are hit and miss: the notch pattern is a lottery per position, and so is which carriers end up erased.</p>` },
+
+{ name:"Moving receiver", sub:"case 8 · case 7 with Doppler", motion:true,
+  taps:[{d:0,g:0,v:0.9},{d:0.3,g:-2,ph:2.0,v:-2.4},{d:0.7,g:-4,ph:4.1,v:1.6},{d:1.1,g:-5,ph:0.6,v:-0.7},{d:1.6,g:-8,ph:5.2,v:3.1},{d:2.0,g:-11,ph:1.7,v:-1.9},{d:2.5,g:-13,ph:3.3,v:2.6},{d:3.1,g:-16,ph:0.2,v:-3.3}], cn:26, isi:20,
+  verdict:["warn","ICI limited, mode dependent"],
+  text:`<p><b>Cause.</b> The same cluster as case 7, but the receiver or the things around it are moving, so each tap's phase rotates at its own rate.</p>
+<p><b>What you see.</b> The response churns and the nulls drift across the band. In the waterfall the bands break up into a woven, mottled texture with no straight lines. The constellation blur is uniform rather than haloed, because the channel changes within one symbol and that is inter-carrier interference, not a notch.</p>
+<p><b>Decoder.</b> 8k symbols are 924 µs long with 1.1 kHz carrier spacing, so even tens of Hz of Doppler becomes ICI. 8k is the worst mode for mobile and 2k the best. The channel estimate also goes stale between pilot symbols.</p>` },
+
+{ name:"Aircraft flutter", sub:"case 9 · 8 µs at −12 dB, phase sweeping", motion:true,
+  taps:[{d:0,g:0},{d:8,g:-12,ph:0,v:0.5}], cn:CN_DEFAULT,
+  verdict:["warn","periodic error bursts if it strengthens"],
+  text:`<p><b>Cause.</b> One weak echo from a moving reflector, an aircraft on approach, whose phase sweeps slowly. The once-a-second flicker of analogue TV.</p>
+<p><b>What you see.</b> A single small echo. The ripple pattern slides sideways across the band in a slow cycle, which the waterfall draws as clean diagonal stripes. MER wobbles periodically rather than sitting still.</p>
+<p><b>Decoder.</b> Mostly harmless on DVB: the equaliser tracks it between pilot symbols. If the echo gets strong and the reflector fast, you get periodic bursts of errors, visible as RS block losses every second or two.</p>` },
+
+{ name:"Weak signal, small echoes", sub:"case 10 · your C24 capture as recorded, C/N 3 dB", motion:true,
+  taps:[{d:-6.0,g:-16,ph:1.2,v:0.35},{d:0,g:0},{d:-9.7,g:-24,ph:2.5},{d:-9.5,g:-23,ph:0.4},{d:11.7,g:-24,ph:1.9}], cn:3,
+  verdict:["bad","no lock, raise the gain"],
+  text:`<p><b>Cause.</b> Same shape of echoes as case 5 but at 3 dB C/N: the feed into the tuner is far too low for the gain setting.</p>
+<p><b>What you see.</b> The SNR per carrier is grass. Any ripple is buried in noise. The impulse-response floor is only 40 dB down, so −24 dB echoes sit near the edge of what it can resolve. The constellation is a cloud; only the BPSK pilots still separate. The waterfall is mostly speckle, with faint diagonal stripes: the −6 µs echo is slowly changing phase, so its ripple slides across the band. Diagonal means something in the path is moving.</p>
+<p><b>Decoder.</b> Noise limited, not multipath limited. Raise the gain and the floor drops, the echoes sharpen, and the comb from case 5 appears. Multipath only becomes the limit once MER stops rising with gain.</p>` },
+
+{ name:"Waves on the water", sub:"case 11 · several long echoes, each drifting at its own rate", motion:true,
+  taps:[{d:0,g:0},{d:-9.73,g:-18,ph:0.3,v:2.2},{d:-9.52,g:-17,ph:2.8,v:-1.6},{d:-6.02,g:-14,ph:1.1,v:0.9},{d:11.7,g:-18,ph:4.0,v:-2.9}], cn:9,
+  verdict:["warn","marginal, shifting"],
+  text:`<p><b>Cause.</b> The echo set from your first C24 screenshot, but every echo is moving a little: a reflector in motion, or the aerial and feeder swaying. Each long echo makes a fine ripple across the band, and each ripple slides sideways at its own speed and in its own direction.</p>
+<p><b>What you see.</b> The ripples are fine because the delays are long: at 10 µs the period is 100 kHz, about eighty cycles across the channel. When several fine ripples drift across each other they interfere, and the waterfall takes on a crossed, short-streaked grain, like wind ripples on water seen from above. At low C/N the OFDM speckle breaks the streaks up further, so they are short and broken rather than clean lines. The SNR-per-carrier comb is dense and never holds still.</p>
+<p><b>Decoder.</b> Each echo is well inside the guard and weak, so by itself none matters. The movement is what costs: the channel estimate goes stale between pilot updates and the equaliser is always slightly behind. You get a slowly breathing MER and intermittent RS losses rather than a hard failure. The texture in the waterfall is the tell that something in the path is physically moving, before the error counters show it.</p>` },
+
+{ name:"Impulsive noise", sub:"case 12 · broadband bursts, not a channel effect", motion:true,
+  taps:[{d:0,g:0}], cn:24, impulse:{p:0.05,g:4},
+  verdict:["warn","good MER, blocks lost in bursts"],
+  text:`<p><b>Cause.</b> Electrical switching nearby: a thermostat, a fridge compressor, LED drivers, a lift motor, a car in the street. Each event is broadband and lasts microseconds to a millisecond.</p>
+<p><b>What you see.</b> Bright horizontal lines across the full width, random in time, each one or two rows tall, with a normal spectrum between them. SNR per carrier and the constellation look fine, because a one-millisecond burst vanishes in the averages.</p>
+<p><b>Decoder.</b> Each burst corrupts a symbol or two on every carrier at once. The interleaver spreads it and Reed-Solomon absorbs up to 8 bytes per packet; a longer burst beats that and you get a cluster of lost blocks against a perfectly good MER. "MER fine, blocks lost" is the signature.</p>` },
+
+{ name:"Narrowband interferer", sub:"case 13 · a carrier inside the channel",
+  taps:[{d:0,g:0}], cn:26, cw:[{f:1.3,g:-4},{f:-2.6,g:-20}],
+  verdict:["good","decodes, a few carriers erased"],
+  text:`<p><b>Cause.</b> A steady carrier sitting inside the channel: a spur from the SDR's own clocks, a PMR or paging transmitter, the harmonic of something digital in the house, a wireless microphone.</p>
+<p><b>What you see.</b> A vertical line that never moves. If it leans slightly it is drifting with temperature, which points at a crystal somewhere. SNR per carrier has a single deep needle at that frequency. The constellation is a dense core with a thin halo from the erased carriers.</p>
+<p><b>Decoder.</b> The carriers under it are lost and the code recovers them. It only matters if it is strong enough to drive the gain stages into compression. Telling it from multipath: a multipath notch is broad and part of a repeating pattern, this is one needle.</p>` },
+
+{ name:"Feeder mismatch and tilt", sub:"case 14 · your second C24 screenshot",
+  taps:[{d:0,g:0},{d:0.22,g:-5,ph:2.0},{d:9.4,g:-26,ph:1.0},{d:14.1,g:-29,ph:2.6}], cn:24, tilt:-3,
+  verdict:["good","decodes, a few dB thrown away"],
+  text:`<p><b>Cause.</b> A sub-microsecond echo at −5 dB is often not a building. 0.22 µs is about 20 m of coax at the cable's velocity factor, so this is a reflection between a poor match at each end of the feeder. Add a little cable slope across the band.</p>
+<p><b>What you see.</b> A brightness gradient across the waterfall, bright on one side and dim on the other, stable in time, with fine pinstripes from whatever long weak echoes exist. SNR per carrier is a tilt or a half-wave rather than a ripple: 13 dB at one edge, 18 dB at the other, which is what your capture showed.</p>
+<p><b>Decoder.</b> Harmless at this level, but it is several dB wasted before the tuner. Check connectors, the balun and any adapter before blaming the city.</p>` },
+
+{ name:"Flat fading", sub:"case 15 · your third C24 screenshot, whole band together", motion:true,
+  taps:[{d:0,g:0},{d:0.33,g:-20,ph:0.5},{d:5.0,g:-22,ph:2.2},{d:12,g:-26,ph:1.1},{d:19,g:-28,ph:3.3}], cn:21,
+  flat:[{a:4,T:3.1},{a:3,T:1.3,ph:1},{a:2.5,T:7.5,ph:2}],
+  verdict:["warn","drops in and out at the troughs"],
+  text:`<p><b>Cause.</b> The whole signal level changing, not the shape of the channel: someone walking past an indoor aerial, a vehicle stopping in front of it, wind on a loose outdoor one, or tropospheric conditions on a long path. Every frequency rises and falls together.</p>
+<p><b>What you see.</b> Horizontal bands of brightness across the full width, bright rows and dark rows a second or a few apart, with no structure across the band inside each row. Fine vertical pinstripes can ride on top from long weak echoes, as in your capture. Multipath bands run across frequency; this runs across time.</p>
+<p><b>Decoder.</b> MER follows the level. With margin you never notice; near the threshold you lose lock at each trough and get bursts of lost blocks. Your screenshot also shows 888 dropped buffers at 84 % CPU, which adds the next case on top. The history tab is where this one is easiest to read.</p>` },
+
+{ name:"Aerial swaying", sub:"case 16 · long echo, phase rocking back and forth", motion:true,
+  taps:[{d:0,g:0},{d:20,g:-4,ph:1.0,sw:1.8,swT:2.4}], cn:26,
+  verdict:["good","decodes, MER breathes"],
+  text:`<p><b>Cause.</b> The long echo of case 3, but the aerial or the reflector is swaying. At 498 MHz a wavelength is 60 cm, so a 15 cm sway swings the echo's phase by a quarter turn and back.</p>
+<p><b>What you see.</b> The pinstripes wiggle. They meander sideways with the gust period and come back, never drifting away as in case 9. In the SNR trace the comb rocks left and right.</p>
+<p><b>Decoder.</b> The pilots track it easily. MER breathes by a dB or two in time with the wind and nothing is lost.</p>` },
+
+{ name:"Fast flutter", sub:"case 17 · aircraft, Doppler faster than the waterfall", motion:true,
+  taps:[{d:0,g:0},{d:8,g:-10,ph:0,v:63}], cn:26, isi:23,
+  verdict:["warn","bursts while the aircraft passes"],
+  text:`<p><b>Cause.</b> An aircraft overhead. The reflected path changes by metres per second, which at a 60 cm wavelength is tens of Hz of Doppler, far faster than the waterfall's 100 ms rows.</p>
+<p><b>What you see.</b> The rows no longer line up. Each row is a ripple at a different offset, so the waterfall becomes horizontal static, streaks one row tall. The clean diagonals of case 9 need a drift of well under a hertz; this is aliased into noise. The maps view is where it shows: Doppler smear around the echo's delay, as in your C31 capture with the main tap spread over ±10 Hz.</p>
+<p><b>Decoder.</b> The channel changes inside the 924 µs symbol, which is inter-carrier interference, and the estimate is stale by the next pilot. Periodic bursts of errors for the half-minute the aircraft is in the beam.</p>` },
+
+{ name:"Dropped buffers", sub:"case 18 · software, not RF", motion:true,
+  taps:[{d:0,g:0}], cn:24, drop:{p:0.035},
+  verdict:["warn","blocks lost with clean MER"],
+  text:`<p><b>Cause.</b> Your C24 runs showed 65 and then 888 dropped buffers with the app at 70 to 87 % CPU. The SDR delivered a block the app was not ready for and the samples were discarded.</p>
+<p><b>What you see.</b> Thin dark rows where a frame is missing, usually followed by a bright smeared row where the discontinuity leaks across every bin. Evenly spaced means a steady overload, random means transient load.</p>
+<p><b>Decoder.</b> Each gap breaks symbol timing and takes a few symbols to recover. Blocks are lost in clusters while MER stays clean, the same signature as impulsive noise. The dropped-buffers counter is the tie-breaker, and the fix is CPU, not the aerial.</p>` },
+
+{ name:"Co-channel interference", sub:"case 19 · another transmitter on the same channel during a lift",
+  taps:[{d:0,g:0}], cn:30, cochan:{g:-9, taps:[{d:0,g:0},{d:3.0,g:-3,ph:1.0}]},
+  verdict:["bad","strong signal, no lock, gain does nothing"],
+  text:`<p><b>Cause.</b> Tropospheric lift carrying a distant transmitter on the same channel. Input level goes up while C/N goes down, which is the opposite of a weak-signal problem.</p>
+<p><b>What you see.</b> It looks like a noisy channel but input rms is high. The floor between the bands is itself banded, because the interferer has its own multipath: here a 3 µs echo gives it a 330 kHz ripple. Two overlapping speckle textures with different stripe spacings.</p>
+<p><b>Decoder.</b> Effective C/N is set by the interferer and no gain setting changes it. DVB-T has no way to separate two muxes on one channel. Wait for the lift to pass, or use a more directional aerial pointed away from the intruder.</p>` }
+];
+
+/* ---------- maths ---------- */
+function mulberry(seed){ return function(){ seed|=0; seed=seed+0x6D2B79F5|0; let t=Math.imul(seed^seed>>>15,1|seed); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; } }
+function gauss(rnd){ const u=Math.max(rnd(),1e-12), v=rnd(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+
+/* a tap: d delay µs, g dB, ph rad, v rad/s steady drift, sw/swT sinusoidal sway (rad, s) */
+function tapsAt(taps,time){ return taps.map(t=>({ a:Math.pow(10,t.g/20), d:t.d, ph:(t.ph||0)+(t.v||0)*time+(t.sw?t.sw*Math.sin(2*Math.PI*time/t.swT):0) })); }
+function h2(tp,f){ let re=0,im=0; for(const t of tp){ const p=-2*Math.PI*f*t.d+t.ph; re+=t.a*Math.cos(p); im+=t.a*Math.sin(p); } return re*re+im*im; }
+function gainAt(c,x01,time){ let g=1; if(c.tilt) g*=Math.pow(10,c.tilt*(x01-0.5)/10); if(c.flat){ let db=0; for(const m of c.flat) db+=m.a*Math.sin(2*Math.PI*time/m.T+(m.ph||0)); g*=Math.pow(10,db/10); } return g; }
+function cwAt(c,f){ let n=0; if(c.cw) for(const w of c.cw){ const d=(f-w.f)/0.02; n+=Math.pow(10,w.g/10)*Math.exp(-d*d); } return n; }   /* ~20 kHz wide needle */
+
+function compute(c,time){
+  const nT = Math.pow(10,-c.cn/10), nI = c.isi==null ? 0 : Math.pow(10,-c.isi/10);
+  const tp=tapsAt(c.taps,time), tc=c.cochan?tapsAt(c.cochan.taps,time):null, gc=c.cochan?Math.pow(10,c.cochan.g/10):0;
+  const snr = new Float32Array(NF); let errAcc=0, snrAcc=0;
+  for(let i=0;i<NF;i++){
+    const f = -4 + 8*i/NF;
+    const m2 = Math.max(h2(tp,f)*gainAt(c,i/NF,time), 1e-8);
+    const n = nT + cwAt(c,f) + (tc ? gc*h2(tc,f) : 0);
+    let s = -10*Math.log10(n/m2 + nI); if(s<0) s=0;            /* MMSE-ish floor: a nulled carrier is pure noise, not worse */
+    snr[i]=s; errAcc += Math.pow(10,-s/10); snrAcc += s;
+  }
+  return { snr, mer: -10*Math.log10(errAcc/NF), meanSnr: snrAcc/NF };
+}
+
+/* ---------- drawing ---------- */
+function tok(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+function prep(cv){ const dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight; if(cv.width!==Math.round(w*dpr)||cv.height!==Math.round(h*dpr)){ cv.width=Math.round(w*dpr); cv.height=Math.round(h*dpr);} const g=cv.getContext("2d"); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h); return [g,w,h]; }
+function axes(g,W,H,L,B,xt,yt,xf,yf){ g.strokeStyle=tok("--grid"); g.lineWidth=1; g.font="10px "+tok("--font-mono"); g.fillStyle=tok("--muted");
+  for(const x of xt){ const px=xf(x); g.beginPath(); g.moveTo(px,0); g.lineTo(px,H-B); g.stroke(); g.textAlign="center"; g.fillText(x>0&&xt[0]<0?"+"+x:String(x),px,H-3); }
+  for(const y of yt){ const py=yf(y); g.beginPath(); g.moveTo(L,py); g.lineTo(W,py); g.stroke(); g.textAlign="right"; g.fillText(String(y),L-3,py+3); } }
+
+/* impulse response as the receiver estimates it: Hann-windowed inverse transform of the 8 MHz channel,
+   so taps have a real main lobe and sidelobes, close taps beat as their phases drift, and the floor is live noise */
+function sinc(x){ return x===0?1:Math.sin(Math.PI*x)/(Math.PI*x); }
+function kern(u){ const x=8*u; return 0.5*sinc(x)+0.25*sinc(x-1)+0.25*sinc(x+1); }   /* u in µs, 8 MHz span */
+function drawIR(cv,v,seed){
+  const c=v.c, st=v.wfSt||{}, [g,W,H]=prep(cv), L=26,B=14, x0=-15,x1=45, y0=-60,y1=2;
+  const xf=x=>L+(x-x0)/(x1-x0)*(W-L), yf=y=>(y1-y)/(y1-y0)*(H-B);
+  g.fillStyle=tok("--guard"); g.fillRect(xf(0),0,xf(GUARD)-xf(0),H-B);
+  axes(g,W,H,L,B,[-10,0,10,20,30,40],[0,-20,-40,-60],xf,yf);
+  g.fillStyle=tok("--muted"); g.font="10px "+tok("--font-mono"); g.textAlign="left"; g.fillText("guard "+GUARD+" µs",xf(0)+4,10);
+  const rnd=mulberry(seed), tp=tapsAt(c.taps,v.time);
+  let nP=Math.pow(10,-(0.6*c.cn+38)/10);                          /* estimate floor after pilot averaging: ~-55 dB at 28 dB C/N, ~-40 dB at 3 dB, as DecLAB shows */
+  if(c.flat) nP/=gainAt(c,0.5,v.time); if(st.imp) nP+=st.imp*0.03; if(c.cochan) nP+=Math.pow(10,c.cochan.g/10)*0.01; if(st.drop) nP=1.5;
+  const nA=Math.sqrt(nP/2), cols=W-L, lev=new Float32Array(cols);
+  for(let px=0;px<cols;px++){ const tau=x0+(x1-x0)*px/cols; let re=gauss(rnd)*nA, im=gauss(rnd)*nA;
+    for(const t of tp){ const k=t.a*kern(tau-t.d); re+=k*Math.cos(t.ph); im+=k*Math.sin(t.ph); }
+    lev[px]=Math.max(y0,10*Math.log10(re*re+im*im+1e-9)); }
+  g.strokeStyle=tok("--trace"); g.lineWidth=1; g.beginPath();
+  for(let px=0;px<cols;px++){ const y=yf(lev[px]); if(px===0) g.moveTo(L+px,y); else g.lineTo(L+px,y); } g.stroke();
+  const labels=[], floorDb=10*Math.log10(nP);
+  for(const t of c.taps){ if(t.g===0 || t.g<floorDb+6) continue; const px=Math.round((t.d-x0)/(x1-x0)*cols); if(px<0||px>=cols) continue;
+    g.strokeStyle=tok("--marker"); g.lineWidth=1.2; g.beginPath(); g.arc(L+px,yf(lev[px])-4,3,0,Math.PI*2); g.stroke();
+    labels.push((t.d>0?"+":"")+t.d.toFixed(2)+" µs "+t.g+" dB"); }
+  g.fillStyle=tok("--marker"); g.font="10px "+tok("--font-mono"); g.textAlign="right";
+  labels.slice(0,5).forEach((s,i)=>g.fillText(s,W-4,12+i*11));
+}
+
+function drawSNR(cv,res){
+  const [g,W,H]=prep(cv), L=22,B=14, y0=0,y1=40;
+  const xf=x=>L+(x+4)/8*(W-L), yf=y=>(y1-y)/(y1-y0)*(H-B);
+  axes(g,W,H,L,B,[-3,-2,-1,0,1,2,3],[0,10,20,30,40],xf,yf);
+  g.fillStyle=tok("--snr"); const cols=W-L, s=res.snr;
+  for(let px=0;px<cols;px++){ const i0=Math.floor(px/cols*NF), i1=Math.max(i0+1,Math.floor((px+1)/cols*NF)); let lo=99,hi=-99; for(let i=i0;i<i1;i++){ if(s[i]<lo)lo=s[i]; if(s[i]>hi)hi=s[i]; }
+    hi=Math.min(hi,y1); const yt=yf(hi), yb=yf(Math.max(lo,y0)); g.fillRect(L+px,yt,1,Math.max(1,yb-yt)); }
+  g.strokeStyle=tok("--snr"); g.globalAlpha=.35; g.lineWidth=1; g.beginPath(); g.moveTo(L,yf(16.5)); g.lineTo(W,yf(16.5)); g.stroke(); g.globalAlpha=1;
+  g.fillStyle=tok("--muted"); g.font="10px "+tok("--font-mono"); g.textAlign="right"; g.fillText("QEF 16.5",W-3,yf(16.5)-3);
+}
+
+function drawCon(cv,res,seed,N){
+  const [g,W,H]=prep(cv), R=1.25, S=Math.min(W,H), ox=W/2, oy=H/2;
+  const xf=x=>ox+x/R*S/2, yf=y=>oy-y/R*S/2;
+  g.strokeStyle=tok("--grid"); g.lineWidth=1; g.beginPath(); g.moveTo(xf(0),0); g.lineTo(xf(0),H); g.moveTo(0,yf(0)); g.lineTo(W,yf(0)); g.stroke();
+  g.strokeStyle=tok("--edge"); g.strokeRect(xf(-1.15),yf(1.15),xf(1.15)-xf(-1.15),yf(-1.15)-yf(1.15));
+  const rnd=mulberry(seed), k=1/Math.sqrt(42), s=res.snr; g.fillStyle=tok("--snr"); g.globalAlpha=.55;
+  for(let n=0;n<N;n++){ const i=Math.floor(rnd()*NF), sig=Math.sqrt(Math.pow(10,-s[i]/10)/2);
+    const I=(2*Math.floor(rnd()*8)-7)*k + gauss(rnd)*sig, Q=(2*Math.floor(rnd()*8)-7)*k + gauss(rnd)*sig;
+    g.fillRect(xf(I)-.75,yf(Q)-.75,1.5,1.5); }
+  g.globalAlpha=1;
+}
+
+/* ---------- page ---------- */
+const SPEED=6;            /* channel seconds per real second: 30 s of waterfall scrolls past in 5 s */
+let frame=0;
+const host=document.getElementById("cases"), reduced=matchMedia("(prefers-reduced-motion: reduce)");
+const views=CASES.map((c,idx)=>{
+  const el=document.createElement("section"); el.className="case"; el.id="case"+(idx+1);
+  el.innerHTML=`<div class="prose"><h2><small>${c.sub}</small>${c.name}</h2>
+    <div class="chips"><span class="chip">MER <span data-mer></span> dB</span><span class="chip">mean SNR <span data-snr></span> dB</span><span class="chip v ${c.verdict[0]}">${c.verdict[1]}</span></div>${c.text}</div>
+    <div class="scopes">
+      <figure class="panel"><figcaption>impulse response, dB (µs)</figcaption><canvas></canvas></figure>
+      <figure class="panel"><figcaption>SNR per carrier, dB (MHz from centre)</figcaption><canvas></canvas></figure>
+      <figure class="panel con"><figcaption>64-QAM after equalisation</figcaption><canvas></canvas></figure>
+      <figure class="panel wf"><figcaption>waterfall, raw spectrum · 8 MHz across · 30 s of channel time down, newest at the bottom, played at 6×</figcaption><canvas></canvas></figure>
+    </div>`;
+  host.appendChild(el);
+  const cvs=el.querySelectorAll("canvas");
+  return { c, idx, ir:cvs[0], sn:cvs[1], con:cvs[2], wf:cvs[3], mer:el.querySelector("[data-mer]"), snr:el.querySelector("[data-snr]"), seed:1000+idx*17, wfAcc:0, time:0, visible:true };
+});
+if("IntersectionObserver" in window){ const io=new IntersectionObserver(es=>{ for(const e of es){ const v=views.find(v=>v.wf.closest(".case")===e.target); if(v) v.visible=e.isIntersecting; } },{rootMargin:"200px"}); views.forEach(v=>io.observe(v.wf.closest(".case"))); }
+
+/* ---------- waterfall ---------- */
+const ROW_DT = 0.1;                                   /* seconds of channel time per row */
+const STOPS=[[0,0,4],[40,10,96],[114,31,129],[182,54,121],[222,73,104],[254,159,109],[252,253,191]];
+function cmap(t,out,o){ t=Math.min(Math.max(t,0),1)*(STOPS.length-1); const i=Math.min(Math.floor(t),STOPS.length-2), u=t-i, a=STOPS[i], b=STOPS[i+1];
+  out[o]=a[0]+(b[0]-a[0])*u; out[o+1]=a[1]+(b[1]-a[1])*u; out[o+2]=a[2]+(b[2]-a[2])*u; out[o+3]=255; }
+function wfRow(c,data,o,W,time,rnd,st){
+  const nT=Math.pow(10,-c.cn/10), lo=-c.cn-2, hi=5;
+  const E=()=>-(Math.log(Math.max(rnd(),1e-9))+Math.log(Math.max(rnd(),1e-9))+Math.log(Math.max(rnd(),1e-9))+Math.log(Math.max(rnd(),1e-9)))/4;   /* each OFDM bin is exponential about |H|²; a row averages 4 symbols */
+  const tp=tapsAt(c.taps,time), tc=c.cochan?tapsAt(c.cochan.taps,time):null, gc=c.cochan?Math.pow(10,c.cochan.g/10):0;
+  const imp = c.impulse && rnd()<c.impulse.p ? Math.pow(10,(c.impulse.g+(rnd()-0.5)*6)/10) : 0;   /* a broadband burst this row */
+  const drop = !!(c.drop && rnd()<c.drop.p), glitch=st.glitch; st.glitch=drop; st.imp=imp; st.drop=drop;   /* a lost buffer: dark row, then a smeared one */
+  for(let x=0;x<W;x++){ const f=-4+8*x/W, sig=h2(tp,f)*gainAt(c,x/W,time); let p;
+    if(drop) p = nT*0.25*E();
+    else { p = sig*E() + nT*E() + cwAt(c,f)*(0.8+0.4*rnd()) + imp*E(); if(tc) p += gc*h2(tc,f)*E(); if(glitch) p += (sig+1)*0.6*E(); }
+    cmap((10*Math.log10(p)-lo)/(hi-lo),data,o+x*4); }
+}
+function drawWF(cv,v){
+  const dpr=Math.min(window.devicePixelRatio||1,1.5), W=Math.round(cv.clientWidth*dpr), H=Math.round(cv.clientHeight*dpr);
+  if(!W||!H) return; cv.width=W; cv.height=H;
+  const g=cv.getContext("2d"), img=g.createImageData(W,H), rnd=mulberry(v.seed+7); v.wfSt={glitch:false};
+  for(let r=0;r<H;r++) wfRow(v.c,img.data,r*W*4,W,v.time-(H-1-r)*ROW_DT,rnd,v.wfSt);
+  g.putImageData(img,0,0); v.wfImg=img; v.wfRnd=rnd;
+}
+function stepWF(v){
+  const cv=v.wf, img=v.wfImg; if(!img||img.width!==cv.width) return;
+  const W=img.width, H=img.height; img.data.copyWithin(0,W*4);
+  wfRow(v.c,img.data,(H-1)*W*4,W,v.time,v.wfRnd,v.wfSt); cv.getContext("2d").putImageData(img,0,0);
+}
+
+function render(v,full){
+  const res=compute(v.c,v.time);
+  if(full) drawWF(v.wf,v);
+  drawIR(v.ir,v,v.seed+frame*7); drawSNR(v.sn,res); drawCon(v.con,res,v.seed+1+frame*31,2400);
+  v.mer.textContent=res.mer.toFixed(1); v.snr.textContent=res.meanSnr.toFixed(1);
+}
+function renderAll(){ views.forEach(v=>render(v,true)); }
+renderAll();
+let rt; new ResizeObserver(()=>{ clearTimeout(rt); rt=setTimeout(renderAll,80); }).observe(host);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change",renderAll);
+new MutationObserver(renderAll).observe(document.documentElement,{attributes:true,attributeFilter:["data-theme"]});
+
+let last=performance.now();
+function tick(now){
+  const dt=Math.min((now-last)/1000,.1); last=now;
+  frame++;
+  for(const v of views){ v.time+=dt*SPEED; v.wfAcc+=dt*SPEED; if(!v.visible){ v.wfAcc=Math.min(v.wfAcc,ROW_DT*4); continue; }
+    render(v,false);
+    let n=0; while(v.wfAcc>=ROW_DT && n<4){ v.wfAcc-=ROW_DT; stepWF(v); n++; } v.wfAcc=Math.min(v.wfAcc,ROW_DT); }
+  requestAnimationFrame(tick);
+}
+if(!reduced.matches) requestAnimationFrame(tick);
+</script>
+</body>
+</html>
