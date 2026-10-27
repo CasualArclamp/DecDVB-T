@@ -294,7 +294,7 @@ const views=CASES.map((c,idx)=>{
       <figure class="panel"><figcaption>impulse response, dB (µs)</figcaption><canvas></canvas></figure>
       <figure class="panel"><figcaption>SNR per carrier, dB (MHz from centre)</figcaption><canvas></canvas></figure>
       <figure class="panel con"><figcaption>64-QAM after equalisation</figcaption><canvas></canvas></figure>
-      <figure class="panel wf"><figcaption>waterfall, raw spectrum · 8 MHz across · 30 s of channel time down, newest at the bottom, played at 6×</figcaption><canvas></canvas></figure>
+      <figure class="panel wf"><figcaption>waterfall, raw spectrum · 8 MHz across · 30 s of channel time down, newest at the top, played at 6×</figcaption><canvas></canvas></figure>
     </div>`;
   host.appendChild(el);
   const cvs=el.querySelectorAll("canvas");
@@ -322,13 +322,13 @@ function drawWF(cv,v){
   const dpr=Math.min(window.devicePixelRatio||1,1.5), W=Math.round(cv.clientWidth*dpr), H=Math.round(cv.clientHeight*dpr);
   if(!W||!H) return; cv.width=W; cv.height=H;
   const g=cv.getContext("2d"), img=g.createImageData(W,H), rnd=mulberry(v.seed+7); v.wfSt={glitch:false};
-  for(let r=0;r<H;r++) wfRow(v.c,img.data,r*W*4,W,v.time-(H-1-r)*ROW_DT,rnd,v.wfSt);
+  for(let r=H-1;r>=0;r--) wfRow(v.c,img.data,r*W*4,W,v.time-r*ROW_DT,rnd,v.wfSt);      /* oldest at the bottom, newest at the top */
   g.putImageData(img,0,0); v.wfImg=img; v.wfRnd=rnd;
 }
 function stepWF(v){
   const cv=v.wf, img=v.wfImg; if(!img||img.width!==cv.width) return;
-  const W=img.width, H=img.height; img.data.copyWithin(0,W*4);
-  wfRow(v.c,img.data,(H-1)*W*4,W,v.time,v.wfRnd,v.wfSt); cv.getContext("2d").putImageData(img,0,0);
+  const W=img.width, H=img.height; img.data.copyWithin(W*4,0,(H-1)*W*4);               /* everything moves down one row */
+  wfRow(v.c,img.data,0,W,v.time,v.wfRnd,v.wfSt); cv.getContext("2d").putImageData(img,0,0);
 }
 
 function render(v,full){
