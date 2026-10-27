@@ -1682,3 +1682,22 @@ at 1.7 MHz was not checked against the spec text); the receiver reads either.
 The T2 channel view's impulse response is drawn from the symbols' early
 window start (128 samples: 69 µs at 1.7 MHz, 14 µs at 8 MHz), as before; the
 echoes' relative delays are right.
+
+## The signal card holds its lock and names the network (2026-10-27)
+
+- **The card holds for 5 s** (`CARD_HOLD`, `shown_card`): on a marginal signal
+  the TPS lock comes and goes, and the card flipped several times a second
+  between the locked card (mode, margin, effective C/N, detail rows) and the
+  greyed "DVB-T / T2" searching card. The last card that had a lock is now kept
+  for 5 s after the lock is lost, with the channel, frequency and running state
+  live; retuning, changing source or stopping the decoder clears it. Checked on
+  a simulated marginal signal (`modulate --cn 3 --profile urban --fd 6`): the
+  mode-only hold still flipped the C/N source and dropped rows in a fifth of
+  the samples, the whole-card hold in none. Not yet judged on air for long.
+- **The NIT's network name beside the standard**: the title bar reads
+  "DVB-T · London". A DVB-T signal carries no transmitter name; the NIT's
+  network name is the closest thing (on UK Freeview the transmitter's region).
+  Only a London NIT has been seen.
+- Portable builds: `RUSTFLAGS="-C target-feature=+crt-static"` with
+  `--target x86_64-pc-windows-msvc` links the C runtime statically (no Visual
+  C++ redistributable); the earlier releases' exes did need it.
