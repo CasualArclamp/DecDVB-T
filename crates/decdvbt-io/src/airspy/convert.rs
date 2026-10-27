@@ -177,11 +177,13 @@ impl RealToIq {
         {
             let ev = &mut self.ev[EV_HIST..EV_HIST + m];
             let od = &mut self.od[OD_DELAY..OD_DELAY + m];
-            for ((g, e), o) in self.raw[..n]
-                .chunks_exact(4)
-                .zip(ev.chunks_exact_mut(2))
-                .zip(od.chunks_exact_mut(2))
-            {
+            // `as_chunks` views the slice as `&[[T; N]]` (the length is in the
+            // type, so no bounds checks inside the loop); `m` and `n` are
+            // multiples of the chunk size, so no remainder is left over.
+            let (groups, _) = self.raw[..n].as_chunks::<4>();
+            let (ev, _) = ev.as_chunks_mut::<2>();
+            let (od, _) = od.as_chunks_mut::<2>();
+            for ((g, e), o) in groups.iter().zip(ev.iter_mut()).zip(od.iter_mut()) {
                 e[0] = -(g[0] as f32 - dc) * SCALE;
                 o[0] = -(g[1] as f32 - dc) * SCALE;
                 e[1] = (g[2] as f32 - dc) * SCALE;
@@ -230,7 +232,8 @@ impl RealToIq {
 /// in `airspy.c`). `out.len()` must be `8 * bytes.len() / 12`.
 pub fn unpack_12bit(bytes: &[u8], out: &mut [u16]) {
     let (words, _) = bytes.as_chunks::<12>();
-    for (w, o) in words.iter().zip(out.chunks_exact_mut(8)) {
+    let (outs, _) = out.as_chunks_mut::<8>();
+    for (w, o) in words.iter().zip(outs.iter_mut()) {
         let w0 = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
         let w1 = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
         let w2 = u32::from_le_bytes([w[8], w[9], w[10], w[11]]);
@@ -503,7 +506,7 @@ mod tests {
     /// `unpack_12bit`).
     fn pack(s: &[u16]) -> Vec<u8> {
         let mut out = Vec::new();
-        for o in s.chunks_exact(8) {
+        for o in s.as_chunks::<8>().0 {
             let o: Vec<u32> = o.iter().map(|&v| v as u32 & 0xfff).collect();
             let w0 = (o[0] << 20) | (o[1] << 8) | (o[2] >> 4);
             let w1 = (o[2] << 28) | (o[3] << 16) | (o[4] << 4) | (o[5] >> 8);
@@ -544,8 +547,10 @@ mod tests {
     fn packed_and_unpacked_convert_alike() {
         let x = tone(3.2e6, 0.6, 8 * 5000);
         let raw: Vec<u16> = adc_bytes(&x)
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| u16::from_le_bytes(b))
             .collect();
         let (mut a, mut b) = (Vec::new(), Vec::new());
         RealToIq::new().process_unpacked(&adc_bytes(&x), &mut a);
