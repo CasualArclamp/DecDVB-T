@@ -47,7 +47,7 @@ use decdvbt_io::name_hint;
 use decdvbt_rx::auto::Standard;
 use decdvbt_rx::receiver::ReceiverStatus;
 use decdvbt_rx::sounder::Geometry;
-use decdvbt_rx::t2::receiver::T2Status;
+use decdvbt_rx::t2::receiver::{T2Status, s1_name};
 use decdvbt_ts::{Epg, TsTap};
 use eframe::egui::{self, Color32, RichText};
 use source::{AirGains, Gains, Preset, Session, Spec};
@@ -479,6 +479,9 @@ struct App {
     /// receiver's own status (`dec` then holds the common figures).
     standard: Standard,
     dec2: Option<Box<T2Status>>,
+    /// The S1 of a T2 P1 seen whose frames are not decoded (MISO, T2-Lite):
+    /// the card says so while nothing locks.
+    t2_unsupported: Option<u8>,
     dec_packets: u64,
     dec_rate: Option<(u64, Instant, f64)>,
     started: Instant,
@@ -704,6 +707,7 @@ impl App {
             card_held: None,
             standard: Standard::Searching,
             dec2: None,
+            t2_unsupported: None,
             dec_packets: 0,
             dec_rate: None,
             stats: Stats::default(),
@@ -867,7 +871,7 @@ impl App {
                 self.decoder_sent = None;
                 self.dec = ReceiverStatus::default();
                 self.card_held = None;
-                (self.standard, self.dec2) = (Standard::Searching, None);
+                (self.standard, self.dec2, self.t2_unsupported) = (Standard::Searching, None, None);
                 self.dec_packets = 0;
                 self.dec_rate = None;
                 self.reset_stream();
@@ -983,7 +987,7 @@ impl App {
         self.bandwidth = bw;
         self.reset_stream();
         self.dec = ReceiverStatus::default();
-        (self.standard, self.dec2) = (Standard::Searching, None);
+        (self.standard, self.dec2, self.t2_unsupported) = (Standard::Searching, None, None);
         let rates = rates_for(bw);
         if !rates.contains(&self.rate_msps) {
             self.rate_msps = rates[0];
@@ -1033,7 +1037,7 @@ impl App {
             if want.is_none() {
                 self.dec = ReceiverStatus::default();
                 self.card_held = None;
-                (self.standard, self.dec2) = (Standard::Searching, None);
+                (self.standard, self.dec2, self.t2_unsupported) = (Standard::Searching, None, None);
                 self.dec_packets = 0;
                 self.dec_rate = None;
                 self.reset_stream();
@@ -1568,6 +1572,7 @@ impl App {
             self.dec = u.status;
             self.standard = u.standard;
             self.dec2 = u.t2;
+            self.t2_unsupported = u.t2_unsupported;
             self.dec_packets = u.packets;
             if self.bottom == Bottom::Maps {
                 if let Some(c) = &u.scopes {
@@ -1740,6 +1745,11 @@ impl App {
         if let (Standard::Dvbt2, Some(t2), true) = (self.standard, &self.dec2, self.decode) {
             return self.t2_card(t2);
         }
+        // Nothing locked, but the T2 receiver has seen P1 symbols of frames it
+        // does not decode: say so, rather than wait for a lock that will not come.
+        if let (Some(s1), None, None, true) = (self.t2_unsupported, read, locked, self.decode) {
+            return self.unsupported_t2_card(s1);
+        }
         let mut details = match (mode, locked) {
             (Some(m), _) => mode_details(&m),
             (None, Some(g)) => lock_details(&g, self.chan_view.status.cfo_hz),
@@ -1784,6 +1794,7 @@ impl App {
             freq_hz: self.vfo_hz,
             active: self.session.is_some(),
             network: self.network_name(),
+            note: None,
         }
     }
 
@@ -1792,6 +1803,25 @@ impl App {
     fn network_name(&self) -> Option<String> {
         let name = self.ts.report.network.name.as_deref()?.trim();
         (self.decode && !name.is_empty()).then(|| name.to_string())
+    }
+
+    /// The card for a DVB-T2 signal whose P1 symbols announce frames the
+    /// receiver does not decode (S1 `s1`: MISO or T2-Lite).
+    fn unsupported_t2_card(&self, s1: u8) -> card::Card {
+        let kind = s1_name(s1);
+        card::Card {
+            standard: Some(card::Standard::DvbT2),
+            note: Some(format!(
+                "This multiplex is {kind} (P1 S1 = {s1}), which DecDVB-T does not \
+                 decode yet: it decodes SISO T2 frames only, so it will not lock."
+            )),
+            cn_db: self.cn_db,
+            cn_source: "spectrum",
+            channel: self.card_channel(),
+            freq_hz: self.vfo_hz,
+            active: self.session.is_some(),
+            ..card::Card::default()
+        }
     }
 
     /// The card for a DVB-T2 lock.
@@ -1820,6 +1850,7 @@ impl App {
             freq_hz: self.vfo_hz,
             active: self.session.is_some(),
             network: self.network_name(),
+            note: None,
         }
     }
 

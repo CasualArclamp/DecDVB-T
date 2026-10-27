@@ -80,6 +80,9 @@ pub struct Card {
     /// The network the NIT names (UK Freeview: the transmitter's region,
     /// "London"), shown beside the standard.
     pub network: Option<String>,
+    /// Why there is no mode, shown in place of the details (a signal the
+    /// receiver sees but does not decode).
+    pub note: Option<String>,
 }
 
 /// A margin's colour: red below 0 dB, amber within 1 dB, else green.
@@ -250,11 +253,16 @@ pub fn show(ui: &mut Ui, c: &Card) {
 
     // ---- the rest of the mode: pairs of label and value, two pairs a row
     ui.add_space(6.0);
+    if let Some(note) = &c.note {
+        ui.label(RichText::new(note).size(12.0).color(HEALTH_WARN));
+        return;
+    }
     if c.details.is_empty() {
         if c.active {
             ui.label(
                 RichText::new(
-                    "FFT size, guard interval and code rate are read from the TPS once                      the receiver locks.",
+                    "FFT size, guard interval and code rate are read from the TPS \
+                     (DVB-T) or L1 (DVB-T2) once the receiver locks.",
                 )
                 .size(12.0)
                 .weak(),

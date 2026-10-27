@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use decdvbt_core::channel::{uhf_centre_hz, uhf_channel_at};
 use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_rx::auto::{AutoReceiver, Standard};
+use decdvbt_rx::t2::receiver::s1_name;
 use decdvbt_ts::TS_LEN;
 use decdvbt_ts::dsmcc::ObjectCarousel;
 use decdvbt_ts::psi::TsAnalyser;
@@ -353,7 +354,8 @@ pub fn run(a: DecodeArgs) -> Result<()> {
         let p = &st.profile;
         let pct = |d: Duration| 100.0 * d.as_secs_f64() / signal_s;
         println!(
-            "where the time went (% of real time, one core): acquire {:.1}, read symbols {:.1},              equalise {:.1}, TPS {:.1}, demap {:.1}, Viterbi {:.1}, outer {:.1}",
+            "where the time went (% of real time, one core): acquire {:.1}, read symbols {:.1}, \
+             equalise {:.1}, TPS {:.1}, demap {:.1}, Viterbi {:.1}, outer {:.1}",
             pct(p.acquire),
             pct(p.read),
             pct(p.equalise),
@@ -366,9 +368,17 @@ pub fn run(a: DecodeArgs) -> Result<()> {
     if !st.tracking {
         let t2 = rx.dvbt2();
         println!(
-            "no DVB-T lock: {} attempts, best cyclic-prefix contrast {:.1} (a lock needs 5);              no DVB-T2 lock either: {} attempts, {} without a P1 symbol, {} with one whose L1 could not be read",
+            "no DVB-T lock: {} attempts, best cyclic-prefix contrast {:.1} (a lock needs 5); \
+             no DVB-T2 lock either: {} attempts, {} without a P1 symbol, {} with one whose L1 \
+             could not be read",
             st.attempts, st.contrast, t2.attempts, t2.acq_no_p1, t2.acq_no_l1
         );
+        if let Some(s1) = t2.p1_unsupported {
+            println!(
+                "the signal's P1 symbols say {} (S1 = {s1}): only SISO T2 frames are decoded",
+                s1_name(s1)
+            );
+        }
         return Ok(());
     }
     println!(

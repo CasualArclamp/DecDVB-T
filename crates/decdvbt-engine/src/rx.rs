@@ -158,6 +158,8 @@ struct DecoderOut {
     /// Which standard has the lock, and the T2 receiver's status with it.
     standard: Standard,
     t2: Option<Box<T2Status>>,
+    /// See [`DecoderUpdate::t2_unsupported`].
+    t2_unsupported: Option<u8>,
     /// Packets made since the receiver was started.
     packets: u64,
     scopes: Option<Arc<Scopes>>,
@@ -218,6 +220,10 @@ pub struct DecoderUpdate {
     /// The standard locked on, and, if it is T2, that receiver's own status.
     pub standard: Standard,
     pub t2: Option<Box<T2Status>>,
+    /// While nothing has the lock: the S1 of a T2 P1 symbol seen whose frames
+    /// the T2 receiver does not decode (MISO, T2-Lite; see
+    /// `T2Status::p1_unsupported`), so the GUI can say why there is no lock.
+    pub t2_unsupported: Option<u8>,
     /// Transport packets decoded since the receiver was started.
     pub packets: u64,
     /// The scopes' cells and the measurements, if new ones have been made
@@ -360,6 +366,7 @@ impl Rx {
             status: o.status.clone(),
             standard: o.standard,
             t2: o.t2.clone(),
+            t2_unsupported: o.t2_unsupported,
             packets: o.packets,
             scopes: o.scopes.take(),
             measurements: o.measurements.take(),
@@ -694,6 +701,7 @@ fn run(
                 o.status = d.status();
                 o.standard = d.standard();
                 o.t2 = (d.standard() == Standard::Dvbt2).then(|| Box::new(d.dvbt2().clone()));
+                o.t2_unsupported = d.dvbt2().p1_unsupported;
                 o.packets += packets;
                 if let Some(s) = d.take_scopes() {
                     o.scopes = Some(Arc::new(s));
