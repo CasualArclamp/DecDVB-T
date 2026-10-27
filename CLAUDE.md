@@ -21,6 +21,8 @@ cargo run --release -p decdvbt-cli -- decode captures/c23_490.000MHz_10Msps_amp.
 cargo run --release -p decdvbt-cli -- decode out/c23.ts --carousel 4416 out/rb   # a .ts as it is; service 4416's DSM-CC carousel (Red Button) to a folder
 cargo run --release -p decdvbt-mheg --example redbutton -- out/live_c30.ts --sid 17536 --keys wait,100,wait,15 --png out/rb.png   # a service's MHEG-5 app, headless (--trace)
 cargo run --release -p decdvbt-cli -- capture C23 --amp --lna 32 --vga 8 --record x.cs8  # the RF amp must be on for DVB-T
+cargo run --release -p decdvbt-cli -- decode C23 --radio airspy -o out/c23.ts   # Airspy R2 (10 MS/s only; --airspy-preset sensitivity:10|linearity:N, --airspy-lna/-mixer/-vga, --airspy-packed)
+cargo run --release -p decdvbt-io --features airspy --example airspy_convert_bench   # the Airspy real-to-IQ converter: ns per sample
 cargo run --release -p decdvbt-rx --example diag -- x.cs8   # per-symbol equaliser diagnostics (see its header)
 cargo run --release -p decdvbt-rx --example doppler -- x.cs8 9 1.5   # from 9 s for 1.5 s: Doppler spectrum of the pilots, the Rician fit, MER (env MOBILE=0|1 DENOISE=0|1, FIT, FINE)
 cargo run --release -p decdvbt-cli -- modulate --profile ra6 --fd 35 --k-db 6 --cn 26 x.cs8   # a moving vehicle: Rician fading (--k-db) at 35 Hz; decode with env DECDVBT_MOBILE / DECDVBT_DENOISE =0|1 to force the estimator
