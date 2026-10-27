@@ -57,7 +57,7 @@ impl Standard {
 }
 
 /// What the card shows.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Card {
     /// `None` until the receiver knows which.
     pub standard: Option<Standard>,

@@ -68,6 +68,11 @@ const SMOOTH_FPS: f64 = 45.0;
 /// [`SNAP_HZ`] of one is taken to be on it.
 const PLAN_OFFSETS_HZ: [f64; 5] = [-333_333.0, -166_667.0, 0.0, 166_667.0, 333_333.0];
 const SNAP_HZ: f64 = 40e3;
+/// How long the signal card keeps showing the last card that had a lock after
+/// the receiver loses it: on a weak signal the lock comes and goes, and a mode
+/// once read is very unlikely to change, so the card holds it (with its
+/// figures) rather than flicker between the mode and "searching".
+const CARD_HOLD: Duration = Duration::from_secs(5);
 /// The display rates the list offers.
 const FPS_CHOICES: [f64; 6] = [5.0, 10.0, 15.0, 20.0, 30.0, 60.0];
 /// HackRF sample rates with the least clock jitter that hold a channel.
@@ -468,6 +473,8 @@ struct App {
     decode: bool,
     decoder_sent: Option<Option<f64>>,
     dec: ReceiverStatus,
+    /// The last card that had a lock, and when (see `CARD_HOLD`).
+    card_held: Option<(Instant, card::Card)>,
     /// Which standard the receiver has locked on, and with a T2 lock that
     /// receiver's own status (`dec` then holds the common figures).
     standard: Standard,
@@ -694,6 +701,7 @@ impl App {
             decode: opts.decode,
             decoder_sent: None,
             dec: ReceiverStatus::default(),
+            card_held: None,
             standard: Standard::Searching,
             dec2: None,
             dec_packets: 0,
@@ -858,6 +866,7 @@ impl App {
                 self.sounder_sent = None;
                 self.decoder_sent = None;
                 self.dec = ReceiverStatus::default();
+                self.card_held = None;
                 (self.standard, self.dec2) = (Standard::Searching, None);
                 self.dec_packets = 0;
                 self.dec_rate = None;
@@ -1023,6 +1032,7 @@ impl App {
             self.decoder_sent = Some(want);
             if want.is_none() {
                 self.dec = ReceiverStatus::default();
+                self.card_held = None;
                 (self.standard, self.dec2) = (Standard::Searching, None);
                 self.dec_packets = 0;
                 self.dec_rate = None;
@@ -1183,6 +1193,7 @@ impl App {
         self.channel_text = format!("C{n}");
         self.tune_hz = fc;
         self.tuned_at = Instant::now();
+        self.card_held = None;
         self.centre_checked = false;
         self.centre_tries = 0;
         let fits = self.span_hz > 0.0
@@ -1242,6 +1253,7 @@ impl App {
         self.cancel_optimiser();
         self.tune_hz = hz;
         self.tuned_at = Instant::now();
+        self.card_held = None;
         self.centre_checked = true;
         if let Some(ch) = uhf_channel_at(hz) {
             self.channel = ch;
@@ -1670,6 +1682,27 @@ impl App {
                     self.cn_db = None;
                 }
             }
+        }
+    }
+
+    /// The card to show: the live one, or the last that had a lock while the
+    /// receiver has been without one for under `CARD_HOLD`. Only the lock's own
+    /// figures are held; the channel, frequency and "running" follow the live
+    /// card.
+    fn shown_card(&mut self) -> card::Card {
+        let live = self.card();
+        if live.standard.is_some() && live.name.is_some() && !live.assumed {
+            self.card_held = Some((Instant::now(), live.clone()));
+            return live;
+        }
+        match &self.card_held {
+            Some((at, held)) if self.decode && at.elapsed() < CARD_HOLD => card::Card {
+                channel: live.channel,
+                freq_hz: live.freq_hz,
+                active: live.active,
+                ..held.clone()
+            },
+            _ => live,
         }
     }
 
@@ -2236,7 +2269,8 @@ impl App {
 
     fn services_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
-        card::show(ui, &self.card());
+        let card = self.shown_card();
+        card::show(ui, &card);
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Services").strong());
