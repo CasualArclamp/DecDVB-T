@@ -1,6 +1,6 @@
 // made by CasualArclamp
-//! Opening a source and running the engine on it: the HackRF at a channel, or
-//! a recorded IQ file.
+//! Opening a source and running the engine on it: the HackRF or the Airspy R2
+//! at a channel, or a recorded IQ file.
 
 use std::path::PathBuf;
 
@@ -32,9 +32,98 @@ impl Default for Gains {
     }
 }
 
+/// The Airspy R2's three gain stages (LNA 0–14, mixer 0–15, VGA 0–15; both
+/// AGCs are off). Plain data here so the app and the prefs need not know
+/// whether the build has the radio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AirGains {
+    pub lna: u8,
+    pub mixer: u8,
+    pub vga: u8,
+}
+
+impl Default for AirGains {
+    /// libairspy's sensitivity preset 10 (untested on a real aerial).
+    fn default() -> Self {
+        Preset::DEFAULT.gains()
+    }
+}
+
+/// libairspy's one-knob gain presets, step 0–21.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Preset {
+    pub linearity: bool,
+    pub step: u8,
+}
+
+impl Preset {
+    pub const DEFAULT: Preset = Preset {
+        linearity: false,
+        step: 10,
+    };
+
+    pub fn gains(self) -> AirGains {
+        #[cfg(feature = "airspy")]
+        {
+            let g = if self.linearity {
+                decdvbt_io::AirspyGains::linearity(self.step)
+            } else {
+                decdvbt_io::AirspyGains::sensitivity(self.step)
+            };
+            AirGains {
+                lna: g.lna,
+                mixer: g.mixer,
+                vga: g.vga,
+            }
+        }
+        // Sensitivity 10, for a build without the Airspy driver.
+        #[cfg(not(feature = "airspy"))]
+        AirGains {
+            lna: 12,
+            mixer: 4,
+            vga: 5,
+        }
+    }
+
+    /// `sensitivity:10` / `linearity:3`, as kept in the prefs.
+    pub fn key(self) -> String {
+        format!(
+            "{}:{}",
+            if self.linearity {
+                "linearity"
+            } else {
+                "sensitivity"
+            },
+            self.step
+        )
+    }
+
+    pub fn parse(s: &str) -> Option<Preset> {
+        let (kind, n) = s.split_once(':')?;
+        let step: u8 = n.parse().ok().filter(|n| *n <= 21)?;
+        match kind {
+            "linearity" => Some(Preset {
+                linearity: true,
+                step,
+            }),
+            "sensitivity" => Some(Preset {
+                linearity: false,
+                step,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// What to open.
 #[derive(Debug, Clone)]
 pub enum Spec {
+    #[cfg_attr(not(feature = "airspy"), allow(dead_code))]
+    Airspy {
+        center_hz: f64,
+        gains: AirGains,
+        packed: bool,
+    },
     HackRf {
         center_hz: f64,
         rate_hz: f64,
@@ -49,12 +138,14 @@ pub enum Spec {
 
 type GainSetter = Box<dyn Fn(Gains) -> Result<(), String>>;
 type Setter<T> = Box<dyn Fn(T) -> Result<(), String>>;
+type AirGainSetter = Setter<AirGains>;
 
 /// A running source.
 pub struct Session {
     pub rx: Rx,
     pub live: bool,
     set_gains: Option<GainSetter>,
+    set_air_gains: Option<AirGainSetter>,
     set_filter: Option<Setter<Option<f32>>>,
     set_ppm: Option<Setter<f32>>,
 }
@@ -62,6 +153,51 @@ pub struct Session {
 impl Session {
     pub fn open(spec: &Spec) -> Result<Session, String> {
         match spec {
+            #[cfg(feature = "airspy")]
+            Spec::Airspy {
+                center_hz,
+                gains,
+                packed,
+            } => {
+                use decdvbt_io::{AirspyGains, AirspySettings, AirspySource};
+                let src = AirspySource::open(AirspySettings {
+                    center_hz: center_hz.round() as u64,
+                    sample_rate: 10_000_000,
+                    gains: AirspyGains {
+                        lna: gains.lna,
+                        mixer: gains.mixer,
+                        vga: gains.vga,
+                    },
+                    packed: *packed,
+                })
+                .map_err(|e| e.to_string())?;
+                let ctl = src.control();
+                let probe = ctl.clone();
+                let rx = Rx::start(
+                    Box::new(src),
+                    RxOptions::default(),
+                    Some(Box::new(move || probe.overflows())),
+                );
+                Ok(Session {
+                    rx,
+                    live: true,
+                    set_gains: None,
+                    set_air_gains: Some(Box::new(move |g| {
+                        ctl.set_gains(AirspyGains {
+                            lna: g.lna,
+                            mixer: g.mixer,
+                            vga: g.vga,
+                        })
+                        .map_err(|e| e.to_string())
+                    })),
+                    // The HackRF's baseband filter and clock trim do not
+                    // exist on this radio.
+                    set_filter: None,
+                    set_ppm: None,
+                })
+            }
+            #[cfg(not(feature = "airspy"))]
+            Spec::Airspy { .. } => Err("built without the airspy feature".into()),
             #[cfg(feature = "hackrf")]
             Spec::HackRf {
                 center_hz,
@@ -90,6 +226,7 @@ impl Session {
                 Ok(Session {
                     rx,
                     live: true,
+                    set_air_gains: None,
                     set_gains: Some(Box::new(move |g| {
                         ctl.set_gains(decdvbt_io::HackRfGains {
                             amp: g.amp,
@@ -124,6 +261,7 @@ impl Session {
                     rx: Rx::start(src, RxOptions::default(), None),
                     live: false,
                     set_gains: None,
+                    set_air_gains: None,
                     set_filter: None,
                     set_ppm: None,
                 })
@@ -141,11 +279,53 @@ impl Session {
         self.set_ppm.as_ref().map_or(Ok(()), |f| f(ppm))
     }
 
-    /// Change the HackRF's gains (no-op for a file).
+    /// Change the Airspy's gains (no-op for any other source).
+    pub fn set_air_gains(&self, g: AirGains) -> Result<(), String> {
+        self.set_air_gains.as_ref().map_or(Ok(()), |f| f(g))
+    }
+
+    /// Change the HackRF's gains (no-op for a file or the Airspy).
     pub fn set_gains(&self, g: Gains) -> Result<(), String> {
         match &self.set_gains {
             Some(f) => f(g),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_round_trip_through_their_key() {
+        for p in [
+            Preset::DEFAULT,
+            Preset {
+                linearity: true,
+                step: 0,
+            },
+            Preset {
+                linearity: false,
+                step: 21,
+            },
+        ] {
+            assert_eq!(Preset::parse(&p.key()), Some(p));
+        }
+        assert_eq!(Preset::parse("sensitivity:22"), None);
+        assert_eq!(Preset::parse("loud:1"), None);
+        assert_eq!(Preset::parse(""), None);
+    }
+
+    #[test]
+    fn the_default_is_sensitivity_ten() {
+        assert_eq!(
+            AirGains::default(),
+            AirGains {
+                lna: 12,
+                mixer: 4,
+                vga: 5
+            }
+        );
     }
 }
