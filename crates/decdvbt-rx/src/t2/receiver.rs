@@ -132,6 +132,24 @@ impl T2Status {
     }
 }
 
+/// What a P1 symbol's S1 field announces (EN 302 755 §7.2.1, Table 1).
+pub fn s1_name(s1: u8) -> &'static str {
+    match s1 {
+        0 => "T2 SISO",
+        1 => "T2 MISO",
+        2 => "non-T2 (FEF)",
+        3 => "T2-Lite SISO",
+        4 => "T2-Lite MISO",
+        _ => "reserved",
+    }
+}
+
+/// S1 codes of frames this receiver does not decode: MISO, and T2-Lite
+/// (whose rates 1/3 and 2/5 and limits it does not handle).
+fn s1_unsupported(s1: u8) -> bool {
+    matches!(s1, 1 | 3 | 4)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct T2Status {
     /// The channel's width the receiver was set to.
@@ -173,6 +191,10 @@ pub struct T2Status {
     /// T2's (or that no L1 could be read from).
     pub acq_no_p1: u32,
     pub acq_no_l1: u32,
+    /// The S1 of the last clean P1 symbol skipped because this receiver does
+    /// not decode what it announces (MISO, T2-Lite: see [`s1_name`]); cleared
+    /// by a lock. A signal that only ever sets this will never lock.
+    pub p1_unsupported: Option<u8>,
     pub profile: T2Profile,
     /// The FEC stage's threads at work and the share of a frame's period the
     /// last frame took on them.
@@ -523,7 +545,16 @@ impl T2Receiver {
                 continue;
             };
             // T2 SISO only (S1 0); the FFT size from S2's first field.
-            if info.s1 != 0 || info.quality < 0.6 {
+            if info.quality < 0.6 {
+                continue;
+            }
+            if info.s1 != 0 {
+                // A FEF's P1 (S1 2) sits between T2 frames that do lock, and
+                // reserved codes are misreads; MISO and T2-Lite are frames this
+                // receiver cannot decode, and the user should be told so.
+                if s1_unsupported(info.s1) {
+                    self.status.p1_unsupported = Some(info.s1);
+                }
                 continue;
             }
             let Some(fft) = Fft::from_s2_code(info.s2 >> 1) else {
@@ -551,6 +582,7 @@ impl T2Receiver {
             self.status.plp = plp;
             self.status.tracking = true;
             self.status.l1_ok = true;
+            self.status.p1_unsupported = None;
             self.status.locks += 1;
             self.status.cfo_hz = cfo;
             self.track = Some(Track {

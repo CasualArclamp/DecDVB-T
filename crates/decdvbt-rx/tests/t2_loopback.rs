@@ -163,3 +163,40 @@ fn noise_alone_gives_no_lock() {
     assert_eq!(rx.status().locks, 0);
     assert!(rx.status().attempts >= 1);
 }
+
+/// P1 symbols every 250 ms (a T2 frame's period) announcing S1 at the native
+/// rate, in noise 20 dB down, for two seconds.
+fn p1_only(s1: u8) -> T2Receiver {
+    let fs = 64e6 / 7.0;
+    let p = decdvbt_mod::t2::p1_symbol(s1, decdvbt_ofdm::t2::p1::s2_value(3, 0));
+    let mut seed = 11u32;
+    let mut g = move || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.35
+    };
+    let mut y: Vec<Iq> = (0..(2.0 * fs) as usize).map(|_| Iq::new(g(), g())).collect();
+    let period = (0.25 * fs) as usize;
+    for start in (1000..y.len() - p.len()).step_by(period) {
+        for (i, v) in p.iter().enumerate() {
+            y[start + i] += *v;
+        }
+    }
+    let mut rx = T2Receiver::new(RxConfig::new(fs, 0.0));
+    let mut pos = 0u64;
+    for b in y.chunks(100_000) {
+        rx.push(b, pos);
+        pos += b.len() as u64;
+    }
+    rx
+}
+
+#[test]
+fn miso_and_t2_lite_p1_symbols_are_reported_not_locked() {
+    for s1 in [1u8, 3, 4] {
+        let rx = p1_only(s1);
+        assert_eq!(rx.status().locks, 0, "S1 {s1}");
+        assert_eq!(rx.status().p1_unsupported, Some(s1), "S1 {s1}");
+    }
+    // A FEF's P1 between T2 frames is not a reason to give up on the signal.
+    assert_eq!(p1_only(2).status().p1_unsupported, None);
+}
