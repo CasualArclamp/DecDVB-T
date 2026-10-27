@@ -68,6 +68,10 @@ const SMOOTH_FPS: f64 = 45.0;
 /// [`SNAP_HZ`] of one is taken to be on it.
 const PLAN_OFFSETS_HZ: [f64; 5] = [-333_333.0, -166_667.0, 0.0, 166_667.0, 333_333.0];
 const SNAP_HZ: f64 = 40e3;
+/// How long the mode read from the TPS stays on the card after the receiver
+/// loses the TPS: on a weak signal the lock comes and goes, and a mode once
+/// read is very unlikely to change, so the card keeps it rather than flicker.
+const TPS_HOLD: Duration = Duration::from_secs(5);
 /// The display rates the list offers.
 const FPS_CHOICES: [f64; 6] = [5.0, 10.0, 15.0, 20.0, 30.0, 60.0];
 /// HackRF sample rates with the least clock jitter that hold a channel.
@@ -468,6 +472,8 @@ struct App {
     decode: bool,
     decoder_sent: Option<Option<f64>>,
     dec: ReceiverStatus,
+    /// The last mode read from the TPS and when (see `TPS_HOLD`).
+    tps_held: Option<(Instant, Mode)>,
     /// Which standard the receiver has locked on, and with a T2 lock that
     /// receiver's own status (`dec` then holds the common figures).
     standard: Standard,
@@ -694,6 +700,7 @@ impl App {
             decode: opts.decode,
             decoder_sent: None,
             dec: ReceiverStatus::default(),
+            tps_held: None,
             standard: Standard::Searching,
             dec2: None,
             dec_packets: 0,
@@ -858,6 +865,7 @@ impl App {
                 self.sounder_sent = None;
                 self.decoder_sent = None;
                 self.dec = ReceiverStatus::default();
+                self.tps_held = None;
                 (self.standard, self.dec2) = (Standard::Searching, None);
                 self.dec_packets = 0;
                 self.dec_rate = None;
@@ -1023,6 +1031,7 @@ impl App {
             self.decoder_sent = Some(want);
             if want.is_none() {
                 self.dec = ReceiverStatus::default();
+                self.tps_held = None;
                 (self.standard, self.dec2) = (Standard::Searching, None);
                 self.dec_packets = 0;
                 self.dec_rate = None;
@@ -1183,6 +1192,7 @@ impl App {
         self.channel_text = format!("C{n}");
         self.tune_hz = fc;
         self.tuned_at = Instant::now();
+        self.tps_held = None;
         self.centre_checked = false;
         self.centre_tries = 0;
         let fits = self.span_hz > 0.0
@@ -1242,6 +1252,7 @@ impl App {
         self.cancel_optimiser();
         self.tune_hz = hz;
         self.tuned_at = Instant::now();
+        self.tps_held = None;
         self.centre_checked = true;
         if let Some(ch) = uhf_channel_at(hz) {
             self.channel = ch;
@@ -1556,6 +1567,9 @@ impl App {
             self.dec = u.status;
             self.standard = u.standard;
             self.dec2 = u.t2;
+            if let Some(m) = self.read_mode() {
+                self.tps_held = Some((Instant::now(), m));
+            }
             self.dec_packets = u.packets;
             if self.bottom == Bottom::Maps {
                 if let Some(c) = &u.scopes {
@@ -1673,6 +1687,28 @@ impl App {
         }
     }
 
+    /// The mode the receiver is reading from the TPS right now.
+    fn read_mode(&self) -> Option<Mode> {
+        self.dec
+            .tps
+            .filter(|_| self.dec.tps_synced && self.decode)
+            .map(|t| {
+                let mut m = Mode::uk(t.modulation, t.rate_hp);
+                m.fft = t.fft;
+                m.guard = t.guard;
+                m.rate_lp = t.rate_lp;
+                m.alpha = t.alpha;
+                m
+            })
+    }
+
+    /// The last mode read, while it is under `TPS_HOLD` old.
+    fn held_mode(&self) -> Option<Mode> {
+        self.tps_held
+            .filter(|(at, _)| at.elapsed() < TPS_HOLD && self.decode)
+            .map(|(_, m)| m)
+    }
+
     fn card(&self) -> card::Card {
         // What the receiver has read from the TPS wins, then what the sounder
         // has read of the signal (the FFT size and the guard interval), then
@@ -1682,21 +1718,7 @@ impl App {
             .status
             .geometry
             .filter(|_| self.chan_view.status.tracking);
-        let tps = self.dec.tps.filter(|_| self.dec.tps_synced && self.decode);
-        let read: Option<Mode> = tps.map(|t| {
-            let mut m = Mode::uk(t.modulation, t.rate_hp);
-            // The TPS does not say the width: it is the one the receiver runs at.
-            m.bandwidth = if self.bandwidth.dvbt() {
-                self.bandwidth
-            } else {
-                Bandwidth::Mhz8
-            };
-            m.fft = t.fft;
-            m.guard = t.guard;
-            m.rate_lp = t.rate_lp;
-            m.alpha = t.alpha;
-            m
-        });
+        let read: Option<Mode> = self.read_mode().or_else(|| self.held_mode());
         let mut mode = read.or(self.opts.assume);
         if read.is_none()
             && let (Some(m), Some((fft, guard))) = (&mut mode, locked.and_then(|g| g.dvbt))
