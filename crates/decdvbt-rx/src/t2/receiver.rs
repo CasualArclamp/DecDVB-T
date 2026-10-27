@@ -13,6 +13,7 @@ use crate::tone::ToneCanceller;
 use std::time::{Duration, Instant};
 
 use decdvbt_core::Iq;
+use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_fec::t2::l1::{L1Coder, L1Mod, PRE_CELLS, PostLayout, post_llrs};
 use decdvbt_ofdm::t2::carriers::p2_roles;
 use decdvbt_ofdm::t2::l1::{L1Post, L1Pre};
@@ -30,13 +31,15 @@ use crate::t2::sounding::{FrameRows, T2Sounder};
 use crate::window::Window;
 use decdvbt_fec::t2::timeint::CellInterleaver;
 
-/// The signal's sample rate for 8 MHz channels, Hz.
+/// The signal's sample rate for 8 MHz channels, Hz (other widths: the
+/// receiver's [`T2Config::bandwidth`]).
 pub const FS_NATIVE: f64 = 64e6 / 7.0;
 /// Samples (at the signal's rate) read either side of an expected frame.
 const MARGIN: usize = 3072;
-/// A search window, in the signal's samples: a little over a long frame's
-/// duration (250 ms) and a P1 symbol, so that one P1 is in it.
-const ACQ_NATIVE: usize = 2_500_000;
+/// A search window, seconds: a little over a long frame's duration (250 ms)
+/// and a P1 symbol, so that one P1 is in it (2.5 M samples at 8 MHz, 504 k at
+/// 1.7 MHz).
+const ACQ_S: f64 = 0.2735;
 /// The wait between attempts to acquire, seconds.
 const RETRY_S: f64 = 0.2;
 /// Frames in a row with no block decoded after which the FEC only probes.
@@ -46,7 +49,8 @@ const MAX_MISSES: u32 = 3;
 /// Radio samples the window keeps behind the latest block: two margins, the
 /// interpolator's reach and room for a rate up to 20 MS/s.
 const HISTORY: usize = 32 * 1024;
-/// The search for a P1's whole carrier spacings either side (8.9 kHz each).
+/// The search for a P1's whole carrier spacings either side (1/1024 of the
+/// signal's rate each: 8.9 kHz at 8 MHz, 1.8 kHz at 1.7 MHz).
 const P1_BINS: isize = 64;
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +59,9 @@ pub struct T2Config {
     pub fs_in: f64,
     /// How far above the radio's centre the signal's centre is.
     pub vfo_offset_hz: f64,
+    /// The channel's width, which sets the signal's sample rate (nothing in
+    /// the signal says it: EN 302 755 §9.5).
+    pub bandwidth: Bandwidth,
     /// The most threads the FEC blocks are spread over (on top of the FEC
     /// stage's own thread, which hands them out); the stage uses as few as
     /// keep it to about half of real time.
@@ -72,6 +79,7 @@ impl T2Config {
         T2Config {
             fs_in,
             vfo_offset_hz,
+            bandwidth: Bandwidth::Mhz8,
             // A quarter of the machine's threads, two to four: about what a
             // 40 Mbit/s 256-QAM multiplex takes, with room to spare.
             fec_threads: (std::thread::available_parallelism().map_or(2, |n| n.get()) / 4)
@@ -120,12 +128,14 @@ impl T2Status {
     pub fn frame_period_s(&self) -> Option<f64> {
         let (mode, pre) = (self.mode.as_ref()?, self.l1pre.as_ref()?);
         let geo = Geometry::new(*mode, pre.num_data_symbols as usize);
-        Some(geo.frame_samples() as f64 / FS_NATIVE)
+        Some(geo.frame_samples() as f64 / self.bandwidth?.sample_rate_hz())
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct T2Status {
+    /// The channel's width the receiver was set to.
+    pub bandwidth: Option<Bandwidth>,
     pub tracking: bool,
     /// L1 is read and agrees with what the lock took it for.
     pub l1_ok: bool,
@@ -197,6 +207,8 @@ struct Track {
 
 pub struct T2Receiver {
     cfg: T2Config,
+    /// The signal's sample rate 1/T, Hz.
+    fs_native: f64,
     rho: f64,
     interp: Interpolator,
     win: Window,
@@ -256,16 +268,21 @@ fn rotate(y: &mut [Iq], f_hz: f64, fs: f64) {
 
 impl T2Receiver {
     pub fn new(cfg: T2Config) -> T2Receiver {
+        let fs_native = cfg.bandwidth.sample_rate_hz();
         T2Receiver {
             cfg,
-            rho: cfg.fs_in / FS_NATIVE,
+            fs_native,
+            rho: cfg.fs_in / fs_native,
             interp: Interpolator::new(),
             // The next frame's stretch starts a little before the end of this
             // one's: keep what went by.
             win: Window::with_history(HISTORY),
             track: None,
-            tone: ToneCanceller::new(cfg.fs_in, cfg.vfo_offset_hz),
-            status: T2Status::default(),
+            tone: ToneCanceller::new(cfg.fs_in, cfg.vfo_offset_hz, fs_native),
+            status: T2Status {
+                bandwidth: Some(cfg.bandwidth),
+                ..T2Status::default()
+            },
             next_attempt: 0,
             ts: Vec::new(),
             coder: L1Coder::new(),
@@ -329,7 +346,8 @@ impl T2Receiver {
     /// [`crate::t2::sounding`]): they cost a copy of the frame's channel.
     pub fn set_sounding(&mut self, on: bool) {
         if on != self.sounder.is_some() {
-            self.sounder = on.then(|| T2Sounder::new(FS_NATIVE));
+            let fs = self.fs_native;
+            self.sounder = on.then(|| T2Sounder::new(fs));
         }
     }
 
@@ -343,24 +361,20 @@ impl T2Receiver {
     /// echoes), or `None` with no lock.
     pub fn measure(&mut self) -> Option<Measurements> {
         let c = self.channel.as_ref()?;
-        Some(Self::measurements(&mut self.measure_state, c))
+        Some(Self::measurements(
+            &mut self.measure_state,
+            c,
+            self.fs_native,
+        ))
     }
 
-    fn measurements(state: &mut MeasureState, c: &ChannelEstimate) -> Measurements {
+    fn measurements(state: &mut MeasureState, c: &ChannelEstimate, fs: f64) -> Measurements {
         let hr: Vec<f32> = c.h.iter().map(|v| v.re).collect();
         let hi: Vec<f32> = c.h.iter().map(|v| v.im).collect();
         let w: Vec<f32> = c.h.iter().map(|v| v.norm_sqr()).collect();
         let noise = vec![c.noise; c.h.len()];
-        let guard_us = (c.mode.guard.samples(c.mode.fft) as f64 / FS_NATIVE * 1e6) as f32;
-        measure_channel(
-            state,
-            c.mode.fft.n(),
-            FS_NATIVE,
-            guard_us,
-            (&hr, &hi),
-            &w,
-            &noise,
-        )
+        let guard_us = (c.mode.guard.samples(c.mode.fft) as f64 / fs * 1e6) as f32;
+        measure_channel(state, c.mode.fft.n(), fs, guard_us, (&hr, &hi), &w, &noise)
     }
 
     /// Forget the lock and the stretch wanted: the stream has jumped.
@@ -451,7 +465,7 @@ impl T2Receiver {
     }
 
     fn want_acquisition(&mut self, start: u64) {
-        let len = (ACQ_NATIVE as f64 * self.rho) as usize + 2 * PAD;
+        let len = (ACQ_S * self.fs_native * self.rho) as usize + 2 * PAD;
         self.win.want(start, len);
     }
 
@@ -496,16 +510,16 @@ impl T2Receiver {
         self.y.clear();
         self.interp
             .resample_planar(self.win.planar(), PAD as f64, self.rho, n, &mut self.y);
-        rotate(&mut self.y, self.cfg.vfo_offset_hz, FS_NATIVE);
+        rotate(&mut self.y, self.cfg.vfo_offset_hz, self.fs_native);
         let base = start as f64 + PAD as f64; // the stream position of y[0]
-        let hits = p1det::find(&self.y, FS_NATIVE);
+        let hits = p1det::find(&self.y, self.fs_native);
         if hits.is_empty() {
             self.status.acq_no_p1 += 1;
             self.want_acquisition(self.next_attempt);
             return;
         }
         for hit in hits {
-            let Some(info) = p1det::read(&self.y, &hit, FS_NATIVE, P1_BINS) else {
+            let Some(info) = p1det::read(&self.y, &hit, self.fs_native, P1_BINS) else {
                 continue;
             };
             // T2 SISO only (S1 0); the FFT size from S2's first field.
@@ -522,7 +536,7 @@ impl T2Receiver {
             let data_symbols = l1pre.num_data_symbols as usize;
             let geo = Geometry::new(mode, data_symbols);
             let step = self.rho;
-            let cfo = self.cfg.vfo_offset_hz + info.cfo_hz + eps * FS_NATIVE / geo.n as f64;
+            let cfo = self.cfg.vfo_offset_hz + info.cfo_hz + eps * self.fs_native / geo.n as f64;
             // The next P1 symbol at or after the end of what has been read,
             // plus the margin the frame window opens ahead of it.
             let frame = geo.frame_samples() as f64 * step;
@@ -577,7 +591,7 @@ impl T2Receiver {
             return None;
         }
         let mut region: Vec<Iq> = self.y[region_start..region_start + region_len + 2 * n].to_vec();
-        rotate(&mut region, cfo_hz, FS_NATIVE);
+        rotate(&mut region, cfo_hz, self.fs_native);
         let offset = p2_start - region_start as f64;
         // The guards, by correlation at the first P2 symbol.
         let mut scored: Vec<(f32, Guard)> = Guard::ALL
@@ -719,13 +733,13 @@ impl T2Receiver {
             .resample_planar(self.win.planar(), idx0, t.step, native, &mut self.y);
         self.status.profile.resample += t_read.elapsed();
         let t_rot = Instant::now();
-        rotate(&mut self.y, t.cfo_hz, FS_NATIVE);
+        rotate(&mut self.y, t.cfo_hz, self.fs_native);
         self.status.profile.rotate += t_rot.elapsed();
         // P1 near where it is expected.
         let t_p1 = Instant::now();
         let lo = MARGIN.saturating_sub(2048);
         let hi = (MARGIN + 2048 + P1_SAMPLES + 64).min(self.y.len());
-        let hits = p1det::find(&self.y[lo..hi], FS_NATIVE);
+        let hits = p1det::find(&self.y[lo..hi], self.fs_native);
         self.status.profile.p1 += t_p1.elapsed();
         // P1 if it shows; if not (a weak moment, a gap in the samples), the
         // place it was expected at: the symbols' cyclic prefixes say whether
@@ -884,7 +898,7 @@ impl T2Receiver {
             if self.heat.len() >= 400 {
                 self.heat.remove(0);
             }
-            let row = Self::measurements(&mut self.measure_state, &estimate);
+            let row = Self::measurements(&mut self.measure_state, &estimate, self.fs_native);
             self.heat.push(row);
         }
         self.channel = Some(estimate);
@@ -972,7 +986,7 @@ impl T2Receiver {
                     start,
                     blocks: dynamic.plp_num_blocks as usize,
                     probe: self.dead_frames >= DEAD_FRAMES_TO_PROBE,
-                    period: Duration::from_secs_f64(t.geo.frame_samples() as f64 / FS_NATIVE),
+                    period: Duration::from_secs_f64(t.geo.frame_samples() as f64 / self.fs_native),
                 };
                 let threads = self.cfg.fec_threads;
                 let wait = !self.cfg.realtime;
@@ -1044,7 +1058,7 @@ impl T2Receiver {
         // they should means the signal's samples are `drift/sym` wider than
         // the interpolator's step takes them.
         t.step *= 1.0 + 0.5 * (timing.drift - drift_residual) / sym;
-        t.cfo_hz += 0.7 * timing.eps * FS_NATIVE / t.geo.n as f64;
+        t.cfo_hz += 0.7 * timing.eps * self.fs_native / t.geo.n as f64;
         t.next_p1 = p1_abs + t.geo.frame_samples() as f64 * t.step;
         self.status.cfo_hz = t.cfo_hz;
         self.status.clock_ppm = (t.step / self.rho - 1.0) * 1e6;

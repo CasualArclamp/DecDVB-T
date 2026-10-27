@@ -81,7 +81,7 @@ pub fn status(state: DemoState, cfg: &TxConfig, t: f64) -> TxStatus {
     let mut s = TxStatus::idle(cfg, &decdvbt_tx::Arm::new());
     let wobble = |period: f64, amp: f64| (t * std::f64::consts::TAU / period).sin() * amp;
     s.sample_rate_hz = cfg.sample_rate_hz();
-    s.ts_rate_bps = cfg.mode.bitrate_hp();
+    s.ts_rate_bps = cfg.ts_rate_bps();
     s.chain = "NVENC (CUDA)".into();
     match state {
         DemoState::Idle => {

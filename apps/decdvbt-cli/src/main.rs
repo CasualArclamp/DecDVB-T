@@ -28,6 +28,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use decdvbt_core::SampleFormat;
 use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_channels};
+use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_engine::{Command as RxCommand, CpuGauge, Rx, RxOptions, Stage, spectral_cn_db};
 use decdvbt_io::{IqFileReader, IqSource, format_from_path, name_hint};
 
@@ -193,7 +194,8 @@ fn capture(
         for r in rx.take_rows() {
             rows += 1;
             let vfo = uhf_channel_at(r.center_hz).and_then(uhf_centre_hz);
-            if let Some(e) = vfo.and_then(|v| spectral_cn_db(&r.db, r.center_hz, r.sample_rate, v))
+            if let Some(e) = vfo
+                .and_then(|v| spectral_cn_db(&r.db, r.center_hz, r.sample_rate, v, Bandwidth::Mhz8))
             {
                 cn = Some(cn.map_or(e, |c| c + 0.1 * (e - c)));
             }

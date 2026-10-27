@@ -27,6 +27,9 @@ cargo run --release -p decdvbt-rx --example diag -- x.cs8   # per-symbol equalis
 cargo run --release -p decdvbt-rx --example doppler -- x.cs8 9 1.5   # from 9 s for 1.5 s: Doppler spectrum of the pilots, the Rician fit, MER (env MOBILE=0|1 DENOISE=0|1, FIT, FINE)
 cargo run --release -p decdvbt-cli -- modulate --profile ra6 --fd 35 --k-db 6 --cn 26 x.cs8   # a moving vehicle: Rician fading (--k-db) at 35 Hz; decode with env DECDVBT_MOBILE / DECDVBT_DENOISE =0|1 to force the estimator
 cargo run --release -p decdvbt-cli -- decode C30 --amp --lna 32 --vga 8 -o out/c30.ts   # live DVB-T2 (or T) from the HackRF; --progress prints a line a second
+cargo run --release -p decdvbt-cli -- modulate --mode qpsk-1/2-2k-1/8-1mhz --freq 433.25 --cn 20 captures/n1_433.250MHz_2Msps.cs8   # 1 MHz DVB-T (every 8 MHz clock / 8) at 2 MS/s
+cargo run --release -p decdvbt-cli -- modulate --t2 8k-1/16-pp4-16qam-3/4-rot-1.7mhz --freq 433.25 --cn 20 captures/t17_433.250MHz_2Msps.cs8   # 1.7 MHz DVB-T2 at 2 MS/s
+cargo run --release -p decdvbt-cli -- decode captures/n1_433.250MHz_2Msps.cs8 --bandwidth 1 -o out/n1.ts   # the width must be given (1, 1.7, 6, 7, 8); live: decode hackrf --freq 433.25 --bandwidth 1.7
 cargo run --release -p decdvbt-cli -- modulate --t2 uk --seconds 2.4 --cn 30 --cfo 50123 --sco 4 --path 0:0 --path 3:-12 captures/x.cs8   # a DVB-T2 test signal (uk, small, or 8k-1/16-pp4-16qam-3/4-short-ext)
 cargo run --release -p decdvbt-rx --example t2_decode -- captures/c30_546.000MHz_10Msps_amp.cs8 out/c30.ts 10 0 8   # the T2 receiver alone, per-frame lines and per-stage times (env THREADS)
 cargo run --release -p decdvbt-fec --example t2_bench -- 256 2/3 normal rot 22   # one T2 FEC block: demap, LDPC, BCH times
@@ -43,6 +46,7 @@ cargo run --release -p decdvbt-tx-app -- --demo --state transmitting --screensho
 cargo run --release -p decdvbt-tx-app -- --selftest              # the safety logic of the built exe, no window
 cargo run -p decdvbt-tx-app --example make_icon                  # redraws apps/decdvbt-tx/assets/icon.ico and icon-256.png
 cargo run --release -p decdvbt-tx --example txfile -- clip.mp4 out.cs8 --null --paced --seconds 30   # the library alone: per-second status, totals, --save-ts, --stages
+cargo run --release -p decdvbt-tx --example txfile -- --stages --t2 8k-1/16-pp4-16qam-3/4-rot-1.7mhz   # per-stage CPU of a narrow mode (or --mode ...-1mhz)
 # the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|maps|history|none,
 # --window ts|epg|sdr, --service ID (select), --play ID, --http 127.0.0.1:8001,
 # --udp 127.0.0.1:1234, --record, --fps N (the waterfall scrolls a pixel a frame: the rate is its speed), --video OUT.mp4 --video-secs N (with --screenshot and

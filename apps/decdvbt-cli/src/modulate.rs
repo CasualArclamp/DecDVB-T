@@ -8,35 +8,42 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use decdvbt_core::SampleFormat;
 use decdvbt_core::channel::{parse_channel, uhf_centre_hz};
-use decdvbt_core::dvbt::Mode;
+use decdvbt_core::dvbt::{Bandwidth, Mode};
 use decdvbt_io::IqFileWriter;
 use decdvbt_mod::channel::{Channel, Impulse, PROFILES, Path as ChannelPath, profile};
 use decdvbt_mod::sim::{SimOptions, T2SimOptions, generate, generate_t2, symbols_for};
-use decdvbt_mod::t2::{self, T2Config, T2Modulator};
+use decdvbt_mod::t2::{T2Config, T2Modulator};
 
 #[derive(clap::Args)]
 pub struct ModulateArgs {
     /// Output file (.cs8, .cs16 or .cf32). Default: captures/sim_<mode>_….cs8,
     /// named so the GUI knows its centre and rate.
     out: Option<PathBuf>,
-    /// The mode: CONSTELLATION-RATE[-2k|8k][-GUARD][-6mhz|7mhz|8mhz], e.g.
-    /// 64qam-2/3-8k-1/32 (the UK's DVB-T), 16qam-3/4-2k-1/8.
+    /// The mode: CONSTELLATION-RATE[-2k|8k][-GUARD][-1mhz|6mhz|7mhz|8mhz],
+    /// e.g. 64qam-2/3-8k-1/32 (the UK's DVB-T), 16qam-3/4-2k-1/8, or
+    /// qpsk-1/2-2k-1/8-1mhz (8 MHz DVB-T with every clock divided by 8).
     #[arg(long, default_value = "64qam-2/3-8k-1/32")]
     mode: String,
     /// Make a DVB-T2 signal instead: `uk`, or FFT-GUARD-PPn-CONSTELLATION-RATE
-    /// with any of ext, rot, short, ti=N, blocks=N, syms=N, e.g.
-    /// 32k-1/128-pp7-256qam-2/3-ext-rot (which is `uk`).
+    /// with any of ext, rot, short, ti=N, blocks=N, syms=N and a bandwidth
+    /// (1.7mhz, 6mhz, 7mhz, 8mhz), e.g. 32k-1/128-pp7-256qam-2/3-ext-rot (which
+    /// is `uk`) or 8k-1/16-pp4-16qam-1/2-1.7mhz.
     #[arg(long)]
     t2: Option<String>,
     /// Seconds of signal.
     #[arg(long, default_value_t = 3.0)]
     seconds: f64,
-    /// Output sample rate, MS/s; 0 for the native 64/7 MS/s.
-    #[arg(long, default_value_t = 10.0)]
-    rate: f64,
+    /// Output sample rate, MS/s; 0 for the signal's native rate (64/7 MS/s
+    /// at 8 MHz). Default 10, or 2 (the HackRF's lowest) for 1 and 1.7 MHz.
+    #[arg(long)]
+    rate: Option<f64>,
     /// Channel the file is labelled with (the centre in its name).
     #[arg(long, default_value = "C30")]
     channel: String,
+    /// The centre the file is labelled with, MHz, instead of a UHF channel
+    /// (narrow signals sit anywhere).
+    #[arg(long)]
+    freq: Option<f64>,
     /// RMS level of the output, dBFS.
     #[arg(long, default_value_t = -20.0, allow_hyphen_values = true)]
     level: f64,
@@ -106,6 +113,29 @@ fn rate_text(out_rate_hz: f64) -> String {
     }
 }
 
+/// The output rate, Hz, for a signal whose native rate is `native` and
+/// whose width is `bw`.
+fn out_rate_of(a: &ModulateArgs, native: f64, bw: Bandwidth) -> f64 {
+    match a.rate {
+        Some(0.0) => native,
+        Some(r) => r * 1e6,
+        None if bw.narrow() => 2e6,
+        None => 10e6,
+    }
+}
+
+/// The label for the file name: "C30_546.000MHz" or "433.250MHz", and the
+/// centre, MHz.
+fn centre_of(a: &ModulateArgs) -> Result<(String, f64)> {
+    if let Some(mhz) = a.freq {
+        return Ok((format!("{mhz:.3}MHz"), mhz));
+    }
+    let chan_no =
+        parse_channel(&a.channel).with_context(|| format!("not a UHF channel: {}", a.channel))?;
+    let centre_mhz = uhf_centre_hz(chan_no).unwrap() / 1e6;
+    Ok((format!("C{chan_no}_{centre_mhz:.3}MHz"), centre_mhz))
+}
+
 fn channel_of(a: &ModulateArgs) -> Result<Channel> {
     let mut ch = Channel {
         cfo_hz: a.cfo,
@@ -152,14 +182,8 @@ pub fn run(a: ModulateArgs) -> Result<()> {
         return run_t2(a);
     }
     let mode = Mode::parse(&a.mode).map_err(anyhow::Error::msg)?;
-    let chan_no =
-        parse_channel(&a.channel).with_context(|| format!("not a UHF channel: {}", a.channel))?;
-    let centre_mhz = uhf_centre_hz(chan_no).unwrap() / 1e6;
-    let out_rate = if a.rate == 0.0 {
-        mode.bandwidth.sample_rate_hz()
-    } else {
-        a.rate * 1e6
-    };
+    let (label, _) = centre_of(&a)?;
+    let out_rate = out_rate_of(&a, mode.bandwidth.sample_rate_hz(), mode.bandwidth);
 
     let ch = channel_of(&a)?;
 
@@ -188,7 +212,7 @@ pub fn run(a: ModulateArgs) -> Result<()> {
             tags += &format!("_{p}");
         }
         PathBuf::from(format!(
-            "captures/sim_{}_C{chan_no}_{centre_mhz:.3}MHz_{}Msps{tags}.{fmt_name}",
+            "captures/sim_{}_{label}_{}Msps{tags}.{fmt_name}",
             a.mode.replace('/', "-"),
             rate_text(out_rate)
         ))
@@ -207,7 +231,8 @@ pub fn run(a: ModulateArgs) -> Result<()> {
         channel: ch.clone(),
     };
     println!(
-        "{} {} {} guard {}: {:.2} Mbit/s, symbol {:.0} µs, C/N needed {}",
+        "{} {} {} {} guard {}: {:.3} Mbit/s, symbol {:.0} µs, C/N needed {}",
+        mode.bandwidth,
         mode.fft.name(),
         mode.modulation.name(),
         mode.rate_hp.name(),
@@ -249,15 +274,10 @@ pub fn run(a: ModulateArgs) -> Result<()> {
 /// A DVB-T2 test signal.
 fn run_t2(a: ModulateArgs) -> Result<()> {
     let spec = a.t2.clone().expect("checked by the caller");
-    let cfg = T2Config::parse(&spec).map_err(anyhow::Error::msg)?;
-    let chan_no =
-        parse_channel(&a.channel).with_context(|| format!("not a UHF channel: {}", a.channel))?;
-    let centre_mhz = uhf_centre_hz(chan_no).unwrap() / 1e6;
-    let out_rate = if a.rate == 0.0 {
-        t2::SAMPLE_RATE_HZ
-    } else {
-        a.rate * 1e6
-    };
+    let mut cfg = T2Config::parse(&spec).map_err(anyhow::Error::msg)?;
+    let (label, centre_mhz) = centre_of(&a)?;
+    cfg.frequency_hz = (centre_mhz * 1e6).round() as u32;
+    let out_rate = out_rate_of(&a, cfg.sample_rate_hz(), cfg.bandwidth);
     let ch = channel_of(&a)?;
     let fmt_name = a
         .format
@@ -284,7 +304,7 @@ fn run_t2(a: ModulateArgs) -> Result<()> {
             tags += &format!("_{p}");
         }
         PathBuf::from(format!(
-            "captures/sim_t2_{}_C{chan_no}_{centre_mhz:.3}MHz_{}Msps{tags}.{fmt_name}",
+            "captures/sim_t2_{}_{label}_{}Msps{tags}.{fmt_name}",
             spec.replace('/', "-"),
             rate_text(out_rate)
         ))
@@ -295,11 +315,13 @@ fn run_t2(a: ModulateArgs) -> Result<()> {
     // Frames for the seconds asked.
     let probe = T2Modulator::new(cfg.clone(), Box::<decdvbt_mod::ts::TestStream>::default())
         .map_err(anyhow::Error::msg)?;
-    let frame_s = probe.frame_samples() as f64 / t2::SAMPLE_RATE_HZ;
+    let frame_s = probe.frame_samples() as f64 / cfg.sample_rate_hz();
     let frames = ((a.seconds / frame_s).ceil() as usize).max(1);
     let layout = *probe.layout();
     println!(
-        "{} {} {} {} guard {} {}: {} FEC blocks of {} cells in {} frames of {} symbols ({:.0} ms)",
+        "{} {} {} {} {} guard {} {}: {} FEC blocks of {} cells in {} frames of {} symbols \
+         ({:.0} ms), {:.3} Mbit/s",
+        cfg.bandwidth,
         cfg.mode.fft,
         cfg.qam.name(),
         cfg.rate,
@@ -315,6 +337,7 @@ fn run_t2(a: ModulateArgs) -> Result<()> {
         frames,
         layout.symbols,
         frame_s * 1e3,
+        cfg.ts_rate_bps() / 1e6,
     );
     if !ch.is_clean() {
         println!("channel: {ch:?}");

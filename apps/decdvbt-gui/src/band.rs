@@ -11,8 +11,10 @@ use eframe::egui::{
     Stroke, TextureId, pos2,
 };
 
-/// Half of a DVB-T/T2 8 MHz channel's occupied bandwidth (7.61 MHz).
-const OCCUPIED_HALF_HZ: f64 = 3.805e6;
+/// Half of a DVB-T/T2 8 MHz channel's occupied bandwidth (7.61 MHz): the
+/// raster's channels are marked with it; the VFO's bracket takes the
+/// received channel's own ([`BandInput::occupied_half_hz`]).
+pub const OCCUPIED_HALF_HZ: f64 = 3.805e6;
 /// Width reserved left of the plot for the dB scale.
 const LEFT: f32 = 48.0;
 /// Height of the frequency scale under the spectrum.
@@ -30,8 +32,13 @@ pub struct BandInput<'a> {
     /// Colour range of the waterfall, which the spectrum's scale follows.
     pub levels: (f32, f32),
     pub waterfall: Option<(TextureId, Rect)>,
-    /// The channel being received, if one is picked.
+    /// The channel being received, if one is picked, and half the band it
+    /// occupies, Hz (3.805 MHz at 8 MHz, 0.476 MHz at 1 MHz).
     pub vfo_hz: Option<f64>,
+    pub occupied_half_hz: f64,
+    /// Mark the UHF raster's channels (not for a narrow signal, which sits
+    /// anywhere).
+    pub raster: bool,
 }
 
 pub enum Action {
@@ -125,7 +132,7 @@ pub fn show(ui: &mut egui::Ui, inp: &BandInput) -> Option<Action> {
         .vfo_hz
         .and_then(uhf_channel_at)
         .filter(|&n| uhf_centre_hz(n).is_some_and(|c| (c - inp.vfo_hz.unwrap()).abs() < 400e3));
-    for n in UHF_FIRST..=UHF_LAST {
+    for n in (UHF_FIRST..=UHF_LAST).filter(|_| inp.raster) {
         let c = uhf_centre_hz(n).unwrap();
         let (x0, x1) = (
             x_of(c - OCCUPIED_HALF_HZ).max(plot_l),
@@ -227,7 +234,7 @@ pub fn show(ui: &mut egui::Ui, inp: &BandInput) -> Option<Action> {
     // The VFO: the received channel's occupied band.
     if let Some(v) = inp.vfo_hz {
         let edge = Stroke::new(1.4, AMBER);
-        for hz in [v - OCCUPIED_HALF_HZ, v + OCCUPIED_HALF_HZ] {
+        for hz in [v - inp.occupied_half_hz, v + inp.occupied_half_hz] {
             let x = x_of(hz);
             if (plot_l..=plot_r).contains(&x) {
                 painter.line_segment([pos2(x, spec.top()), pos2(x, wf.bottom())], edge);

@@ -1,8 +1,8 @@
 // made by CasualArclamp
 //! What the app keeps from one run to the next, beyond the SDR window's own
 //! settings and the learned carrier offsets: the radio's channel and
-//! frequency, gains and sample rate, the capture last opened, the panel and
-//! frame rate in use, the window's size.
+//! frequency, gains and sample rate, the channel's width, the capture last
+//! opened, the panel and frame rate in use, the window's size.
 //!
 //! The app compares a [`Snapshot`] of these with the one last written, once a
 //! frame, and writes when they have held still for a moment (a gain slider
@@ -46,6 +46,8 @@ pub struct Snapshot {
     pub fps: u32,
     pub doppler_hz: u32,
     pub window: (u32, u32),
+    /// The channel's width ("8mhz", "1.7mhz").
+    pub bandwidth: String,
 }
 
 impl Snapshot {
@@ -84,6 +86,7 @@ impl Snapshot {
             ("view_fps", &self.fps.to_string()),
             ("view_doppler", &self.doppler_hz.to_string()),
             ("window", &format!("{}x{}", self.window.0, self.window.1)),
+            ("bandwidth", &self.bandwidth),
         ]);
     }
 }
@@ -108,6 +111,7 @@ pub struct Saved {
     pub fps: Option<f64>,
     pub doppler_hz: Option<f64>,
     pub window: Option<(u32, u32)>,
+    pub bandwidth: Option<decdvbt_core::dvbt::Bandwidth>,
 }
 
 impl Saved {
@@ -165,6 +169,8 @@ impl Saved {
             fps: prefs::number("view_fps"),
             doppler_hz: prefs::number("view_doppler"),
             window,
+            bandwidth: prefs::get("bandwidth")
+                .and_then(|b| decdvbt_core::dvbt::Bandwidth::parse(&b)),
         }
     }
 }
@@ -245,6 +251,7 @@ mod tests {
             fps: 15,
             doppler_hz: 15,
             window: (1400, 860),
+            bandwidth: "8mhz".into(),
         }
     }
 

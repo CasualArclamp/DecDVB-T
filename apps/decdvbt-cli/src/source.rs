@@ -1,12 +1,14 @@
 // made by CasualArclamp
 //! Opening what the commands read: an IQ file (the centre and rate taken from
-//! its name) or, for a UHF channel, the HackRF or the Airspy R2 (`--radio`).
+//! its name) or, for a UHF channel (or `hackrf` with a frequency), the HackRF
+//! or the Airspy R2 (`--radio`).
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use decdvbt_core::SampleFormat;
 use decdvbt_core::channel::{parse_channel, uhf_centre_hz};
+use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_engine::DropProbe;
 use decdvbt_io::{IqFileReader, IqSource, format_from_path, name_hint};
 
@@ -18,6 +20,27 @@ pub struct Gains {
     pub amp: bool,
     pub lna: u16,
     pub vga: u16,
+}
+
+/// How a live radio is tuned beyond the channel: a free centre frequency
+/// (for `hackrf` as the source) and the channel's width, which picks the
+/// radio's rate and filter (10 MS/s and the driver's filter for 6 to 8 MHz;
+/// 2 MS/s, its lowest, and the 1.75 MHz filter, its narrowest, for 1 and
+/// 1.7 MHz).
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "hackrf"), allow(dead_code))]
+pub struct Tuning {
+    pub freq_hz: Option<f64>,
+    pub bandwidth: Bandwidth,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            freq_hz: None,
+            bandwidth: Bandwidth::Mhz8,
+        }
+    }
 }
 
 /// Which radio a live channel is received on.
@@ -93,13 +116,29 @@ pub fn open_live(
     radio: &RadioArgs,
 ) -> Result<(Box<dyn IqSource>, Option<DropProbe>)> {
     let center = uhf_centre_hz(n).unwrap();
+    open_radio(center, rate_msps, None, gains, radio)
+}
+
+/// A live radio at `center` Hz. `rate_msps` is the HackRF's rate; `narrow`
+/// (a 1 or 1.7 MHz channel) overrides it with the HackRF's lowest, 2 MS/s,
+/// and its narrowest filter. The Airspy has one rate, 10 MS/s, and no
+/// narrow-channel mode.
+fn open_radio(
+    center: f64,
+    rate_msps: f64,
+    narrow: Option<bool>,
+    gains: Option<Gains>,
+    radio: &RadioArgs,
+) -> Result<(Box<dyn IqSource>, Option<DropProbe>)> {
+    let narrow = narrow.unwrap_or(false);
     match radio.radio {
         #[cfg(feature = "hackrf")]
         Radio::Hackrf => {
             use decdvbt_io::{HackRfGains, HackRfSettings, HackRfSource};
+            let rate = if narrow { 2.0 } else { rate_msps };
             let s = HackRfSource::open(HackRfSettings {
                 center_hz: center.round() as u64,
-                sample_rate: (rate_msps * 1e6).round() as u32,
+                sample_rate: (rate * 1e6).round() as u32,
                 gains: gains.map_or_else(HackRfGains::default, |g| HackRfGains {
                     amp: g.amp,
                     lna_db: g.lna,
@@ -107,16 +146,24 @@ pub fn open_live(
                 }),
             })?;
             let ctl = s.control();
+            if narrow {
+                // The driver's own (0.75 of 2 MS/s) is its 1.75 MHz too; say so.
+                ctl.set_filter_bandwidth(Some(1_750_000))?;
+            }
             Ok((Box::new(s), Some(Box::new(move || ctl.overflows()))))
         }
         #[cfg(not(feature = "hackrf"))]
         Radio::Hackrf => {
-            let _ = (center, rate_msps, gains);
+            let _ = (center, rate_msps, narrow, gains);
             anyhow::bail!("built without the hackrf feature")
         }
         #[cfg(feature = "airspy")]
         Radio::Airspy => {
             use decdvbt_io::{AirspySettings, AirspySource};
+            anyhow::ensure!(
+                !narrow,
+                "the Airspy R2 has no narrow-channel mode (its lowest rate is 10 MS/s): use the HackRF"
+            );
             let s = AirspySource::open(AirspySettings {
                 center_hz: center.round() as u64,
                 // The Airspy has one rate; anything else is refused, not
@@ -130,23 +177,36 @@ pub fn open_live(
         }
         #[cfg(not(feature = "airspy"))]
         Radio::Airspy => {
-            let _ = (center, rate_msps, gains);
+            let _ = (center, rate_msps, narrow, gains);
             anyhow::bail!("built without the airspy feature")
         }
     }
 }
 
-/// `source` is an IQ file, or a UHF channel ("C26") for the radio `radio`
-/// names (the HackRF takes `gains`; its defaults if `None`). `file_rate_msps`
-/// is the rate of a raw file whose name does not say.
+/// `source` is an IQ file, a UHF channel ("C26") for the radio `radio` names,
+/// or `hackrf` for the HackRF at `tuning.freq_hz`; the HackRF takes `gains`
+/// (its defaults if `None`). `file_rate_msps` is the rate of a raw file whose
+/// name does not say.
 pub fn open(
     source: &str,
     file_rate_msps: f64,
     gains: Option<Gains>,
+    tuning: Tuning,
     radio: &RadioArgs,
 ) -> Result<Box<dyn IqSource>> {
-    match parse_channel(source) {
-        Some(n) => Ok(open_live(n, 10.0, gains, radio)?.0),
+    let centre = parse_channel(source)
+        .and_then(uhf_centre_hz)
+        .or_else(|| source.eq_ignore_ascii_case("hackrf").then_some(0.0))
+        .map(|c| tuning.freq_hz.unwrap_or(c));
+    match centre {
+        Some(c) if c <= 0.0 => anyhow::bail!("hackrf: give the frequency (--freq MHZ)"),
+        Some(c) => {
+            anyhow::ensure!(
+                radio.radio == Radio::Hackrf || !source.eq_ignore_ascii_case("hackrf"),
+                "`hackrf` names the HackRF: give a channel (C26) for --radio airspy"
+            );
+            Ok(open_radio(c, 10.0, Some(tuning.bandwidth.narrow()), gains, radio)?.0)
+        }
         None => {
             let path = PathBuf::from(source);
             let fmt = format_from_path(&path).unwrap_or(SampleFormat::Cs8);

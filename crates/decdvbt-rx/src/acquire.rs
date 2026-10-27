@@ -325,6 +325,9 @@ pub fn acquire(x: &[Iq], cp: &CpFind) -> Option<Acquisition> {
     let _ = spacing_s;
     // A 12 µs window in taps: the pilot samples are 12 carriers apart, so
     // the inverse transform's tap spacing is 1/(nd · 12 Δf) = N·T/(nd · 12).
+    // T is the 8 MHz channel's at every width: the window is a fixed share of
+    // the useful symbol (1/75 in 8k), 12 µs at 8 MHz, 96 µs at 1 MHz, which
+    // is what the signal's own clock scales a channel's echoes to.
     let t_s = 1.0 / (64e6 / 7.0);
     let tap_s = n as f64 * t_s / (nd as f64 * 12.0);
     let window = ((12e-6 / tap_s).round() as usize).clamp(4, nd / 2);

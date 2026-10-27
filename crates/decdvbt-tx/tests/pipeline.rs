@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use common::*;
 use decdvbt_core::Iq;
+use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_tx::config::{EncoderChoice, TxRate, TxSink};
 use decdvbt_tx::feeder::Feeder;
 use decdvbt_tx::ffmpeg::{self, Chain};
@@ -108,9 +109,14 @@ struct Decoded {
 }
 
 fn decode(path: &std::path::Path, fs: f64) -> Decoded {
-    use decdvbt_rx::auto::AutoReceiver;
+    decode_bw(path, fs, Bandwidth::Mhz8)
+}
+
+/// The same for a channel `bw` wide (the receiver is told it).
+fn decode_bw(path: &std::path::Path, fs: f64, bw: Bandwidth) -> Decoded {
+    use decdvbt_rx::auto::{AutoReceiver, Standard};
     let bytes = std::fs::read(path).unwrap();
-    let mut rx = AutoReceiver::new(fs, 0.0);
+    let mut rx = AutoReceiver::with_bandwidth(fs, 0.0, bw);
     let (mut ts, mut abs) = (Vec::new(), 0u64);
     for chunk in bytes.chunks(2 * 65_536) {
         let block: Vec<Iq> = chunk
@@ -126,6 +132,16 @@ fn decode(path: &std::path::Path, fs: f64) -> Decoded {
     rx.flush();
     rx.take_ts(&mut ts);
     let st = rx.status();
+    if rx.standard() == Standard::Dvbt2 {
+        // T2's counts are LDPC blocks, and its SNR the cells' MER.
+        let t2 = rx.dvbt2();
+        return Decoded {
+            ts,
+            uncorrectable: t2.blocks_bad,
+            blocks: t2.blocks_ok + t2.blocks_bad,
+            snr_db: t2.snr_db,
+        };
+    }
     Decoded {
         ts,
         uncorrectable: st.outer.uncorrectable,
@@ -311,6 +327,9 @@ fn a_resampled_rate_decodes_bit_exact_too() {
 #[test]
 fn a_paced_run_does_not_underrun() {
     let Some(ff) = ffmpeg() else { return };
+    // Its CPU reading is the whole process's: not while the narrow loopbacks
+    // decode beside it.
+    let _one_at_a_time = serial();
     let dir = test_dir("paced");
     let clip = make_clip(&ff, &dir, "hd.mp4", 1280, 720, 6, false);
     let mut cfg = null_config(&clip, mode_b());
@@ -340,5 +359,169 @@ fn a_paced_run_does_not_underrun() {
     );
     assert!(st.process_cpu_pct < 150.0);
     assert!(!st.chain.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The narrow channels through the whole transmitter: a 1 MHz DVB-T and a
+/// 1.7 MHz DVB-T2 IQ file at the radio's 2 MS/s (the modulators' own rates
+/// resampled, as the HackRF would be fed), each decoded by the receiver told
+/// the width, every packet after the lock identical to what was sent, and the
+/// NIT read back with the width and the centre.
+fn narrow_loopback(name: &str, cfg_of: impl Fn(&std::path::Path) -> decdvbt_tx::TxConfig) {
+    let Some(ff) = ffmpeg() else { return };
+    let _one_at_a_time = serial();
+    let dir = test_dir(name);
+    let clip = make_clip(&ff, &dir, "hd.mp4", 1280, 720, 5, false);
+    let iq = dir.join("tx_433.250MHz_2Msps.cs8");
+    let ts_path = dir.join("sent.ts");
+    let mut cfg = cfg_of(&clip);
+    cfg.centre_hz = 433_250_000.0;
+    cfg.sink = TxSink::IqFile {
+        path: iq.clone(),
+        paced: false,
+        seconds: None,
+    };
+    let bw = cfg.bandwidth();
+    let rate = cfg.ts_rate_bps();
+    let st = run(cfg, 1e9, Some(&ts_path));
+    assert_eq!(st.state, TxState::Finished, "{st:?}");
+    assert_eq!(st.sample_rate_hz, 2_000_000);
+    assert_eq!(st.underruns, 0, "{st:?}");
+    // OFDM's rare peaks at -12 dBFS: a few in 13 M samples (T9 allows 10 in 25 M).
+    assert!(st.clipped <= 10, "{st:?}");
+    assert_eq!(st.dts_pcr_warnings, 0, "{st:?}");
+
+    let d = decode_bw(&iq, 2e6, bw);
+    assert_eq!(d.uncorrectable, 0, "{name}");
+    assert!(d.snr_db > 28.0, "{name}: SNR {}", d.snr_db);
+    let sent = std::fs::read(&ts_path).unwrap();
+    let (n, bad) = compare(&sent, &d.ts);
+    // Five seconds of programme, less the receiver's lock.
+    let whole = (rate * 5.0 / 1504.0) as usize;
+    eprintln!(
+        "{name}: {n} packets compared of about {whole}, {} blocks, SNR {:.1} dB",
+        d.blocks, d.snr_db
+    );
+    assert!(
+        n * 2 > whole,
+        "{name}: only {n} of about {whole} packets compared"
+    );
+    assert_eq!(bad, 0, "{name}: {bad} of {n} packets differ");
+    let a = analyse(&sent, rate.floor());
+    assert!(a.cc_errors.is_empty(), "{name}: {a:#?}");
+    assert!(a.pcr_max_interval_ms <= 40.0, "{name}: {a:#?}");
+
+    let mut an = decdvbt_ts::TsAnalyser::new();
+    for p in d.ts.as_chunks::<188>().0 {
+        an.packet(p);
+    }
+    let r = an.report();
+    let t = &r.network.transponders[0];
+    match bw {
+        Bandwidth::Mhz1 => {
+            let ter = t.terrestrial.unwrap();
+            assert_eq!(ter.centre_hz, 433_250_000);
+            assert_eq!(ter.bandwidth_khz, 1000);
+        }
+        _ => {
+            let t2 = t.t2.unwrap();
+            assert_eq!(t2.centre_hz, Some(433_250_000));
+            assert_eq!(t2.bandwidth_khz, 1712);
+        }
+    }
+    assert_eq!(r.programmes.len(), 1);
+    assert_eq!(r.bad_sections, 0);
+    // The stream we sent decodes with no errors.
+    let out = std::process::Command::new(&ff)
+        .args(["-v", "error", "-i"])
+        .arg(&ts_path)
+        .args(["-f", "null", "-"])
+        .output()
+        .unwrap();
+    let errors = String::from_utf8_lossy(&out.stderr);
+    assert!(errors.trim().is_empty(), "{name}: ffmpeg: {errors}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn one_mhz_dvbt_loops_back_bit_exact() {
+    // QPSK 2/3 2k 1/8 at 1 MHz: 0.92 Mbit/s, the CIF picture.
+    narrow_loopback("n1", |clip| {
+        let mut m = mode(
+            decdvbt_core::dvbt::Modulation::Qpsk,
+            decdvbt_core::dvbt::Rate::R2_3,
+            decdvbt_core::dvbt::Guard::G1_8,
+        );
+        m.fft = decdvbt_core::dvbt::FftSize::K2;
+        m.bandwidth = Bandwidth::Mhz1;
+        assert_eq!(VideoProfile::for_rate(mux_rate_bps(&m)).height, 288);
+        null_config(clip, m)
+    });
+}
+
+#[test]
+fn t2_1_7_mhz_loops_back_bit_exact() {
+    // 16-QAM 3/4 8K 1/16 PP4: 3.9 Mbit/s, standard definition.
+    narrow_loopback("n17", |clip| {
+        let mut cfg = null_config(clip, mode_a());
+        cfg.t2 = decdvbt_tx::modes::t2_mode(
+            decdvbt_ofdm::t2::Fft::K8,
+            decdvbt_ofdm::t2::Guard::G1_16,
+            decdvbt_fec::t2::qam::Qam::Qam16,
+            (3, 4),
+        );
+        assert!(cfg.t2.is_some());
+        cfg
+    });
+}
+
+/// The slowest mode there is (1 MHz QPSK 1/2 1/4, 0.62 Mbit/s): ffmpeg's
+/// stream at that rate, at the sample clock, holds its PCR, its tables and a
+/// margin of nulls, with no stuffing and no "dts < pcr" (T2 of the test plan,
+/// at the bottom of the range).
+#[test]
+fn the_slowest_stream_is_clean() {
+    let Some(ff) = ffmpeg() else { return };
+    let dir = test_dir("slow");
+    let clip = make_clip(&ff, &dir, "hd.mp4", 1280, 720, 8, false);
+    let ts_path = dir.join("slow.ts");
+    let mut m = mode(
+        decdvbt_core::dvbt::Modulation::Qpsk,
+        decdvbt_core::dvbt::Rate::R1_2,
+        decdvbt_core::dvbt::Guard::G1_4,
+    );
+    m.bandwidth = Bandwidth::Mhz1;
+    let mut cfg = null_config(&clip, m);
+    cfg.sink = TxSink::Null { paced: true };
+    let st = run(cfg, 6.0, Some(&ts_path));
+    let ts = std::fs::read(&ts_path).unwrap();
+    let rate = rate_of(&m);
+    assert!((rate - 622_058.0).abs() < 2.0, "{rate}");
+    let a = analyse(&ts, rate);
+    let why = format!("{a:#?} {st:?}");
+    assert_eq!(a.bad_sync, 0, "{why}");
+    assert!(a.cc_errors.is_empty(), "{why}");
+    assert_eq!(st.ts_stuffed, 0, "{why}");
+    assert_eq!(st.dts_pcr_warnings, 0, "{why}");
+    assert!(a.pcr_ppm.abs() < 5.0, "{why}");
+    assert!(a.pcr_max_interval_ms <= 40.0, "{why}");
+    assert_eq!(a.pcr_jumps, 0, "{why}");
+    assert!(a.null_fraction >= 0.05, "{why}");
+    // PAT and PMT every 100 ms, SDT and NIT every 500 ms, to within a few
+    // packets (a packet lasts 2.4 ms at this rate: ffmpeg's tables came up to
+    // 2.6 packets late; TR 101 290 1.3 only faults a PAT gap over 0.5 s).
+    let pkt_ms = 1504.0 / rate * 1e3;
+    for (pid, limit) in [(0u16, 100.0), (0x1000, 100.0), (0x11, 500.0), (0x10, 500.0)] {
+        let gap = a.max_gap_ms.get(&pid).copied();
+        assert!(
+            gap.is_some_and(|g| g <= limit + 4.0 * pkt_ms),
+            "pid {pid:#x}: {gap:?}; {why}"
+        );
+    }
+    eprintln!(
+        "0.62 Mbit/s: {:.1} % nulls, PCR every {:.1} ms at most",
+        100.0 * a.null_fraction,
+        a.pcr_max_interval_ms
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

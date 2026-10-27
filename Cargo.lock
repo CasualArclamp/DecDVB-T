@@ -728,8 +728,10 @@ version = "0.1.3"
 dependencies = [
  "decdvbt-core",
  "decdvbt-dsp",
+ "decdvbt-fec",
  "decdvbt-io",
  "decdvbt-mod",
+ "decdvbt-ofdm",
  "decdvbt-rx",
  "decdvbt-ts",
  "rustfft",

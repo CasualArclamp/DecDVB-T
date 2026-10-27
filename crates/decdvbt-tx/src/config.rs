@@ -4,14 +4,21 @@
 
 use std::path::PathBuf;
 
-use decdvbt_core::dvbt::{Mode, Modulation, Rate};
+use decdvbt_core::dvbt::{Bandwidth, Mode, Modulation, Rate};
 use decdvbt_core::{Error, Result};
+use decdvbt_mod::t2::T2Config;
+
+/// The HackRF's lowest sample rate, Hz.
+pub const RADIO_MIN_HZ: u32 = 2_000_000;
 
 /// The IQ sample rate the radio is run at.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TxRate {
     /// The modulator's own rate (64/7 MS/s for 8 MHz): no resampler, the
     /// cheapest. Whole hertz for the radio: 9 142 857 Hz, 0.016 ppm off.
+    /// The narrow channels' own rates (8/7 MS/s for 1 MHz, 131/71 for 1.7 MHz)
+    /// are under the radio's lowest, so for them this is 2 MS/s, reached by
+    /// the resampler (7/4 and 142/131).
     Native,
     /// A fixed rate, 2 to 20 MS/s (10 or 20 are exact ratios of native), by
     /// an interpolating polyphase filter. Costs CPU; moves the DAC images
@@ -20,10 +27,10 @@ pub enum TxRate {
 }
 
 impl TxRate {
-    /// The rate in whole hertz for `mode`'s bandwidth.
-    pub fn hz(self, mode: &Mode) -> u32 {
+    /// The rate in whole hertz for a channel `bandwidth` wide.
+    pub fn hz(self, bandwidth: Bandwidth) -> u32 {
         match self {
-            TxRate::Native => mode.bandwidth.sample_rate_hz().round() as u32,
+            TxRate::Native => (bandwidth.sample_rate_hz().round() as u32).max(RADIO_MIN_HZ),
             TxRate::Fixed(hz) => hz,
         }
     }
@@ -64,7 +71,9 @@ pub struct HackRfTxConfig {
     pub amp: bool,
     /// The radio's baseband filter, Hz; `None` leaves the driver's automatic
     /// choice (75 % of the rate, which cuts the edges of a 7.61 MHz signal at
-    /// 9.14 MS/s). The default is 8 MHz.
+    /// 9.14 MS/s). The default is 8 MHz; [`crate::modes::baseband_filter_hz`]
+    /// gives the one for a bandwidth (1.75 MHz, the radio's narrowest, for 1
+    /// and 1.7 MHz).
     pub baseband_filter_hz: Option<u32>,
 }
 
@@ -175,8 +184,11 @@ pub struct TxConfig {
     /// Start again at the end of the file (inside ffmpeg, so counters and PCR
     /// stay continuous). Off: the session finishes when the file does.
     pub loop_input: bool,
-    /// The DVB-T mode. Non-hierarchical only.
+    /// The DVB-T mode. Non-hierarchical only. Unused while `t2` is set.
     pub mode: Mode,
+    /// Send DVB-T2 with this configuration instead (the app offers it at
+    /// 1.7 MHz: [`crate::modes::t2_mode`]); `None` is DVB-T in `mode`.
+    pub t2: Option<T2Config>,
     /// RF centre frequency, Hz.
     pub centre_hz: f64,
     pub rate: TxRate,
@@ -203,6 +215,7 @@ impl TxConfig {
             input,
             loop_input: true,
             mode: Mode::uk(Modulation::Qam64, Rate::R2_3),
+            t2: None,
             centre_hz: 546_000_000.0,
             rate: TxRate::Native,
             level_dbfs: -12.0,
@@ -217,13 +230,71 @@ impl TxConfig {
 
     /// The radio rate, whole hertz.
     pub fn sample_rate_hz(&self) -> u32 {
-        self.rate.hz(&self.mode)
+        self.rate.hz(self.bandwidth())
+    }
+
+    /// The channel's width.
+    pub fn bandwidth(&self) -> Bandwidth {
+        self.t2
+            .as_ref()
+            .map_or(self.mode.bandwidth, |t| t.bandwidth)
+    }
+
+    /// The signal's own sample rate 1/T, Hz.
+    pub fn native_rate_hz(&self) -> f64 {
+        self.bandwidth().sample_rate_hz()
+    }
+
+    /// The transport stream rate the signal carries, bit/s (exact): EN 300
+    /// 744 Table 17's for DVB-T, the PLP's for T2 ([`T2Config::ts_rate_bps`]).
+    pub fn ts_rate_bps(&self) -> f64 {
+        self.t2
+            .as_ref()
+            .map_or_else(|| self.mode.bitrate_hp(), |t| t.ts_rate_bps())
+    }
+
+    /// The rate ffmpeg muxes at (`-muxrate`), whole bit/s, rounded down so
+    /// its stream is never faster than the modulator drains it.
+    pub fn mux_rate_bps(&self) -> u64 {
+        self.ts_rate_bps().floor() as u64
+    }
+
+    /// The span the carriers fill, Hz (7.61 MHz for 8 MHz DVB-T, 0.95 MHz
+    /// for 1 MHz, 1.54 MHz for 1.7 MHz T2 8K).
+    pub fn occupied_hz(&self) -> f64 {
+        match &self.t2 {
+            Some(t) => t.mode.c_ps() as f64 * t.sample_rate_hz() / t.mode.fft.n() as f64,
+            None => {
+                let f = self.mode.fft;
+                f.active_carriers() as f64 * self.native_rate_hz() / f.n() as f64
+            }
+        }
     }
 
     /// Check the settings against what the modulator and the radio accept.
     pub fn validate(&self) -> Result<()> {
-        if self.mode.hierarchical() {
-            return Err(Error::Other("hierarchical modes are not supported".into()));
+        match &self.t2 {
+            None if self.mode.hierarchical() => {
+                return Err(Error::Other("hierarchical modes are not supported".into()));
+            }
+            None if !self.mode.bandwidth.dvbt() => {
+                return Err(Error::Other(format!(
+                    "DVB-T is not sent in {}",
+                    self.mode.bandwidth
+                )));
+            }
+            Some(t) if !t.bandwidth.t2() => {
+                return Err(Error::Other(format!(
+                    "DVB-T2 is not sent in {}",
+                    t.bandwidth
+                )));
+            }
+            Some(t) if t.max_blocks().is_err() => {
+                return Err(Error::Other(
+                    "that DVB-T2 mode does not make a frame".into(),
+                ));
+            }
+            _ => {}
         }
         let hz = self.sample_rate_hz();
         if !(2_000_000..=20_000_000).contains(&hz) {
@@ -231,7 +302,7 @@ impl TxConfig {
                 "sample rate {hz} Hz is outside the HackRF's 2 to 20 MS/s"
             )));
         }
-        if (hz as f64) < self.mode.bandwidth.sample_rate_hz() * 0.999 {
+        if (hz as f64) < self.native_rate_hz() * 0.999 {
             return Err(Error::Other(
                 "sample rate is below the signal's own (it would alias)".into(),
             ));
@@ -268,6 +339,27 @@ mod tests {
     fn hackrf_defaults_are_the_safe_ones() {
         let h = HackRfTxConfig::default();
         assert_eq!((h.txvga_db, h.amp), (0, false));
+    }
+
+    #[test]
+    fn the_narrow_channels_run_the_radio_at_2_msps() {
+        let mut c = TxConfig::new("x.mp4".into());
+        c.mode.bandwidth = Bandwidth::Mhz1;
+        assert_eq!(c.sample_rate_hz(), 2_000_000);
+        assert!(c.validate().is_ok());
+        assert!(
+            (c.occupied_hz() - 0.951e6).abs() < 2e3,
+            "{}",
+            c.occupied_hz()
+        );
+        assert!((c.ts_rate_bps() * 8.0 - 24_128_342.25).abs() < 1.0);
+        // 1.7 MHz is DVB-T2's only.
+        c.mode.bandwidth = Bandwidth::Mhz1_7;
+        assert!(c.validate().is_err());
+        c.t2 = Some(T2Config::parse("8k-1/16-pp4-16qam-3/4-1.7mhz").unwrap());
+        assert!(c.validate().is_ok());
+        assert_eq!(c.sample_rate_hz(), 2_000_000);
+        assert_eq!(c.bandwidth(), Bandwidth::Mhz1_7);
     }
 
     #[test]

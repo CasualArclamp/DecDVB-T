@@ -39,7 +39,7 @@ ring overflow on one DVB-T mux). Every design choice is weighed against this:
 | Relation to OnAir | **Standalone.** OnAir (adswill/OnAir, GPL-3, Rory contributes) may be read and borrowed from: its DVB-T/T2 receiver and its Rust crates (`onair_ts`, `onair_dvbsi`, `onair_fec`). Credit it in comments. |
 | Standards (first release) | **DVB-T** (EN 300 744) and **DVB-T2 base** (EN 302 755). T2-Lite, MISO, FEF and full multi-PLP are not in the first release. |
 | Order | **DVB-T first**, then T2 on the proven OFDM front end. |
-| Region / targets | **UK Freeview**, 8 MHz channels, UHF. Transmitter unknown; a band scan and the NIT will tell us which. |
+| Region / targets | **UK Freeview**, 8 MHz channels, UHF. Transmitter unknown; a band scan and the NIT will tell us which. Since 2026-10-27 also the **narrow channels** (§8): DVB-T scaled to 1 MHz and DVB-T2 at 1.7 MHz, anywhere from 1 MHz to 6 GHz. |
 | Front ends | **HackRF One** (live; plugged into this PC), **Airspy R2** (live, 10 MS/s; Mini not supported), IQ files. |
 | Antenna | Rooftop aerial with a TV-band band-pass filter. **Heavy multipath on some channels.** |
 | Robustness | **Robust from the start**: SFN and long echoes (beyond the guard), Doppler and impulsive noise taken into account in the first design. |
@@ -164,3 +164,49 @@ interleavers, rotated-constellation demapping, and the T/T2 modulator.
   a half-band filter, ~4 % of a core), in the reader thread so the receive
   thread pays nothing. 10 MS/s is the only rate; the Mini is not supported.
 - Automatic gain (LNA/VGA) from ADC level and MER: wanted?
+
+## 8. Narrow channels: 1 MHz DVB-T and 1.7 MHz DVB-T2 (2026-10-27)
+
+Added end to end (modulator, transmitter, receiver, both apps). The decisions:
+
+- **One `Bandwidth` for both standards** (`decdvbt_core::dvbt::Bandwidth`: 1,
+  1.7, 6, 7, 8 MHz) with `dvbt()` / `t2()` saying which standard is sent in
+  it. It sets only the elementary period T; the signals' samples at 1/T are
+  the same at every width, so the modulators and the receivers work in
+  samples and carriers and take the width for the clock alone.
+- **1 MHz DVB-T is not a standard**: the 8 MHz mode with every clock divided
+  by 8 (T = 7/8 µs, 8/7 MS/s, 0.95 MHz occupied, an eighth of the 8 MHz
+  rates: 0.62 to 3.96 Mbit/s), as narrowband amateur DATV does. All FFT
+  sizes, guards, constellations and rates. DVB-T only (`Mode::parse` takes
+  `-1mhz`; 1.7 MHz is refused).
+- **1.7 MHz DVB-T2 is EN 302 755's** (T = 71/131 µs, Table 66; 1.712 MHz in
+  the delivery descriptor). Nothing in P1 or L1 says the width (L1-pre's
+  BWT_EXT is the extended carrier mode), so a receiver must be told it, and a
+  network says it in the NIT. The TX offers 1K to 8K, normal carriers,
+  rotated constellations, 64800-bit LDPC, the pilot pattern following the
+  guard (`decdvbt_tx::modes::t2_mode`).
+- **The radio runs at 2 MS/s** (its lowest) for both, and the **baseband
+  filter at 1.75 MHz** (its narrowest). TX: `TxRate::Native` means 2 MS/s
+  for them, reached by the polyphase resampler (7/4 and 142/131). RX: the
+  receiver reads the radio's samples directly where the symbol is a whole
+  number of them (1 MHz: rho = 7/4, a 14336-point transform for 8k) and
+  interpolates otherwise (1.7 MHz: rho = 142/131).
+- **The receiver is told the width** (`AutoReceiver::with_bandwidth`, the
+  engine's `Command::Bandwidth`, `decode --bandwidth`, the GUI's width box):
+  1 MHz runs the DVB-T receiver alone, 1.7 MHz the T2 receiver alone, 6 to 8
+  MHz both. What was in Hz and assumed 8 MHz now scales with the width: the
+  CW detector's band, the spectral C/N zones and block edges, T2's
+  acquisition window (time-based: 0.27 s), the band view's brackets. What was
+  in samples, carriers or symbols (acquisition, the offset search in
+  carriers, guard and mode detection, the Doppler estimator, the notch) is
+  already the same at every width: the Doppler a symbol is what the
+  estimators fit, so a given Hz of Doppler is eight times harder at 1 MHz,
+  as it should be. The lock's health and quality looks are in symbols, so
+  they take eight times longer in seconds at 1 MHz (a dead 8k lock is given
+  up after about 15 s instead of 2).
+- **SI**: the terrestrial_delivery_system_descriptor has no code for 1 MHz
+  (EN 300 468 Table 46: 4 to 7 reserved): DecDVB-T sends **7**, the last
+  reserved value, and reads 7 back as 1 MHz. T2 goes in the
+  T2_delivery_system_descriptor (bandwidth 0101, 1.712 MHz). Below 1.5
+  Mbit/s the TX sends CIF (352x288, 64k audio) and its budget allows the
+  tables' fixed 39 kbit/s.
