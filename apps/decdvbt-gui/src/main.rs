@@ -1783,7 +1783,15 @@ impl App {
             channel: self.card_channel(),
             freq_hz: self.vfo_hz,
             active: self.session.is_some(),
+            network: self.network_name(),
         }
+    }
+
+    /// The network the stream's NIT names, once it has been read (a stream
+    /// that has not sent one, or a new tuning, has none).
+    fn network_name(&self) -> Option<String> {
+        let name = self.ts.report.network.name.as_deref()?.trim();
+        (self.decode && !name.is_empty()).then(|| name.to_string())
     }
 
     /// The card for a DVB-T2 lock.
@@ -1811,6 +1819,7 @@ impl App {
             channel: self.card_channel(),
             freq_hz: self.vfo_hz,
             active: self.session.is_some(),
+            network: self.network_name(),
         }
     }
 
