@@ -21,7 +21,7 @@ use crate::source;
 #[derive(clap::Args)]
 pub struct DecodeArgs {
     /// An IQ file, a transport stream (`.ts`), or a UHF channel ("C26") for
-    /// the HackRF.
+    /// the HackRF or (with `--radio airspy`) the Airspy R2.
     source: String,
     /// Write the transport stream here.
     #[arg(short, long)]
@@ -45,6 +45,8 @@ pub struct DecodeArgs {
     /// HackRF VGA gain, dB (0-62, steps of 2).
     #[arg(long, default_value_t = 8)]
     vga: u16,
+    #[command(flatten)]
+    radio: source::RadioArgs,
     /// Print the guide: this many events of each service (of every
     /// multiplex the stream's guide covers), with their details.
     #[arg(long, default_value_t = 0)]
@@ -189,6 +191,7 @@ pub fn run(a: DecodeArgs) -> Result<()> {
             lna: a.lna,
             vga: a.vga,
         }),
+        &a.radio,
     )?;
     let fs = src.sample_rate();
     let centre = src.center_freq();
