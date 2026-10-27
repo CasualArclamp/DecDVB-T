@@ -77,6 +77,9 @@ pub struct Card {
     pub freq_hz: Option<f64>,
     /// A source is running.
     pub active: bool,
+    /// The network the NIT names (UK Freeview: the transmitter's region,
+    /// "London"), shown beside the standard.
+    pub network: Option<String>,
 }
 
 /// A margin's colour: red below 0 dB, amber within 1 dB, else green.
@@ -101,10 +104,11 @@ pub fn show(ui: &mut Ui, c: &Card) {
     let health = margin.map(|m| margin_colour(Some(m)));
 
     // ---- the title bar: standard · mode, and where it is
-    let title = match c.standard {
-        Some(s) if c.assumed => format!("{} · assumed", s.name()),
-        Some(s) => s.name().to_string(),
-        None => "DVB-T / T2".to_string(),
+    let title = match (c.standard, c.network.as_deref()) {
+        (Some(s), _) if c.assumed => format!("{} · assumed", s.name()),
+        (Some(s), Some(net)) => format!("{} · {net}", s.name()),
+        (Some(s), None) => s.name().to_string(),
+        (None, _) => "DVB-T / T2".to_string(),
     };
     let bar = egui::Frame::new()
         .fill(colour.gamma_multiply(0.15))
