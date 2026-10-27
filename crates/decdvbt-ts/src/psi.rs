@@ -183,7 +183,10 @@ pub struct OtherService {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Terrestrial {
     pub centre_hz: u64,
-    pub bandwidth_mhz: u8,
+    /// The channel's width, kHz (0: a reserved code). DecDVB-T's 1 MHz DVB-T
+    /// is sent with the reserved code 7 and read back as 1000
+    /// (`decdvbt_core::dvbt::Bandwidth::terrestrial_code`).
+    pub bandwidth_khz: u32,
     pub constellation: &'static str,
     pub hierarchy: &'static str,
     pub rate_hp: &'static str,
@@ -208,7 +211,7 @@ impl Terrestrial {
         let rate = |v: u8| ["1/2", "2/3", "3/4", "5/6", "7/8", "?", "?", "?"][(v & 7) as usize];
         Some(Terrestrial {
             centre_hz: u64::from(u32::from_be_bytes([d[0], d[1], d[2], d[3]])) * 10,
-            bandwidth_mhz: [8, 7, 6, 5, 0, 0, 0, 0][(d[4] >> 5) as usize],
+            bandwidth_khz: decdvbt_core::dvbt::Bandwidth::terrestrial_khz(d[4] >> 5),
             constellation: ["QPSK", "16-QAM", "64-QAM", "?"][(d[5] >> 6) as usize],
             hierarchy: ["none", "α=1", "α=2", "α=4"][((d[5] >> 3) & 3) as usize],
             rate_hp: rate(d[5]),
@@ -216,6 +219,60 @@ impl Terrestrial {
             guard: ["1/32", "1/16", "1/8", "1/4"][((d[6] >> 3) & 3) as usize],
             mode: ["2k", "8k", "4k", "?"][((d[6] >> 1) & 3) as usize],
         })
+    }
+}
+
+/// A T2 delivery system descriptor (EN 300 468 §6.4.6.3, an extension
+/// descriptor, tag 0x7F extension 0x04): how a DVB-T2 multiplex is sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct T2Delivery {
+    pub plp_id: u8,
+    pub t2_system_id: u16,
+    /// The channel's width, kHz (1712 for "1.7 MHz"; 0 unknown or not given).
+    pub bandwidth_khz: u32,
+    pub guard: &'static str,
+    pub mode: &'static str,
+    /// The first cell's centre frequency, Hz.
+    pub centre_hz: Option<u64>,
+}
+
+impl T2Delivery {
+    /// "T2 32K 1/128 PLP 0".
+    pub fn describe(&self) -> String {
+        format!("T2 {} {} PLP {}", self.mode, self.guard, self.plp_id)
+    }
+
+    /// `d` is the descriptor's body from the extension tag on.
+    fn parse(d: &[u8]) -> Option<T2Delivery> {
+        if d.len() < 4 || d[0] != 0x04 {
+            return None;
+        }
+        let mut t = T2Delivery {
+            plp_id: d[1],
+            t2_system_id: u16::from_be_bytes([d[2], d[3]]),
+            guard: "?",
+            mode: "?",
+            ..Default::default()
+        };
+        if d.len() >= 6 {
+            // SISO/MISO(2) bandwidth(4) reserved(2); guard(3) mode(3)
+            // other_frequency_flag(1) tfs_flag(1); then the cells.
+            t.bandwidth_khz = decdvbt_core::dvbt::Bandwidth::t2_khz((d[4] >> 2) & 0x0F);
+            t.guard = [
+                "1/32", "1/16", "1/8", "1/4", "1/128", "19/128", "19/256", "?",
+            ][(d[5] >> 5) as usize];
+            t.mode = ["2K", "8K", "4K", "1K", "16K", "32K", "?", "?"][((d[5] >> 2) & 7) as usize];
+            let tfs = d[5] & 1 != 0;
+            // The first cell: cell_id(16), then one centre (or a TFS loop
+            // of them), in 10 Hz units.
+            let at = if tfs { 9 } else { 8 };
+            if d.len() >= at + 4 {
+                t.centre_hz = Some(
+                    u64::from(u32::from_be_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]])) * 10,
+                );
+            }
+        }
+        Some(t)
     }
 }
 
@@ -234,6 +291,8 @@ pub struct Transponder {
     pub system: Option<&'static str>,
     /// A terrestrial (DVB-T) multiplex.
     pub terrestrial: Option<Terrestrial>,
+    /// A DVB-T2 multiplex.
+    pub t2: Option<T2Delivery>,
     /// Its services: (service id, service type).
     pub services: Vec<(u16, u8)>,
     /// Its logical channel numbers: (service id, number, visible).
@@ -685,6 +744,7 @@ impl TsAnalyser {
             for (tag, d) in descriptors(desc) {
                 match tag {
                     0x5A => t.terrestrial = Terrestrial::parse(d),
+                    0x7F if d.first() == Some(&0x04) => t.t2 = T2Delivery::parse(d),
                     // service_list_descriptor: (service id, type) pairs.
                     0x41 => t.services.extend(
                         d.as_chunks::<3>()
@@ -857,8 +917,11 @@ impl TsAnalyser {
                     .transponders
                     .iter()
                     .find(|t| t.ts_id == o.ts_id)
-                    .and_then(|t| t.terrestrial)
-                    .map(|t| t.centre_hz);
+                    .and_then(|t| {
+                        t.terrestrial
+                            .map(|d| d.centre_hz)
+                            .or(t.t2.and_then(|d| d.centre_hz))
+                    });
                 o
             })
             .collect();
@@ -1221,12 +1284,35 @@ mod tests {
         let ter = t.terrestrial.unwrap();
         assert_eq!(ter.centre_hz, 490_000_000);
         assert_eq!(ter.describe(), "64-QAM 2/3 8k 1/32");
-        assert_eq!(ter.bandwidth_mhz, 8);
+        assert_eq!(ter.bandwidth_khz, 8000);
         assert_eq!(t.services, [(0x1001, 1), (0x1002, 2)]);
         assert_eq!(t.lcns, [(0x1001, 1, true), (0x1002, 105, false)]);
         a.programmes.entry(0x1002).or_default().number = 0x1002;
         let r = a.report();
         assert_eq!(r.programmes[0].lcn, Some(105));
+    }
+
+    #[test]
+    fn a_t2_nit_gives_the_width_and_the_centre() {
+        // A 1.7 MHz T2 multiplex at 433.25 MHz: PLP 0, system 0x4033, SISO,
+        // bandwidth code 5, 8K 1/16, one cell.
+        let mut t = vec![0x04, 0x00, 0x40, 0x33, 5 << 2, (1 << 5) | (1 << 2)];
+        t.extend_from_slice(&[0x00, 0x01]);
+        t.extend_from_slice(&(433_250_000u32 / 10).to_be_bytes());
+        t.push(0); // no subcells
+        let d = desc(0x7F, &t);
+        let mut nit = vec![0xF0, 0x00];
+        let tsl = 6 + d.len();
+        nit.extend_from_slice(&[0xF0 | (tsl >> 8) as u8, tsl as u8]);
+        nit.extend_from_slice(&[0x00, 0x01, 0xFF, 0x01]);
+        nit.extend_from_slice(&[0xF0 | (d.len() >> 8) as u8, d.len() as u8]);
+        nit.extend_from_slice(&d);
+        let mut a = TsAnalyser::new();
+        a.packet(&section_packet(PID_NIT, 0, &section(0x40, 0xFF01, 0, &nit)));
+        let t2 = a.network.transponders[0].t2.unwrap();
+        assert_eq!(t2.bandwidth_khz, 1712);
+        assert_eq!(t2.centre_hz, Some(433_250_000));
+        assert_eq!(t2.describe(), "T2 8K 1/16 PLP 0");
     }
 
     #[test]

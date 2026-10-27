@@ -32,6 +32,9 @@ main requirement: a DVB-T multiplex decodes in about a third of one core, a
 - **Both at once**: the receiver locks to whichever standard is on the
   channel, follows the carrier and the radio's clock, and relocks after a
   fade.
+- **Narrow channels**: DVB-T2's 1.7 MHz, and DVB-T scaled to 1 MHz (the
+  8 MHz mode's clocks divided by 8, as narrowband amateur DATV runs it), at
+  any frequency, the radio at 2 MS/s. Pick the width beside the source.
 
 **Watching**
 - A built-in **player** (HD H.264 and SD MPEG-2 through ffmpeg) with sound,

@@ -151,8 +151,7 @@ pub fn measure(
     // Across the band: groups of carriers.
     let group = k_total.div_ceil(CURVE_POINTS).max(1);
     let mean_w = w.iter().sum::<f32>() / k_total as f32;
-    let (mut freq, mut gain, mut snr, mut gd) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut freq, mut gain, mut snr, mut gd) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let tau_per_rad = 1.0 / (std::f32::consts::TAU * df_mhz);
     for g in (0..k_total).step_by(group) {
         let end = (g + group).min(k_total);

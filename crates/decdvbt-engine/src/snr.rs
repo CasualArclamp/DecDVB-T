@@ -16,6 +16,12 @@
 //!   on the safe side.
 //! - A faded block reads its average power, which is what the C/N of a
 //!   channel is, but is not the MER the FEC sees after equalisation.
+//!
+//! The figures below are an 8 MHz channel's; every one of them scales with
+//! the channel's width ([`Bandwidth::scale`]: an eighth for 1 MHz DVB-T, about
+//! a fifth for 1.7 MHz DVB-T2), as the signal does.
+
+use decdvbt_core::dvbt::Bandwidth;
 
 /// What is measured, relative to the block's nominal centre: the signal
 /// band (the occupied band reaches ±3.805 MHz, ±3.47 MHz at the worst UK
@@ -30,14 +36,22 @@ const WINDOW_HZ: f64 = 100e3;
 /// signal (dB): below it the band is just noise.
 const MIN_EXCESS_DB: f32 = 2.0;
 
-/// The C/N of the block centred on `vfo_hz`, dB, from a spectrum row
-/// (dBFS per bin, most negative frequency first) spanning `span_hz` around
-/// `centre_hz`. `None` if the guards are not in the span or the band holds
-/// no more than noise.
-pub fn spectral_cn_db(db: &[f32], centre_hz: f64, span_hz: f64, vfo_hz: f64) -> Option<f32> {
+/// The C/N of the block centred on `vfo_hz` in a channel `bw` wide, dB, from
+/// a spectrum row (dBFS per bin, most negative frequency first) spanning
+/// `span_hz` around `centre_hz`. `None` if the guards are not in the span or
+/// the band holds no more than noise.
+pub fn spectral_cn_db(
+    db: &[f32],
+    centre_hz: f64,
+    span_hz: f64,
+    vfo_hz: f64,
+    bw: Bandwidth,
+) -> Option<f32> {
     if db.len() < 64 || span_hz <= 0.0 {
         return None;
     }
+    let k = bw.scale();
+    let (signal_hz, guard_hz) = (SIGNAL_HZ * k, (GUARD_HZ.0 * k, GUARD_HZ.1 * k));
     let n = db.len();
     let lo_hz = centre_hz - span_hz / 2.0;
     // The bin holding a frequency, clamped into the row.
@@ -54,8 +68,8 @@ pub fn spectral_cn_db(db: &[f32], centre_hz: f64, span_hz: f64, vfo_hz: f64) -> 
         let sum: f32 = db[r.clone()].iter().map(|d| 10f32.powf(d / 10.0)).sum();
         Some(sum / r.len() as f32)
     };
-    let signal = mean_power(vfo_hz - SIGNAL_HZ, vfo_hz + SIGNAL_HZ)?;
-    let win = ((WINDOW_HZ / span_hz) * n as f64).round().max(1.0) as usize;
+    let signal = mean_power(vfo_hz - signal_hz, vfo_hz + signal_hz)?;
+    let win = ((WINDOW_HZ * k / span_hz) * n as f64).round().max(1.0) as usize;
     // The quietest window in either zone (only those inside the span).
     let quietest = |a: f64, b: f64| -> Option<f32> {
         if a < lo_hz || b > lo_hz + span_hz {
@@ -77,8 +91,8 @@ pub fn spectral_cn_db(db: &[f32], centre_hz: f64, span_hz: f64, vfo_hz: f64) -> 
         }
         Some(best / win as f32)
     };
-    let below = quietest(vfo_hz - GUARD_HZ.1, vfo_hz - GUARD_HZ.0);
-    let above = quietest(vfo_hz + GUARD_HZ.0, vfo_hz + GUARD_HZ.1);
+    let below = quietest(vfo_hz - guard_hz.1, vfo_hz - guard_hz.0);
+    let above = quietest(vfo_hz + guard_hz.0, vfo_hz + guard_hz.1);
     let noise = match (below, above) {
         (Some(a), Some(b)) => a.min(b),
         (Some(a), None) | (None, Some(a)) => a,
@@ -103,41 +117,43 @@ const EDGE_REACH_HZ: f64 = 4.3e6;
 /// plan puts it (the UK's muxes are transmitted up to a third of a megahertz
 /// off): its centre and its width, Hz, from a spectrum row (dBFS per bin,
 /// most negative frequency first) spanning `span_hz` around `centre_hz`, looking
-/// out from the channel's `nominal_hz`. `None` if the span does not hold the
-/// block with room either side, nothing stands clear of the noise, or what
-/// stands is not as wide as a block.
+/// out from the channel's `nominal_hz`, for a channel `bw` wide. `None` if the
+/// span does not hold the block with room either side, nothing stands clear of
+/// the noise, or what stands is not as wide as a block.
 pub fn signal_block(
     db: &[f32],
     centre_hz: f64,
     span_hz: f64,
     nominal_hz: f64,
+    bw: Bandwidth,
 ) -> Option<(f64, f64)> {
     let n = db.len();
     if n < 64 || span_hz <= 0.0 {
         return None;
     }
+    let k = bw.scale();
+    let reach_hz = EDGE_REACH_HZ * k;
     let lo_hz = centre_hz - span_hz / 2.0;
-    if nominal_hz - EDGE_REACH_HZ < lo_hz || nominal_hz + EDGE_REACH_HZ > lo_hz + span_hz {
+    if nominal_hz - reach_hz < lo_hz || nominal_hz + reach_hz > lo_hz + span_hz {
         return None;
     }
     let hz_per_bin = span_hz / n as f64;
     let bin = |hz: f64| ((hz - lo_hz) / hz_per_bin) as usize;
     // The block's level: the middle of its inner part, which any offset the
     // plan can have leaves inside it.
-    let mut inner: Vec<f32> = db[bin(nominal_hz - 2.5e6)..bin(nominal_hz + 2.5e6)].to_vec();
+    let mut inner: Vec<f32> = db[bin(nominal_hz - 2.5e6 * k)..bin(nominal_hz + 2.5e6 * k)].to_vec();
     inner.sort_by(f32::total_cmp);
     let level = inner[inner.len() / 2];
     // Something has to stand clear of the quiet part of the band round it.
-    let mut all: Vec<f32> =
-        db[bin(nominal_hz - EDGE_REACH_HZ)..bin(nominal_hz + EDGE_REACH_HZ)].to_vec();
+    let mut all: Vec<f32> = db[bin(nominal_hz - reach_hz)..bin(nominal_hz + reach_hz)].to_vec();
     all.sort_by(f32::total_cmp);
     if level - all[all.len() / 33] < EDGE_DROP_DB + 2.0 {
         return None;
     }
     let threshold = level - EDGE_DROP_DB;
-    let run = (EDGE_RUN_HZ / hz_per_bin).ceil().max(2.0) as usize;
+    let run = (EDGE_RUN_HZ * k / hz_per_bin).ceil().max(2.0) as usize;
     let start = bin(nominal_hz) as isize;
-    let reach = (EDGE_REACH_HZ / hz_per_bin) as isize;
+    let reach = (reach_hz / hz_per_bin) as isize;
     // Out from the middle until the spectrum is down and stays down: the
     // edge is where that run began.
     let edge = |dir: isize| -> Option<f64> {
@@ -158,7 +174,7 @@ pub fn signal_block(
     };
     let (low, high) = (edge(-1)?, edge(1)?);
     let width = high - low;
-    (BLOCK_WIDTH_HZ.0..=BLOCK_WIDTH_HZ.1)
+    (BLOCK_WIDTH_HZ.0 * k..=BLOCK_WIDTH_HZ.1 * k)
         .contains(&width)
         .then_some(((low + high) / 2.0, width))
 }
@@ -188,7 +204,7 @@ mod tests {
     fn an_offset_block_is_found_by_its_edges_through_fades() {
         // A block 167 kHz low of its channel, with three fades in it.
         let r = block(-85.0, -50.0, -3.97e6, 3.64e6, &[-2.0e6, 0.4e6, 2.9e6]);
-        let (centre, width) = signal_block(&r, 546e6, 10e6, 546e6).unwrap();
+        let (centre, width) = signal_block(&r, 546e6, 10e6, 546e6, Bandwidth::Mhz8).unwrap();
         assert!((centre - (546e6 - 165e3)).abs() < 15e3, "{centre}");
         assert!((width - 7.61e6).abs() < 80e3, "{width}");
     }
@@ -203,24 +219,42 @@ mod tests {
                 *v = -50.0;
             }
         }
-        let (centre, _) = signal_block(&r, 546e6, 10e6, 546e6).unwrap();
+        let (centre, _) = signal_block(&r, 546e6, 10e6, 546e6, Bandwidth::Mhz8).unwrap();
         assert!((centre - 546e6).abs() < 15e3, "{centre}");
     }
 
     #[test]
     fn noise_and_narrow_things_are_not_blocks() {
         assert_eq!(
-            signal_block(&block(-85.0, -84.0, -3.8e6, 3.8e6, &[]), 546e6, 10e6, 546e6),
+            signal_block(
+                &block(-85.0, -84.0, -3.8e6, 3.8e6, &[]),
+                546e6,
+                10e6,
+                546e6,
+                Bandwidth::Mhz8
+            ),
             None
         );
         // A 2 MHz carrier is not a mux.
         assert_eq!(
-            signal_block(&block(-85.0, -50.0, -1.0e6, 1.0e6, &[]), 546e6, 10e6, 546e6),
+            signal_block(
+                &block(-85.0, -50.0, -1.0e6, 1.0e6, &[]),
+                546e6,
+                10e6,
+                546e6,
+                Bandwidth::Mhz8
+            ),
             None
         );
         // The span too narrow to see round it.
         assert_eq!(
-            signal_block(&block(-85.0, -50.0, -3.8e6, 3.8e6, &[]), 546e6, 8e6, 546e6),
+            signal_block(
+                &block(-85.0, -50.0, -3.8e6, 3.8e6, &[]),
+                546e6,
+                8e6,
+                546e6,
+                Bandwidth::Mhz8
+            ),
             None
         );
     }
@@ -239,7 +273,7 @@ mod tests {
     #[test]
     fn a_block_twenty_db_over_the_floor_reads_about_twenty() {
         let r = row(-80.0, -60.0, 3.8e6);
-        let cn = spectral_cn_db(&r, 546e6, 10e6, 546e6).unwrap();
+        let cn = spectral_cn_db(&r, 546e6, 10e6, 546e6, Bandwidth::Mhz8).unwrap();
         // S + N = 100 N, so S/N = 99: 19.96 dB.
         assert!((cn - 19.96).abs() < 0.1, "{cn}");
     }
@@ -247,7 +281,10 @@ mod tests {
     #[test]
     fn an_empty_channel_reads_nothing() {
         let r = row(-80.0, -79.5, 3.8e6);
-        assert_eq!(spectral_cn_db(&r, 546e6, 10e6, 546e6), None);
+        assert_eq!(
+            spectral_cn_db(&r, 546e6, 10e6, 546e6, Bandwidth::Mhz8),
+            None
+        );
     }
 
     #[test]
@@ -259,7 +296,7 @@ mod tests {
                 *v = -65.0;
             }
         }
-        let cn = spectral_cn_db(&r, 546e6, 10e6, 546e6).unwrap();
+        let cn = spectral_cn_db(&r, 546e6, 10e6, 546e6, Bandwidth::Mhz8).unwrap();
         assert!((cn - 19.96).abs() < 0.1, "{cn}");
     }
 
@@ -277,7 +314,7 @@ mod tests {
                 }
             })
             .collect();
-        let cn = spectral_cn_db(&r, 546e6, 10e6, 546e6).unwrap();
+        let cn = spectral_cn_db(&r, 546e6, 10e6, 546e6, Bandwidth::Mhz8).unwrap();
         assert!((cn - 19.96).abs() < 0.2, "{cn}");
     }
 
@@ -285,6 +322,25 @@ mod tests {
     fn a_guard_outside_the_span_is_not_guessed() {
         // A 6 MHz span: the guards, 4.3 MHz out, are not in it.
         let r = row(-80.0, -60.0, 3.8e6);
-        assert_eq!(spectral_cn_db(&r, 546e6, 6e6, 546e6), None);
+        assert_eq!(spectral_cn_db(&r, 546e6, 6e6, 546e6, Bandwidth::Mhz8), None);
+    }
+
+    #[test]
+    fn a_narrow_block_is_measured_on_its_own_scale() {
+        // 1 MHz DVB-T (0.95 MHz occupied) at 2 MS/s: 20 dB over the floor,
+        // and its edges where they are.
+        let r: Vec<f32> = (0..4096)
+            .map(|k| {
+                let hz = (k as f64 / 4096.0 - 0.5) * 2e6;
+                if hz.abs() < 0.476e6 { -60.0 } else { -80.0 }
+            })
+            .collect();
+        let cn = spectral_cn_db(&r, 433e6, 2e6, 433e6, Bandwidth::Mhz1).unwrap();
+        assert!((cn - 20.0).abs() < 0.5, "{cn}");
+        let (centre, width) = signal_block(&r, 433e6, 2e6, 433e6, Bandwidth::Mhz1).unwrap();
+        assert!((centre - 433e6).abs() < 2e3, "{centre}");
+        assert!((width - 0.952e6).abs() < 10e3, "{width}");
+        // The 8 MHz figures do not fit the 2 MS/s span at all.
+        assert_eq!(spectral_cn_db(&r, 433e6, 2e6, 433e6, Bandwidth::Mhz8), None);
     }
 }

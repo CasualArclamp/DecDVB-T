@@ -20,8 +20,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use decdvbt_core::crc::crc32_mpeg2;
-use decdvbt_core::dvbt::{Bandwidth, FftSize, Mode, Modulation};
+use decdvbt_core::dvbt::{FftSize, Mode, Modulation};
+use decdvbt_mod::t2::T2Config;
 use decdvbt_mod::ts::{TS_LEN, TS_SYNC};
+use decdvbt_ofdm::t2::{Fft, Guard};
 
 use crate::config::ServiceInfo;
 
@@ -34,6 +36,8 @@ const PID_NULL: u16 = 0x1FFF;
 pub struct SiConfig {
     pub service: ServiceInfo,
     pub mode: Mode,
+    /// A DVB-T2 transmission: its delivery descriptor instead of DVB-T's.
+    pub t2: Option<T2Config>,
     pub centre_hz: f64,
     /// Seconds from UTC to local time, for the TOT's local_time_offset
     /// descriptor (the GUI passes the PC's).
@@ -54,11 +58,9 @@ fn descriptor(tag: u8, body: &[u8]) -> Vec<u8> {
 pub fn terrestrial_delivery_descriptor(mode: &Mode, centre_hz: f64) -> Vec<u8> {
     let mut b = Vec::with_capacity(11);
     b.extend_from_slice(&((centre_hz / 10.0).round() as u32).to_be_bytes());
-    let bandwidth = match mode.bandwidth {
-        Bandwidth::Mhz8 => 0u8,
-        Bandwidth::Mhz7 => 1,
-        Bandwidth::Mhz6 => 2,
-    };
+    // 1 MHz has no code of its own: the reserved 7 (see
+    // `Bandwidth::terrestrial_code`).
+    let bandwidth = mode.bandwidth.terrestrial_code().unwrap_or(7);
     // bandwidth(3), priority(1: HP), time_slicing(1: not used),
     // MPE-FEC(1: not used), reserved(2).
     b.push(bandwidth << 5 | 0x1F);
@@ -95,6 +97,43 @@ pub fn terrestrial_delivery_descriptor(mode: &Mode, centre_hz: f64) -> Vec<u8> {
     descriptor(0x5A, &b)
 }
 
+/// EN 300 468 §6.4.6.3: the T2_delivery_system_descriptor (extension
+/// descriptor 0x7F, tag_extension 0x04) for `cfg` at `centre_hz`: PLP id,
+/// T2_system_id, SISO, the bandwidth (Table 149: 1.712 MHz is 0101), guard
+/// interval, FFT size, one cell (cell_id, its centre in 10 Hz units, no
+/// subcells).
+pub fn t2_delivery_descriptor(cfg: &T2Config, centre_hz: f64) -> Vec<u8> {
+    let mut b = vec![0x04, cfg.plp_id];
+    b.extend_from_slice(&cfg.t2_system_id.to_be_bytes());
+    let bw = cfg.bandwidth.t2_code().unwrap_or(0);
+    // SISO/MISO(2: SISO), bandwidth(4), reserved_future_use(2).
+    b.push(bw << 2 | 0x03);
+    let guard = match cfg.mode.guard {
+        Guard::G1_32 => 0u8,
+        Guard::G1_16 => 1,
+        Guard::G1_8 => 2,
+        Guard::G1_4 => 3,
+        Guard::G1_128 => 4,
+        Guard::G19_128 => 5,
+        Guard::G19_256 => 6,
+    };
+    let tm = match cfg.mode.fft {
+        Fft::K2 => 0u8,
+        Fft::K8 => 1,
+        Fft::K4 => 2,
+        Fft::K1 => 3,
+        Fft::K16 => 4,
+        Fft::K32 => 5,
+    };
+    // guard_interval(3), transmission_mode(3), other_frequency_flag(1: no),
+    // tfs_flag(1: no).
+    b.push(guard << 5 | tm << 2);
+    b.extend_from_slice(&cfg.cell_id.to_be_bytes());
+    b.extend_from_slice(&((centre_hz / 10.0).round() as u32).to_be_bytes());
+    b.push(0); // subcell_info_loop_length
+    descriptor(0x7F, &b)
+}
+
 /// A long-form section: header, `body`, CRC-32 (ISO/IEC 13818-1 §2.4.4.11).
 /// `last_section_number` is 0 for the one section we send.
 fn long_section(table_id: u8, id_ext: u16, body: &[u8]) -> Vec<u8> {
@@ -128,7 +167,10 @@ pub fn nit_section(cfg: &SiConfig, service_type: u8) -> Vec<u8> {
         0x41,
         &[(s.service_id >> 8) as u8, s.service_id as u8, service_type],
     );
-    ts_desc.extend(terrestrial_delivery_descriptor(&cfg.mode, cfg.centre_hz));
+    ts_desc.extend(match &cfg.t2 {
+        Some(t2) => t2_delivery_descriptor(t2, cfg.centre_hz),
+        None => terrestrial_delivery_descriptor(&cfg.mode, cfg.centre_hz),
+    });
 
     let mut b = Vec::new();
     b.extend_from_slice(&(0xF000 | net_desc.len() as u16).to_be_bytes());
@@ -272,7 +314,7 @@ impl SiInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use decdvbt_core::dvbt::{Guard, Rate};
+    use decdvbt_core::dvbt::{Bandwidth, Guard, Rate};
     use decdvbt_ts::TsAnalyser;
     use std::time::Duration;
 
@@ -283,6 +325,7 @@ mod tests {
                 ..Default::default()
             },
             mode: Mode::uk(Modulation::Qam64, Rate::R2_3),
+            t2: None,
             centre_hz: 546_000_000.0,
             utc_offset_s: 3600,
         }
@@ -307,6 +350,10 @@ mod tests {
         assert_eq!(d[6] >> 5, 1);
         assert_eq!((d[8] >> 3) & 3, 3);
         assert_eq!((d[8] >> 1) & 3, 0);
+        // 1 MHz: the reserved code 7, which the analyser reads back.
+        m.bandwidth = Bandwidth::Mhz1;
+        let d = terrestrial_delivery_descriptor(&m, 433.25e6);
+        assert_eq!(d[6] >> 5, 7);
     }
 
     #[test]
@@ -364,13 +411,35 @@ mod tests {
         let d = t.terrestrial.unwrap();
         assert_eq!(d.centre_hz, 546_000_000);
         assert_eq!(d.describe(), "64-QAM 2/3 8k 1/32");
-        assert_eq!(d.bandwidth_mhz, 8);
+        assert_eq!(d.bandwidth_khz, 8000);
         assert!(r.utc_unix.is_some());
         assert!(r.local_time.is_some());
         assert_eq!(r.bad_sections, 0);
         // The NIT's continuity counter ran on from ffmpeg's: no jump.
         assert_eq!(an.pids[&0x10].cc_errors, 0);
         assert_eq!(an.pids[&0x14].cc_errors, 0);
+    }
+
+    #[test]
+    fn a_t2_nit_says_1_712_mhz_and_the_centre() {
+        let mut c = cfg();
+        c.centre_hz = 433_250_000.0;
+        c.t2 = crate::modes::t2_mode(
+            Fft::K8,
+            super::Guard::G1_16,
+            decdvbt_fec::t2::qam::Qam::Qam16,
+            (3, 4),
+        );
+        let nit = nit_section(&c, 0x16);
+        assert_eq!(crc32_mpeg2(&nit), 0);
+        let mut an = TsAnalyser::new();
+        an.packet(&section_packet(PID_NIT, 0, &nit));
+        let t = &an.report().network.transponders[0];
+        assert!(t.terrestrial.is_none());
+        let d = t.t2.unwrap();
+        assert_eq!(d.bandwidth_khz, 1712);
+        assert_eq!(d.centre_hz, Some(433_250_000));
+        assert_eq!(d.describe(), "T2 8K 1/16 PLP 0");
     }
 
     #[test]

@@ -231,15 +231,30 @@ fn network_tab(ui: &mut Ui, view: &TsView) {
     ui.add_space(4.0);
     for t in &n.transponders {
         let this = Some(t.ts_id) == view.report.ts_id;
-        let head = match t.terrestrial {
-            Some(ter) => format!(
-                "{:.3} MHz  {}  ts {:#06x}{}",
+        let mark = if this { "  ← this" } else { "" };
+        // The width: "1 MHz" for DecDVB-T's own narrow DVB-T, "1.712 MHz".
+        let width = |khz: u32| match khz {
+            0 => String::new(),
+            k if k % 1000 == 0 => format!("  {} MHz", k / 1000),
+            k => format!("  {:.3} MHz", f64::from(k) / 1e3),
+        };
+        let head = match (t.terrestrial, t.t2) {
+            (Some(ter), _) => format!(
+                "{:.3} MHz  {}{}  ts {:#06x}{mark}",
                 ter.centre_hz as f64 / 1e6,
                 ter.describe(),
+                width(ter.bandwidth_khz),
                 t.ts_id,
-                if this { "  ← this" } else { "" }
             ),
-            None => format!("ts {:#06x}  onid {:#06x}", t.ts_id, t.onid),
+            (None, Some(t2)) => format!(
+                "{}  {}{}  ts {:#06x}{mark}",
+                t2.centre_hz
+                    .map_or("?".into(), |c| format!("{:.3} MHz", c as f64 / 1e6)),
+                t2.describe(),
+                width(t2.bandwidth_khz),
+                t.ts_id,
+            ),
+            (None, None) => format!("ts {:#06x}  onid {:#06x}", t.ts_id, t.onid),
         };
         egui::CollapsingHeader::new(RichText::new(head).strong())
             .id_salt(("ts", t.ts_id, t.onid))

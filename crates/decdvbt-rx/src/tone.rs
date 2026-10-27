@@ -50,9 +50,13 @@ const RATE: f32 = 0.3;
 const WARM_UP: u32 = 3;
 /// Detector rounds a held tone may go unseen before it is let go.
 const PATIENCE: u32 = 6;
-/// The band looked at either side of the signal's centre, Hz (the 8 MHz
-/// channel's 7.61 MHz of carriers, less its filter skirts).
-const HALF_BAND: f64 = 3.75e6;
+/// The band looked at either side of the signal's centre, as a fraction of
+/// the signal's own sample rate 1/T: 3.75 MHz at 8 MHz (the channel's 7.61 MHz
+/// of carriers, less its filter skirts), 469 kHz for 1 MHz DVB-T, 757 kHz for
+/// 1.7 MHz T2. (The detector's stride and transform are in the radio's
+/// samples: at the 2 MS/s of a narrow signal it looks four times a second,
+/// with 244 Hz bins.)
+const HALF_BAND_OF_RATE: f64 = 3.75e6 / (64e6 / 7.0);
 /// The local median's block and hop, bins.
 const BLOCK: usize = 128;
 const HOP: usize = 64;
@@ -177,6 +181,8 @@ pub struct ToneCanceller {
     fs: f64,
     /// The signal's centre above the radio's, Hz.
     vfo: f64,
+    /// The band either side of it that is searched, Hz.
+    half_band: f64,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     buf: Vec<Iq>,
@@ -194,7 +200,10 @@ pub struct ToneCanceller {
 }
 
 impl ToneCanceller {
-    pub fn new(fs: f64, vfo_offset_hz: f64) -> ToneCanceller {
+    /// A canceller for the radio's samples at `fs`, the signal `vfo_offset_hz`
+    /// above the radio's centre at its own rate `fs_native` (64/7 MHz for an
+    /// 8 MHz channel), which sets the band searched.
+    pub fn new(fs: f64, vfo_offset_hz: f64, fs_native: f64) -> ToneCanceller {
         let fft = FftPlanner::new().plan_fft_forward(N);
         let scratch = vec![Iq::new(0.0, 0.0); fft.get_inplace_scratch_len()];
         let window = (0..N)
@@ -204,6 +213,7 @@ impl ToneCanceller {
             enabled: !std::env::var("DECDVBT_TONE").is_ok_and(|v| v == "0"),
             fs,
             vfo: vfo_offset_hz,
+            half_band: HALF_BAND_OF_RATE * fs_native,
             fft,
             window,
             buf: vec![Iq::new(0.0, 0.0); N],
@@ -332,7 +342,7 @@ impl ToneCanceller {
     }
 
     fn in_band(&self, bin: usize) -> bool {
-        (self.freq_of(bin) - self.vfo).abs() < HALF_BAND
+        (self.freq_of(bin) - self.vfo).abs() < self.half_band
     }
 
     /// The local median of the spectrum around each bin: blocks of
@@ -458,7 +468,7 @@ mod tests {
     #[test]
     fn no_tone_passes_the_block_through_untouched() {
         let mut seed = 3;
-        let mut c = ToneCanceller::new(10e6, 0.0);
+        let mut c = ToneCanceller::new(10e6, 0.0, 64e6 / 7.0);
         for i in 0..8 {
             let b = noise(131_072, &mut seed);
             assert!(!c.process(&b, i * 131_072));
@@ -470,7 +480,7 @@ mod tests {
     fn a_tone_is_found_and_taken_down_and_a_drifting_one_followed() {
         let fs = 10e6;
         let mut seed = 5;
-        let mut c = ToneCanceller::new(fs, 0.0);
+        let mut c = ToneCanceller::new(fs, 0.0, 64e6 / 7.0);
         let block = 131_072usize;
         let (f0, drift) = (1.2345e6f64, 2000.0f64); // Hz, Hz/s
         let amp = 3.0f32; // noise power is 6/12 = 0.5: the tone is 18 dB over
@@ -526,7 +536,7 @@ mod bench {
         };
         let block: Vec<Iq> = (0..131_072).map(|_| Iq::new(u(), u())).collect();
         // Detector alone (no tone held): every block is looked at.
-        let mut c = ToneCanceller::new(10e6, 0.0);
+        let mut c = ToneCanceller::new(10e6, 0.0, 64e6 / 7.0);
         let mut best = f64::MAX;
         for r in 0..20 {
             c.since = STRIDE;

@@ -14,6 +14,8 @@ pub struct T2Card {
 pub fn card(t2: &T2Status, stream_mbps: Option<f64>) -> T2Card {
     let kv = |k: &str, v: String| (k.to_string(), v);
     let mut details = Vec::new();
+    // The signal's rate: the width the receiver runs at (8 MHz's if unknown).
+    let fs = t2.bandwidth.map_or(FS_NATIVE, |b| b.sample_rate_hz());
     if let Some(m) = &t2.mode {
         let g = m.guard.samples(m.fft);
         details.push(kv(
@@ -22,14 +24,20 @@ pub fn card(t2: &T2Status, stream_mbps: Option<f64>) -> T2Card {
         ));
         details.push(kv(
             "guard",
-            format!("{} ({:.0} µs)", m.guard, g as f64 / FS_NATIVE * 1e6),
+            format!("{} ({:.0} µs)", m.guard, g as f64 / fs * 1e6),
         ));
         details.push(kv("pilots", m.pp.to_string()));
         details.push(kv(
             "symbol",
-            format!("{:.0} µs", (m.fft.n() + g) as f64 / FS_NATIVE * 1e6),
+            format!("{:.0} µs", (m.fft.n() + g) as f64 / fs * 1e6),
         ));
         details.push(kv("carriers", m.c_ps().to_string()));
+        if let Some(b) = t2
+            .bandwidth
+            .filter(|b| *b != decdvbt_core::dvbt::Bandwidth::Mhz8)
+        {
+            details.push(kv("bandwidth", b.name().to_string()));
+        }
     }
     let name = t2.plp.map(|p| {
         details.push(kv(

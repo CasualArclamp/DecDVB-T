@@ -13,6 +13,15 @@
 //! so no programme is lost to them. A few more are discarded so the signal
 //! starts at the first symbol of a superframe (TPS frame 0, symbol 0).
 //!
+//! **DVB-T2** (1.7 MHz in the app): `T2Modulator` makes a whole T2 frame a
+//! call (about 217 ms, 400 000 samples at 1.7 MHz), so its samples are kept
+//! and handed out a block at a time; it has no start-up pulse to discard.
+//!
+//! **The narrow channels' rate.** 1 MHz DVB-T is 8/7 MS/s and 1.7 MHz T2
+//! 131/71 MS/s, both under the HackRF's 2 MS/s: `TxRate::Native` takes them
+//! to 2 MS/s with the polyphase resampler (7/4 and 142/131), which keeps the
+//! occupied band and rejects the images by 70 dB.
+//!
 //! CPU, measured on this machine (one core, % per second of signal, `txfile
 //! --stages`): 64-QAM 2/3 8k 1/32 modulator 7.2 (outer 0.8, inner 0.7, pilots,
 //! IFFT and guard 5.7) and cs8 pack 0.4; 64-QAM 7/8 7.5 and 0.4; the 35/32
@@ -28,15 +37,59 @@ use std::time::Instant;
 use decdvbt_core::{Error, Iq, Result};
 use decdvbt_dsp::Resampler;
 use decdvbt_mod::Modulator;
+use decdvbt_mod::t2::T2Modulator;
 use decdvbt_mod::ts::TsSource;
 
-use crate::config::{TxConfig, TxRate};
+use crate::config::TxConfig;
 use crate::preview::{PreviewQueue, PreviewTap};
 use crate::ring::pack_cs8_scaled;
 
-/// The occupied bandwidth of an 8 MHz DVB-T signal, Hz (the resampler keeps
-/// this much and rejects the images beyond).
-const OCCUPIED_8MHZ_HZ: f64 = 7.61e6;
+/// The modulator for the standard sent.
+enum Source {
+    // Boxed: the modulators are kilobytes of state each, and the enum would
+    // otherwise be the larger one's size whichever it holds.
+    Dvbt(Box<Modulator>),
+    /// With the frame's samples not yet handed out, from `at` on.
+    T2 {
+        modulator: Box<T2Modulator>,
+        frame: Vec<Iq>,
+        at: usize,
+    },
+}
+
+/// Samples of a T2 frame handed out in one step: about a DVB-T 8k symbol.
+const T2_STEP: usize = 8192;
+
+impl Source {
+    fn mean_power(&self) -> f64 {
+        match self {
+            Source::Dvbt(m) => m.mean_power(),
+            Source::T2 { modulator, .. } => modulator.mean_power(),
+        }
+    }
+
+    /// The next stretch of samples at the signal's rate into `out` (cleared
+    /// first): a DVB-T symbol, or the next part of a T2 frame.
+    fn next(&mut self, out: &mut Vec<Iq>) {
+        match self {
+            Source::Dvbt(m) => m.next_symbol(out),
+            Source::T2 {
+                modulator,
+                frame,
+                at,
+            } => {
+                if *at >= frame.len() {
+                    modulator.next_frame(frame);
+                    *at = 0;
+                }
+                let end = (*at + T2_STEP).min(frame.len());
+                out.clear();
+                out.extend_from_slice(&frame[*at..end]);
+                *at = end;
+            }
+        }
+    }
+}
 
 /// The linear gain that makes `mean_power` (the modulator's, 1.08 for DVB-T)
 /// come out at `level_dbfs` rms of |c|.
@@ -75,7 +128,7 @@ impl IqStats {
 /// The real-time IQ source. Owns the modulator.
 #[non_exhaustive]
 pub struct IqGenerator {
-    modulator: Modulator,
+    modulator: Source,
     gain: f32,
     resampler: Option<Resampler>,
     priming: Arc<AtomicBool>,
@@ -103,17 +156,32 @@ impl IqGenerator {
         preview: Option<PreviewQueue>,
     ) -> Result<IqGenerator> {
         cfg.validate()?;
-        let modulator = Modulator::new(cfg.mode, None, ts).map_err(Error::Other)?;
-        let gain = gain_for(cfg.level_dbfs, modulator.mean_power());
-        let native = cfg.mode.bandwidth.sample_rate_hz();
-        let (resampler, rate_hz) = match cfg.rate {
-            TxRate::Native => (None, f64::from(cfg.sample_rate_hz())),
-            TxRate::Fixed(hz) => {
-                let occupied = OCCUPIED_8MHZ_HZ * cfg.mode.bandwidth.mhz() / 8.0;
-                let r =
-                    Resampler::for_rates(native, f64::from(hz), occupied).map_err(Error::Other)?;
-                (Some(r), f64::from(hz))
+        let modulator = match &cfg.t2 {
+            None => Source::Dvbt(Box::new(
+                Modulator::new(cfg.mode, None, ts).map_err(Error::Other)?,
+            )),
+            Some(t2) => {
+                let mut t2 = t2.clone();
+                t2.frequency_hz = cfg.centre_hz.round() as u32;
+                Source::T2 {
+                    modulator: Box::new(T2Modulator::new(t2, ts).map_err(Error::Other)?),
+                    frame: Vec::new(),
+                    at: 0,
+                }
             }
+        };
+        let gain = gain_for(cfg.level_dbfs, modulator.mean_power());
+        let native = cfg.native_rate_hz();
+        let hz = f64::from(cfg.sample_rate_hz());
+        // The radio's rate is the signal's own (to the hertz it is given in),
+        // or a resampler takes it there: a fixed rate, or a narrow channel's
+        // native one, which the radio cannot run at.
+        let (resampler, rate_hz) = if (hz - native).abs() < 1.0 {
+            (None, hz)
+        } else {
+            // Whole hertz may round a native rate: resample to the exact one.
+            let r = Resampler::for_rates(native, hz, cfg.occupied_hz()).map_err(Error::Other)?;
+            (Some(r), hz)
         };
         let rate_hz = rate_hz.max(1.0);
         Ok(IqGenerator {
@@ -135,27 +203,31 @@ impl IqGenerator {
     /// Discard the warm-up symbols with `priming` set, then clear it.
     pub fn warm_up(&mut self) {
         let start = Instant::now();
-        let n = self.modulator.warmup_symbols();
-        for _ in 0..n {
-            self.modulator.next_symbol(&mut self.sym);
-        }
-        // On to the start of a superframe: TPS then begins at frame 0.
-        while self.modulator.position() != (0, 0) {
-            self.modulator.next_symbol(&mut self.sym);
+        // T2 starts clean at its first frame: nothing to discard.
+        if let Source::Dvbt(m) = &mut self.modulator {
+            let n = m.warmup_symbols();
+            for _ in 0..n {
+                m.next_symbol(&mut self.sym);
+            }
+            // On to the start of a superframe: TPS then begins at frame 0.
+            while m.position() != (0, 0) {
+                m.next_symbol(&mut self.sym);
+            }
         }
         self.priming.store(false, Ordering::Relaxed);
         tracing::debug!("modulator warmed up in {:?}", start.elapsed());
     }
 
     /// Append cs8 bytes to `out` until it holds at least `min_bytes`, whole
-    /// symbols at a time. Never allocates once `out` has grown.
+    /// symbols at a time (T2: steps of a frame). Never allocates once `out`
+    /// has grown.
     pub fn fill(&mut self, out: &mut Vec<u8>, min_bytes: usize) {
         let t0 = Instant::now();
         let mut clipped = 0u64;
         let mut produced = 0u64;
         let mut measured = false;
         while out.len() < min_bytes {
-            self.modulator.next_symbol(&mut self.sym);
+            self.modulator.next(&mut self.sym);
             let block: &[Iq] = match &mut self.resampler {
                 Some(r) => {
                     self.work.clear();
@@ -282,14 +354,17 @@ mod tests {
         assert!(g.priming.load(Ordering::Relaxed));
         g.warm_up();
         assert!(!g.priming.load(Ordering::Relaxed));
-        assert_eq!(g.modulator.position(), (0, 0));
+        let Source::Dvbt(m) = &g.modulator else {
+            panic!("DVB-T")
+        };
+        assert_eq!(m.position(), (0, 0));
     }
 
     #[test]
     fn a_fixed_rate_resamples_and_reports_it() {
         let mut cfg = TxConfig::new("x.mp4".into());
         cfg.mode.fft = decdvbt_core::dvbt::FftSize::K2;
-        cfg.rate = TxRate::Fixed(10_000_000);
+        cfg.rate = crate::config::TxRate::Fixed(10_000_000);
         let (mut g, stats) = generator(&cfg);
         assert_eq!(g.sample_rate_hz(), 10e6);
         let mut bytes = Vec::new();
@@ -323,5 +398,36 @@ mod tests {
         g.fill(&mut bytes, 2 * 1_830_000);
         let rows = q.lock().unwrap().len();
         assert!((3..=5).contains(&rows), "{rows}");
+    }
+
+    #[test]
+    fn the_narrow_channels_come_out_at_2_msps() {
+        // 1 MHz DVB-T 2k 1/32: 2112 native samples a symbol, 3696 at 2 MS/s.
+        let mut cfg = TxConfig::new("x.mp4".into());
+        cfg.mode.fft = decdvbt_core::dvbt::FftSize::K2;
+        cfg.mode.bandwidth = decdvbt_core::dvbt::Bandwidth::Mhz1;
+        let (mut g, stats) = generator(&cfg);
+        assert_eq!(g.sample_rate_hz(), 2e6);
+        g.warm_up();
+        let mut bytes = Vec::new();
+        g.fill(&mut bytes, 2 * 400_000);
+        let symbols = bytes.len() as f64 / 2.0 / (2112.0 * 7.0 / 4.0);
+        assert!((symbols - symbols.round()).abs() < 0.02, "{symbols}");
+        assert_eq!(stats.clipped.load(Ordering::Relaxed), 0);
+        // 1.7 MHz T2: blocks of the size asked for, at 2 MS/s, at the level.
+        cfg.t2 = crate::modes::t2_mode(
+            decdvbt_ofdm::t2::Fft::K2,
+            decdvbt_ofdm::t2::Guard::G1_8,
+            decdvbt_fec::t2::qam::Qam::Qam16,
+            (1, 2),
+        );
+        let (mut g, stats) = generator(&cfg);
+        g.warm_up();
+        assert_eq!(g.sample_rate_hz(), 2e6);
+        let mut bytes = Vec::new();
+        g.fill(&mut bytes, 2_000_000);
+        assert!(bytes.len() >= 2_000_000 && bytes.len() < 2_000_000 + 2 * 9000);
+        let (rms, _) = stats.level();
+        assert!((rms + 12.0).abs() < 0.7, "{rms}");
     }
 }

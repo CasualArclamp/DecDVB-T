@@ -7,7 +7,13 @@
 //!     [--mode 64qam-2/3-8k-1/32] [--seconds 30] [--loop] [--rate native|10|20]
 //!     [--chain auto|nvenc|x264] [--paced | --flat-out] [--null]
 //!     [--save-ts sent.ts] [--stages] [--freq-mhz 546] [--no-preview]
+//!     [--t2 8k-1/16-pp4-16qam-3/4-rot-1.7mhz]
 //! ```
+//!
+//! `--mode ...-1mhz` is DVB-T at 1 MHz; `--t2 SPEC` sends DVB-T2 (a
+//! `T2Config::parse` description, 1.7 MHz with `-1.7mhz`) instead of `--mode`.
+//! The narrow channels run the virtual radio at 2 MS/s (their native rates
+//! are under the HackRF's lowest), so the resampler is part of their cost.
 //!
 //! It builds a `TxConfig` with an `IqFile` (or `Null`) sink, runs `prepare`,
 //! `transmit`, prints a status line a second and the totals at the end. The
@@ -29,6 +35,7 @@ use decdvbt_core::dvbt::Mode;
 use decdvbt_mod::Modulator;
 use decdvbt_mod::inner::InnerEncoder;
 use decdvbt_mod::outer::OuterEncoder;
+use decdvbt_mod::t2::{T2Config, T2Modulator};
 use decdvbt_mod::ts::{TS_LEN, TestStream, TsSource};
 use decdvbt_tx::config::{EncoderChoice, TxConfig, TxRate, TxSink};
 use decdvbt_tx::ring::pack_cs8;
@@ -38,6 +45,7 @@ struct Args {
     input: Option<PathBuf>,
     out: Option<PathBuf>,
     mode: Mode,
+    t2: Option<T2Config>,
     seconds: f64,
     looped: bool,
     rate: TxRate,
@@ -54,7 +62,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: txfile IN.mp4 [OUT.cs8] [--mode 64qam-2/3-8k-1/32] [--seconds 30] [--loop]\n\
          \x20      [--rate native|10|20] [--chain auto|nvenc|x264] [--paced | --flat-out]\n\
-         \x20      [--null] [--save-ts sent.ts] [--stages] [--freq-mhz 546] [--no-preview]"
+         \x20      [--null] [--save-ts sent.ts] [--stages] [--freq-mhz 546] [--no-preview]\n\
+         \x20      [--t2 SPEC]"
     );
     std::process::exit(2);
 }
@@ -64,6 +73,7 @@ fn parse() -> Args {
         input: None,
         out: None,
         mode: Mode::parse("64qam-2/3").unwrap(),
+        t2: None,
         seconds: 30.0,
         looped: false,
         rate: TxRate::Native,
@@ -85,6 +95,12 @@ fn parse() -> Args {
                     eprintln!("{e}");
                     usage()
                 })
+            }
+            "--t2" => {
+                a.t2 = Some(T2Config::parse(&value()).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    usage()
+                }))
             }
             "--seconds" => a.seconds = value().parse().unwrap_or_else(|_| usage()),
             "--loop" => a.looped = true,
@@ -179,9 +195,10 @@ fn stages(mode: Mode, symbols: usize, rate: TxRate) {
     let t_pack = t.elapsed();
     let signal = symbols as f64 * mode.symbol_s();
     let pct = |d: Duration| 100.0 * d.as_secs_f64() / signal;
-    if let TxRate::Fixed(hz) = rate {
-        let native = mode.bandwidth.sample_rate_hz();
-        let occupied = 7.61e6 * mode.bandwidth.mhz() / 8.0;
+    let native = mode.bandwidth.sample_rate_hz();
+    let hz = rate.hz(mode.bandwidth);
+    if (f64::from(hz) - native).abs() >= 1.0 {
+        let occupied = mode.fft.active_carriers() as f64 * native / mode.fft.n() as f64;
         let mut r = decdvbt_dsp::Resampler::for_rates(native, f64::from(hz), occupied).unwrap();
         let mut out = Vec::new();
         let t = Instant::now();
@@ -206,13 +223,62 @@ fn stages(mode: Mode, symbols: usize, rate: TxRate) {
     );
 }
 
+/// The same for DVB-T2: the modulator a frame at a time, the resampler to
+/// the radio's rate and the pack.
+fn t2_stages(cfg: &T2Config, frames: usize, rate: TxRate) {
+    let mut m = T2Modulator::new(cfg.clone(), Box::<TestStream>::default()).unwrap();
+    let mut frame: Vec<Iq> = Vec::new();
+    m.next_frame(&mut frame);
+    let t = Instant::now();
+    for _ in 0..frames {
+        m.next_frame(&mut frame);
+    }
+    let t_mod = t.elapsed();
+    let native = cfg.sample_rate_hz();
+    let hz = f64::from(rate.hz(cfg.bandwidth));
+    let mut out = frame.clone();
+    let mut t_rs = Duration::ZERO;
+    if (hz - native).abs() >= 1.0 {
+        let occupied = cfg.mode.c_ps() as f64 * native / cfg.mode.fft.n() as f64;
+        let mut r = decdvbt_dsp::Resampler::for_rates(native, hz, occupied).unwrap();
+        let t = Instant::now();
+        for _ in 0..frames {
+            out.clear();
+            r.process(&frame, &mut out);
+        }
+        t_rs = t.elapsed();
+    }
+    let mut bytes = Vec::new();
+    let t = Instant::now();
+    for _ in 0..frames {
+        bytes.clear();
+        pack_cs8(&out, &mut bytes);
+    }
+    let t_pack = t.elapsed();
+    let signal = frames as f64 * cfg.frame_s();
+    let pct = |d: Duration| 100.0 * d.as_secs_f64() / signal;
+    println!(
+        "T2 stages (% of one core per second of signal, {frames} frames of {:.0} ms, {:.3} \
+         Mbit/s): modulator {:.1}  resampler to {} MS/s {:.1}  cs8 pack {:.1}",
+        cfg.frame_s() * 1e3,
+        cfg.ts_rate_bps() / 1e6,
+        pct(t_mod),
+        hz / 1e6,
+        pct(t_rs),
+        pct(t_pack)
+    );
+}
+
 fn main() {
     // This tool never keys a radio; this makes the library refuse one too.
     // SAFETY: set at the start of `main`, before any other thread exists.
     unsafe { std::env::set_var(decdvbt_tx::radio::NO_RADIO_ENV, "1") };
     let a = parse();
     if a.stages {
-        stages(a.mode, 600, a.rate);
+        match &a.t2 {
+            Some(t2) => t2_stages(t2, 20, a.rate),
+            None => stages(a.mode, 600, a.rate),
+        }
         if a.input.is_none() {
             return;
         }
@@ -222,6 +288,7 @@ fn main() {
     };
     let mut cfg = TxConfig::new(input);
     cfg.mode = a.mode;
+    cfg.t2 = a.t2.clone();
     cfg.loop_input = a.looped;
     cfg.rate = a.rate;
     cfg.video.encoder = a.chain;

@@ -43,6 +43,7 @@ pub fn run() -> i32 {
         modeinfo::presets().iter().all(|p| {
             let mut c = TxConfig::new("x.mp4".into());
             c.mode = p.mode;
+            c.t2 = p.t2.clone();
             c.validate().is_ok()
         })
     });

@@ -45,7 +45,7 @@ use crate::cpu::CpuGauge;
 use crate::feeder::{Feeder, FeederShared};
 use crate::ffmpeg::{self, Chain, VideoInfo};
 use crate::iq::{IqGenerator, IqStats};
-use crate::modes::{VideoProfile, mux_rate_bps};
+use crate::modes::VideoProfile;
 use crate::preview::{PreviewQueue, PreviewRow};
 use crate::radio::{self, Radio, RadioShared, UNDERRUN_ZERO_BYTES, VirtualRadio};
 use crate::ring::{IqRing, TsRing};
@@ -165,7 +165,7 @@ impl TxStatus {
             amp,
             sent_s: 0.0,
             programme_s: 0.0,
-            ts_rate_bps: cfg.mode.bitrate_hp(),
+            ts_rate_bps: cfg.ts_rate_bps(),
             ts_in_bps: 0.0,
             ts_fill: 0.0,
             ts_stuffed: 0,
@@ -376,7 +376,7 @@ fn produce(core: &Arc<Core>, cfg: &TxConfig, dump: Option<&Path>) -> Result<()> 
         return Ok(());
     }
 
-    let rate_bps = mux_rate_bps(&cfg.mode);
+    let rate_bps = cfg.mux_rate_bps();
     let mut profile = VideoProfile::for_rate(rate_bps);
     if let Some((w, h)) = cfg.video.size {
         profile.width = w;
@@ -395,11 +395,12 @@ fn produce(core: &Arc<Core>, cfg: &TxConfig, dump: Option<&Path>) -> Result<()> 
     let mut feeder = Feeder::spawn(ffmpeg_path, args, core.ts_ring.clone())?;
     *core.feeder.lock().unwrap() = Some(feeder.shared.clone());
 
-    let pps = cfg.mode.bitrate_hp() / (188.0 * 8.0);
+    let pps = cfg.ts_rate_bps() / (188.0 * 8.0);
     let si = SiInjector::new(
         SiConfig {
             service: cfg.service.clone(),
             mode: cfg.mode,
+            t2: cfg.t2.clone(),
             centre_hz: cfg.centre_hz,
             utc_offset_s: local_utc_offset_s(),
         },
@@ -653,7 +654,7 @@ impl TxSession {
             return Err(Error::Other("already running".into()));
         }
         self.config.validate()?;
-        let pps = self.config.mode.bitrate_hp() / (188.0 * 8.0);
+        let pps = self.config.ts_rate_bps() / (188.0 * 8.0);
         let capacity = ((4 << 20) / 188).max((TS_RING_SECONDS * pps) as usize);
         let prefill = ((TS_PREFILL_SECONDS * pps) as usize).min(capacity / 2);
         let iq_ring = Arc::new(IqRing::new(IQ_RING_BLOCKS));
@@ -842,7 +843,7 @@ impl TxSession {
             amp,
             sent_s: bytes_out as f64 / 2.0 / rate_hz,
             programme_s: programme_us as f64 * 1e-6,
-            ts_rate_bps: self.config.mode.bitrate_hp(),
+            ts_rate_bps: self.config.ts_rate_bps(),
             ts_in_bps: p.window.ts_in_bps,
             ts_fill: core.ts_ring.fill(),
             ts_stuffed: core.ts_stats.stuffed.load(Ordering::Relaxed),

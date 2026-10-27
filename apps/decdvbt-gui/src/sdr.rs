@@ -16,8 +16,8 @@ use crate::prefs;
 use crate::source::Gains;
 
 /// Baseband filter bandwidths the radio has that are worth offering, MHz.
-pub const FILTERS_MHZ: [f32; 13] = [
-    2.5, 3.5, 5.0, 5.5, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 14.0, 15.0, 20.0,
+pub const FILTERS_MHZ: [f32; 14] = [
+    1.75, 2.5, 3.5, 5.0, 5.5, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 14.0, 15.0, 20.0,
 ];
 
 /// What is set besides the gains. Remembered between runs.

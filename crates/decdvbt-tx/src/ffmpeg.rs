@@ -339,7 +339,7 @@ pub fn sanitise_name(s: &str) -> String {
 /// The ffmpeg arguments (not including the program) for `cfg`: input, filter
 /// chain, encoder, `-muxrate`, service ids, `pipe:1`.
 ///
-/// Invariants (tests check each): `-muxrate` is [`crate::modes::mux_rate_bps`];
+/// Invariants (tests check each): `-muxrate` is [`TxConfig::mux_rate_bps`];
 /// `-threads 1` before `-i`; `-maxrate` and `-bufsize` always present;
 /// `-pcr_period 20`; `-muxdelay 0.4`; `-mpegts_flags +system_b+nit` only if
 /// `muxer_has_nit`; `-stream_loop -1` before `-i` iff `cfg.loop_input`;
@@ -389,8 +389,8 @@ pub fn command_line(
     };
     add(&["-i", &input, "-map", "0:v:0", "-map", "0:a:0?"]);
 
-    // Picture. SD is anamorphic: 720x576 with the sample aspect ratio that
-    // makes it 16:9 (or 4:3 for a 4:3 source). HD keeps the source's aspect
+    // Picture. SD is anamorphic: 720x576 (352x288 at the lowest rates) with
+    // the sample aspect ratio that makes it 16:9 (or 4:3 for a 4:3 source). HD keeps the source's aspect
     // ratio inside the frame, so the size varies, which receivers accept.
     let (w, h) = (profile.width, profile.height);
     let fps = cfg.video.fps;
@@ -403,10 +403,17 @@ pub fn command_line(
     let dar = info
         .filter(|i| i.height > 0)
         .map(|i| i.width as f64 / i.height as f64);
-    let sar = if dar.is_some_and(|d| d < 1.5) {
-        "16/15"
+    // The pixels' shape that shows `w`x`h` at 16:9 (4:3 for a 4:3 source):
+    // 64/45 and 16/15 for 720x576, 16/11 and 12/11 for the low rates' 352x288.
+    let (dw, dh) = if dar.is_some_and(|d| d < 1.5) {
+        (4, 3)
     } else {
-        "64/45"
+        (16, 9)
+    };
+    let sar = {
+        let (n, d) = (dw * h, dh * w);
+        let g = gcd(n, d);
+        format!("{}/{}", n / g, d / g)
     };
     let mut vf = String::new();
     if chain != Chain::NvencCuda && info.is_some_and(|i| i.interlaced) {
@@ -505,7 +512,7 @@ pub fn command_line(
     if audio_codec == AudioCodec::AacLatm {
         flags.push_str("+latm");
     }
-    let rate = crate::modes::mux_rate_bps(&cfg.mode).to_string();
+    let rate = cfg.mux_rate_bps().to_string();
     let s = &cfg.service;
     let stype = service_type(
         if chain == Chain::Mpeg2 {
@@ -549,6 +556,10 @@ pub fn command_line(
         "pipe:1",
     ]);
     a
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a.max(1) } else { gcd(b, a % b) }
 }
 
 /// Whether `ffmpeg -h muxer=mpegts` mentions `nit` (ffmpeg 9 does; older
@@ -665,6 +676,32 @@ mod tests {
         assert_eq!(after(&a, "-mpegts_service_type"), "22");
         let g = lines(&c, Chain::NvencCuda, true);
         assert_eq!(after(&g, "-vf"), "scale_cuda=720:576,setsar=64/45,fps=25");
+    }
+
+    #[test]
+    fn the_narrow_channels_mux_slowly_and_send_cif() {
+        // 1 MHz QPSK 1/2 1/8: 5 529 411 / 8 bit/s, a 352x288 picture whose
+        // pixels make it 16:9.
+        let mut c = cfg(Modulation::Qpsk, Rate::R1_2, Guard::G1_8);
+        c.mode.bandwidth = decdvbt_core::dvbt::Bandwidth::Mhz1;
+        let a = lines(&c, Chain::X264, true);
+        assert_eq!(after(&a, "-muxrate"), "691176");
+        assert_eq!(
+            after(&a, "-vf"),
+            "scale=352:288,setsar=16/11,fps=25,format=yuv420p"
+        );
+        assert_eq!(after(&a, "-b:a"), "64k");
+        // T2 at 1.7 MHz: the PLP's rate.
+        c.t2 = crate::modes::t2_mode(
+            decdvbt_ofdm::t2::Fft::K8,
+            decdvbt_ofdm::t2::Guard::G1_16,
+            decdvbt_fec::t2::qam::Qam::Qam16,
+            (3, 4),
+        );
+        let p = VideoProfile::for_rate(c.mux_rate_bps());
+        let a = command_line(&c, None, Chain::X264, &p, true);
+        assert_eq!(after(&a, "-muxrate"), c.mux_rate_bps().to_string());
+        assert!(c.mux_rate_bps() > 3_000_000 && c.mux_rate_bps() < 5_000_000);
     }
 
     #[test]

@@ -39,7 +39,9 @@ pub struct HackRfTxSettings {
     /// The baseband filter, Hz; `None` keeps the driver's automatic choice
     /// (the widest setting not above 75 % of the sample rate, which cuts the
     /// edges of a 7.61 MHz signal at 9.14 MS/s). The firmware rounds the value
-    /// to one of its settings (8 MHz for 8 000 000).
+    /// to one of its settings (8 MHz for 8 000 000); the narrowest is 1.75 MHz,
+    /// which the narrow channels (1 MHz DVB-T, 1.7 MHz DVB-T2, sent at the
+    /// radio's lowest rate, 2 MS/s) ask for.
     pub baseband_filter_hz: Option<u32>,
 }
 

@@ -161,36 +161,177 @@ impl Alpha {
     }
 }
 
-/// The channel's width: it sets the elementary period T (§4.7: 7/64, 1/8 or
-/// 7/48 µs), so every duration scales with it.
+/// The channel's width: it sets the elementary period T (EN 300 744 §4.7:
+/// 7/64, 1/8 or 7/48 µs; EN 302 755 §9.5, Table 66, for DVB-T2), so every
+/// duration and frequency of the signal scales with it while its samples at
+/// 1/T stay the same. Shared by DVB-T and DVB-T2: not every width is in both
+/// standards ([`Bandwidth::dvbt`], [`Bandwidth::t2`]).
+///
+/// - **1 MHz** is not in either standard: DVB-T with every clock of the 8 MHz
+///   mode divided by 8 (T = 7/8 µs, 8/7 MS/s, about 0.95 MHz occupied), the
+///   way narrowband amateur DATV runs it. DVB-T only.
+/// - **1.7 MHz** is DVB-T2's narrow channel (T = 71/131 µs, 1.845 MS/s; the
+///   delivery descriptor calls it 1.712 MHz). DVB-T2 only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bandwidth {
+    Mhz1,
+    Mhz1_7,
     Mhz6,
     Mhz7,
     Mhz8,
 }
 
 impl Bandwidth {
+    /// Every width, narrowest first.
+    pub const ALL: [Bandwidth; 5] = [
+        Bandwidth::Mhz1,
+        Bandwidth::Mhz1_7,
+        Bandwidth::Mhz6,
+        Bandwidth::Mhz7,
+        Bandwidth::Mhz8,
+    ];
+
+    /// The nominal width, MHz (what C/N is measured against).
     pub fn mhz(self) -> f64 {
         match self {
+            Bandwidth::Mhz1 => 1.0,
+            Bandwidth::Mhz1_7 => 1.7,
             Bandwidth::Mhz6 => 6.0,
             Bandwidth::Mhz7 => 7.0,
             Bandwidth::Mhz8 => 8.0,
         }
     }
 
+    /// "1.7 MHz".
+    pub fn name(self) -> &'static str {
+        match self {
+            Bandwidth::Mhz1 => "1 MHz",
+            Bandwidth::Mhz1_7 => "1.7 MHz",
+            Bandwidth::Mhz6 => "6 MHz",
+            Bandwidth::Mhz7 => "7 MHz",
+            Bandwidth::Mhz8 => "8 MHz",
+        }
+    }
+
+    /// As a mode string spells it: "1mhz", "1.7mhz", "8mhz".
+    pub fn token(self) -> &'static str {
+        match self {
+            Bandwidth::Mhz1 => "1mhz",
+            Bandwidth::Mhz1_7 => "1.7mhz",
+            Bandwidth::Mhz6 => "6mhz",
+            Bandwidth::Mhz7 => "7mhz",
+            Bandwidth::Mhz8 => "8mhz",
+        }
+    }
+
+    /// Read a width as typed: "1.7", "1.7mhz", "8 MHz" (1.712 is 1.7).
+    pub fn parse(s: &str) -> Option<Bandwidth> {
+        let t = s.trim().to_ascii_lowercase().replace(' ', "");
+        let t = t.strip_suffix("mhz").unwrap_or(&t);
+        Some(match t {
+            "1" => Bandwidth::Mhz1,
+            "1.7" | "1.712" => Bandwidth::Mhz1_7,
+            "6" => Bandwidth::Mhz6,
+            "7" => Bandwidth::Mhz7,
+            "8" => Bandwidth::Mhz8,
+            _ => return None,
+        })
+    }
+
+    /// Whether DVB-T is sent in this width (1 MHz: the scaled, non-standard
+    /// mode above).
+    pub fn dvbt(self) -> bool {
+        self != Bandwidth::Mhz1_7
+    }
+
+    /// Whether DVB-T2 is (EN 302 755 Table 66; 1 MHz is not).
+    pub fn t2(self) -> bool {
+        self != Bandwidth::Mhz1
+    }
+
+    /// The narrow widths, whose native rate is under the HackRF's lowest
+    /// sample rate (2 MS/s): they need a resampler to reach the radio.
+    pub fn narrow(self) -> bool {
+        matches!(self, Bandwidth::Mhz1 | Bandwidth::Mhz1_7)
+    }
+
     /// The elementary period T, seconds.
     pub fn t_s(self) -> f64 {
         match self {
+            // 7/64 µs × 8: the 8 MHz mode's clock divided by 8.
+            Bandwidth::Mhz1 => 7.0 / 8.0 * 1e-6,
+            // EN 302 755 Table 66.
+            Bandwidth::Mhz1_7 => 71.0 / 131.0 * 1e-6,
             Bandwidth::Mhz6 => 7.0 / 48.0 * 1e-6,
             Bandwidth::Mhz7 => 1.0 / 8.0 * 1e-6,
             Bandwidth::Mhz8 => 7.0 / 64.0 * 1e-6,
         }
     }
 
-    /// The sample rate at which one sample is one T: 64/7 MS/s for 8 MHz.
+    /// The sample rate at which one sample is one T: 64/7 MS/s for 8 MHz,
+    /// 8/7 for 1 MHz, 131/71 for 1.7 MHz.
     pub fn sample_rate_hz(self) -> f64 {
         1.0 / self.t_s()
+    }
+
+    /// The bandwidth field (3 bits) of the terrestrial_delivery_system_descriptor
+    /// (EN 300 468 §6.2.13.4, Table 46: 8, 7, 6, 5 MHz are 0 to 3; 4 to 7 are
+    /// reserved for future use). 1 MHz has no code: DecDVB-T sends **7**, the
+    /// last reserved value (the least likely to be given a meaning soon), and
+    /// reads 7 back as 1 MHz. A standard receiver ignores or rejects it, which
+    /// is right for a signal it could not receive anyway. `None`: not DVB-T.
+    pub fn terrestrial_code(self) -> Option<u8> {
+        match self {
+            Bandwidth::Mhz8 => Some(0),
+            Bandwidth::Mhz7 => Some(1),
+            Bandwidth::Mhz6 => Some(2),
+            Bandwidth::Mhz1 => Some(7),
+            Bandwidth::Mhz1_7 => None,
+        }
+    }
+
+    /// The width a terrestrial descriptor's code says, kHz (5 MHz included;
+    /// 7 is DecDVB-T's 1 MHz, see [`Bandwidth::terrestrial_code`]; 0 unknown).
+    pub fn terrestrial_khz(code: u8) -> u32 {
+        [8000, 7000, 6000, 5000, 0, 0, 0, 1000][(code & 7) as usize]
+    }
+
+    /// The bandwidth field (4 bits) of the T2_delivery_system_descriptor
+    /// (EN 300 468 §6.4.6.3, Table 149: 8, 7, 6, 5, 10 MHz are 0 to 4 and
+    /// 1.712 MHz is 5). `None`: not DVB-T2.
+    pub fn t2_code(self) -> Option<u8> {
+        match self {
+            Bandwidth::Mhz8 => Some(0),
+            Bandwidth::Mhz7 => Some(1),
+            Bandwidth::Mhz6 => Some(2),
+            Bandwidth::Mhz1_7 => Some(5),
+            Bandwidth::Mhz1 => None,
+        }
+    }
+
+    /// The width a T2 descriptor's code says, kHz (0 unknown).
+    pub fn t2_khz(code: u8) -> u32 {
+        match code {
+            0 => 8000,
+            1 => 7000,
+            2 => 6000,
+            3 => 5000,
+            4 => 10000,
+            5 => 1712,
+            _ => 0,
+        }
+    }
+
+    /// The width against 8 MHz (1/8 for 1 MHz): what an 8 MHz figure in Hz
+    /// (a filter, a search range) scales by.
+    pub fn scale(self) -> f64 {
+        self.sample_rate_hz() / Bandwidth::Mhz8.sample_rate_hz()
+    }
+}
+
+impl std::fmt::Display for Bandwidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -225,8 +366,9 @@ impl Mode {
     /// Read a mode as typed: "64qam-2/3", "16QAM-3/4-2k", "qpsk-1/2-8k-1/4".
     /// After the constellation and the rate, in any order: the FFT size
     /// ("2k", "8k"), the guard interval ("1/32", "1/16", "1/8", "1/4") and
-    /// the bandwidth ("6mhz", "7mhz", "8mhz"). The rest is the UK's
-    /// ([`Mode::uk`]); hierarchy is not spelled.
+    /// the bandwidth ("1mhz", "6mhz", "7mhz", "8mhz"; 1.7 MHz is DVB-T2's
+    /// only and is refused). The rest is the UK's ([`Mode::uk`]); hierarchy is
+    /// not spelled.
     pub fn parse(s: &str) -> Result<Mode, String> {
         let s = s.to_ascii_lowercase();
         let mut parts = s.split('-');
@@ -249,9 +391,11 @@ impl Mode {
             match p {
                 "2k" => mode.fft = FftSize::K2,
                 "8k" => mode.fft = FftSize::K8,
-                "6mhz" => mode.bandwidth = Bandwidth::Mhz6,
-                "7mhz" => mode.bandwidth = Bandwidth::Mhz7,
-                "8mhz" => mode.bandwidth = Bandwidth::Mhz8,
+                b if b.ends_with("mhz") => {
+                    mode.bandwidth = Bandwidth::parse(b)
+                        .filter(|b| b.dvbt())
+                        .ok_or(format!("not a DVB-T bandwidth: {b}"))?
+                }
                 g => {
                     mode.guard = Guard::ALL
                         .into_iter()
@@ -376,6 +520,33 @@ mod tests {
         assert!(Mode::parse("64qam-9/10").is_err());
         assert!(Mode::parse("64qam").is_err());
         assert!(Mode::parse("64qam-2/3-4k").is_err());
+        assert_eq!(
+            Mode::parse("qpsk-1/2-1mhz").unwrap().bandwidth,
+            Bandwidth::Mhz1
+        );
+        // 1.7 MHz is DVB-T2's.
+        assert!(Mode::parse("qpsk-1/2-1.7mhz").is_err());
+    }
+
+    #[test]
+    fn the_narrow_widths_have_their_clocks() {
+        // 1 MHz: the 8 MHz clock over 8; the bitrate likewise.
+        assert!((Bandwidth::Mhz1.sample_rate_hz() - 8e6 / 7.0).abs() < 1e-6);
+        assert!((Bandwidth::Mhz1.scale() - 0.125).abs() < 1e-12);
+        let mut m = Mode::uk(Modulation::Qam64, Rate::R2_3);
+        let r8 = m.bitrate_hp();
+        m.bandwidth = Bandwidth::Mhz1;
+        assert!((m.bitrate_hp() * 8.0 - r8).abs() < 1e-6);
+        assert!((m.useful_s() * 1e6 - 7168.0).abs() < 1e-6);
+        // 1.7 MHz: T = 71/131 µs (EN 302 755 Table 66).
+        assert!((Bandwidth::Mhz1_7.sample_rate_hz() - 131e6 / 71.0).abs() < 1e-6);
+        for b in Bandwidth::ALL {
+            assert_eq!(Bandwidth::parse(b.token()), Some(b));
+            assert_eq!(Bandwidth::parse(b.name()), Some(b));
+        }
+        assert_eq!(Bandwidth::parse("1.712"), Some(Bandwidth::Mhz1_7));
+        assert!(Bandwidth::Mhz1.dvbt() && !Bandwidth::Mhz1.t2());
+        assert!(!Bandwidth::Mhz1_7.dvbt() && Bandwidth::Mhz1_7.t2());
     }
 
     #[test]
