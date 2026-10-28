@@ -54,8 +54,12 @@ const ALPHA: f32 = 0.5;
 const BETA: f32 = 0.2;
 /// The slopes tried (rad at the band's edge): ±SLOPE_MAX in steps of
 /// SLOPE_STEP, a coherent sum of the pilots each. A step is well inside the
-/// main lobe (π wide) of the sum.
-const SLOPE_MAX: f32 = 6.0;
+/// main lobe (π wide) of the sum. ±18 rad is ±7 samples: an Airspy R2 now and
+/// then loses a few samples inside the radio (2–7 at 10 MS/s, seen live), and
+/// a step the scan cannot see leaves the symbols after it unequalised until
+/// the slow cyclic-prefix loop pulls the window back (~70 packets lost a
+/// slip at ±6 rad, ~25 at ±18; +0.25 % of a core).
+const SLOPE_MAX: f32 = 18.0;
 const SLOPE_STEP: f32 = 0.5;
 /// Pilot coherence below which a symbol is not used to update the estimate.
 const MIN_COHERENCE: f32 = 0.35;

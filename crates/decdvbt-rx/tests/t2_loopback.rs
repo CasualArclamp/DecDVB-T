@@ -174,7 +174,9 @@ fn p1_only(s1: u8) -> T2Receiver {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
         ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.35
     };
-    let mut y: Vec<Iq> = (0..(2.0 * fs) as usize).map(|_| Iq::new(g(), g())).collect();
+    let mut y: Vec<Iq> = (0..(2.0 * fs) as usize)
+        .map(|_| Iq::new(g(), g()))
+        .collect();
     let period = (0.25 * fs) as usize;
     for start in (1000..y.len() - p.len()).step_by(period) {
         for (i, v) in p.iter().enumerate() {

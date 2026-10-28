@@ -176,7 +176,7 @@ impl Session {
                 let rx = Rx::start(
                     Box::new(src),
                     RxOptions::default(),
-                    Some(Box::new(move || probe.overflows())),
+                    Some(Box::new(move || probe.lost())),
                 );
                 Ok(Session {
                     rx,

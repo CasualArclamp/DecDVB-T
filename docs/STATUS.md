@@ -1701,3 +1701,30 @@ echoes' relative delays are right.
 - Portable builds: `RUSTFLAGS="-C target-feature=+crt-static"` with
   `--target x86_64-pc-windows-msvc` links the C runtime statically (no Visual
   C++ redistributable); the earlier releases' exes did need it.
+
+## Airspy R2 glitches: packed blanking, timing slips (2026-10-28)
+
+Found with a live soak on a 64-QAM 2/3 8K mux (`--example airspy_live`) and replays of
+raw USB transfers (`DECDVBT_AIRSPY_RAW=path`, `--example airspy_replay`). No USB
+buffer is ever dropped and the delivered rate is 10.000 MS/s; both faults are inside
+the radio.
+
+- **Packed mode**: every ~2 s (24-30 a minute) a packed transfer carries bytes
+  512..12288 as *unpacked* u16 words (the firmware's in-place packer not done, it
+  seems). Read as packed that is near full-scale noise: +8 dB on the buffer, lost locks.
+  `RealToIq::process_packed` now finds such blocks (top nibble of half the u16 words
+  zero, `looks_unpacked`) and blanks them to the DC level, keeping the sample count;
+  `AirspyControl::blanked`/`lost` count them and the apps' drop counter shows them.
+  The radio also loses samples around these events (from 3 up to ~2050 IQ samples,
+  measured from the cyclic prefix), so packed mode still relocks a few times a
+  minute. **Use unpacked**: USB has the headroom (0 drops in every run).
+- **Timing slips, both modes**: now and then the stream loses 2-7 IQ samples
+  mid-transfer (never on a USB transfer or packet boundary: in the radio). The
+  equaliser's slope scan only reached ±2.3 samples (`SLOPE_MAX` 6 rad), so the symbols
+  after a slip went unequalised until the slow CP loop pulled the window back: ~70
+  packets lost a slip and SNR down 5-6 dB for 50 ms. `SLOPE_MAX` is now 18 rad
+  (±7 samples): ~25 packets (the one symbol the slip lands in), +0.25 % of a core,
+  no change on weak or HackRF signals. The receiver's clock reading on the Airspy
+  went from a false 20-80 ppm (the CP and pilot loops pulling against each other)
+  to 1-4 ppm.
+- Live 60 s unpacked before/after: 47 loss bursts → 13 single blips.
