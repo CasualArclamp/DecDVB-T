@@ -1984,12 +1984,6 @@ impl App {
             if before != self.kind && running {
                 self.stop();
             }
-            // The Airspy's lowest rate is 10 MS/s, and the narrow channels
-            // need the radio at 2 MS/s: it offers only the wide ones.
-            if self.kind == SourceKind::Airspy && self.bandwidth.narrow() {
-                self.set_bandwidth(Bandwidth::Mhz8);
-            }
-
             // The channel's width: what the receiver looks for (both
             // sources).
             let mut bw = self.bandwidth;
@@ -1998,9 +1992,6 @@ impl App {
                 .width(70.0)
                 .show_ui(ui, |ui| {
                     for b in Bandwidth::ALL {
-                        if self.kind == SourceKind::Airspy && b.narrow() {
-                            continue;
-                        }
                         let label = match b {
                             Bandwidth::Mhz1 => "1 MHz (DVB-T)",
                             Bandwidth::Mhz1_7 => "1.7 MHz (T2)",
@@ -2013,7 +2004,8 @@ impl App {
                 .on_hover_text(
                     "The channel's width: the receiver must be told it. 1 MHz is DVB-T with \
                      every clock of 8 MHz divided by 8 (DecDVB-T's narrow mode); 1.7 MHz is \
-                     DVB-T2's narrow channel. Both run the radio at 2 MS/s.",
+                     DVB-T2's narrow channel. Both run the HackRF at 2 MS/s; the Airspy (10 \
+                     MS/s only) decodes them from its 10 MS/s stream.",
                 );
             self.set_bandwidth(bw);
 

@@ -121,8 +121,8 @@ pub fn open_live(
 
 /// A live radio at `center` Hz. `rate_msps` is the HackRF's rate; `narrow`
 /// (a 1 or 1.7 MHz channel) overrides it with the HackRF's lowest, 2 MS/s,
-/// and its narrowest filter. The Airspy has one rate, 10 MS/s, and no
-/// narrow-channel mode.
+/// and its narrowest filter. The Airspy has one rate, 10 MS/s, whatever the
+/// width.
 fn open_radio(
     center: f64,
     rate_msps: f64,
@@ -160,10 +160,8 @@ fn open_radio(
         #[cfg(feature = "airspy")]
         Radio::Airspy => {
             use decdvbt_io::{AirspySettings, AirspySource};
-            anyhow::ensure!(
-                !narrow,
-                "the Airspy R2 has no narrow-channel mode (its lowest rate is 10 MS/s): use the HackRF"
-            );
+            // A narrow channel is decoded from the 10 MS/s stream as it is
+            // (tests/narrow_wide.rs): the receivers take the radio's rate.
             let s = AirspySource::open(AirspySettings {
                 center_hz: center.round() as u64,
                 // The Airspy has one rate; anything else is refused, not

@@ -1728,3 +1728,14 @@ the radio.
   went from a false 20-80 ppm (the CP and pilot loops pulling against each other)
   to 1-4 ppm.
 - Live 60 s unpacked before/after: 47 loss bursts → 13 single blips.
+
+## Narrow channels on the Airspy R2 (2026-10-28)
+
+- The 1 MHz (DVB-T) and 1.7 MHz (DVB-T2) widths are offered for the Airspy in the GUI and
+  CLI (they were hidden: "its lowest rate is 10 MS/s"). No DSP change was needed: the
+  receivers take the radio's rate and their own DDC/FFT front end decimates, so a narrow
+  signal decodes from the 10 MS/s stream as it does from the HackRF's 2 MS/s.
+  `crates/decdvbt-rx/tests/narrow_wide.rs` checks both byte for byte at 10 MS/s (the T2
+  signal is generated at 2 MS/s and upsampled by 5: the modulator has no simple ratio from
+  1.845 MS/s to 10): 1 MHz 2k QPSK ~5 % and 1.7 MHz 8k 16-QAM ~14 % of real time in the
+  receiver alone. Not yet tried on air with the Airspy.
