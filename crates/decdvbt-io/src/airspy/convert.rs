@@ -95,6 +95,7 @@ pub struct RealToIq {
     od: Box<[f32; OD_DELAY + PAIRS]>,
     acc: Box<[f32; PAIRS]>,
     raw: Box<[u16; BLOCK]>,
+    blanked: u64,
 }
 
 impl Default for RealToIq {
@@ -112,6 +113,7 @@ impl RealToIq {
             od: Box::new([0.0; OD_DELAY + PAIRS]),
             acc: Box::new([0.0; PAIRS]),
             raw: Box::new([0; BLOCK]),
+            blanked: 0,
         }
     }
 
@@ -135,16 +137,39 @@ impl RealToIq {
 
     /// As [`process_unpacked`](Self::process_unpacked) for the packed format
     /// (8 samples in 12 bytes). Returns the bytes consumed.
+    ///
+    /// The R2 sometimes sends a stretch of a packed transfer still in the
+    /// unpacked format (seen live at 10 MS/s: about every 2 s, bytes
+    /// 512..12288 of a transfer, i.e. the first 12 KB chunk, as u16 words;
+    /// presumably the firmware's in-place packer had not finished it). Read
+    /// as packed that is near full-scale noise, +8 dB on the buffer, and the
+    /// receiver loses lock. Such a block is found by [`looks_unpacked`] and
+    /// replaced by the DC level, i.e. silence: the sample count and so the
+    /// receiver's timing stay right. [`blanked`](Self::blanked) counts them.
     pub fn process_packed(&mut self, bytes: &[u8], out: &mut Vec<Complex32>) -> usize {
         let usable = bytes.len() / 12 * 12;
         out.reserve(usable / 6);
         // 8 samples per 12 bytes: a block of 4096 samples is 6144 bytes.
         for chunk in bytes[..usable].chunks(BLOCK / 8 * 12) {
             let n = chunk.len() / 12 * 8;
-            unpack_12bit(chunk, &mut self.raw[..n]);
+            if looks_unpacked(chunk) {
+                // The block's mean is then the DC estimate itself, so the
+                // tracker does not move either.
+                let dc = self.dc.round() as u16;
+                self.raw[..n].fill(dc);
+                self.blanked += 1;
+            } else {
+                unpack_12bit(chunk, &mut self.raw[..n]);
+            }
             self.block(n, out);
         }
         usable
+    }
+
+    /// Packed blocks blanked because they arrived unpacked (see
+    /// [`process_packed`](Self::process_packed)), since the start.
+    pub fn blanked(&self) -> u64 {
+        self.blanked
     }
 
     /// One block of `n` raw samples (a multiple of 4, at most `BLOCK`) from
@@ -221,10 +246,27 @@ impl RealToIq {
     }
 
     /// Start again from silence (after a retune the old state is stale).
+    /// The blanked count carries on.
     pub fn reset(&mut self) {
         self.ev.fill(0.0);
         self.od.fill(0.0);
     }
+}
+
+/// Pieces a packed block is checked in: 384 bytes, 192 u16 words.
+const CHECK: usize = 384;
+
+/// Whether any 384-byte piece of a packed block holds unpacked samples:
+/// read as u16 words, unpacked 12-bit samples all have a zero top nibble,
+/// while packed bytes give one about 1 time in 16 (a quiet input around the
+/// 2048 midpoint, 1 in 6 at most). Half the words is far from both.
+pub fn looks_unpacked(bytes: &[u8]) -> bool {
+    bytes.as_chunks::<CHECK>().0.iter().any(|piece| {
+        let (words, _) = piece.as_chunks::<2>();
+        // Counted with `sum` over a bool->u32 map, which LLVM vectorises.
+        let zero: u32 = words.iter().map(|w| (w[1] < 0x10) as u32).sum();
+        zero as usize * 2 > CHECK / 2
+    })
 }
 
 /// Unpack the Airspy's packed 12-bit format: 8 samples per 12 bytes, three
@@ -557,6 +599,34 @@ mod tests {
         let used = RealToIq::new().process_packed(&pack(&raw), &mut b);
         assert_eq!(used, raw.len() / 8 * 12);
         assert_eq!(a, b);
+    }
+
+    /// The radio's glitch: part of a packed transfer arrives as u16 words.
+    #[test]
+    fn unpacked_words_in_a_packed_transfer_are_blanked() {
+        let x = tone(3.2e6, 0.6, 8 * 16384);
+        let raw: Vec<u16> = adc_bytes(&x)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| u16::from_le_bytes(b))
+            .collect();
+        let mut bytes = pack(&raw);
+        // Clean packed data, a loud tone and a quiet input, never trips it.
+        assert!(!bytes.chunks(6144).any(looks_unpacked));
+        let quiet: Vec<u16> = (0..8 * 1024).map(|k| 2046 + (k % 5) as u16).collect();
+        assert!(!looks_unpacked(&pack(&quiet)));
+        // Bytes 512..12288 as the live glitch had them.
+        let words: Vec<u8> = raw[..5888].iter().flat_map(|w| w.to_le_bytes()).collect();
+        bytes[512..12288].copy_from_slice(&words);
+        let mut conv = RealToIq::new();
+        let mut out = Vec::new();
+        assert_eq!(conv.process_packed(&bytes, &mut out), bytes.len());
+        assert_eq!(out.len(), raw.len() / 2, "the sample count is kept");
+        assert_eq!(conv.blanked(), 2, "the two 6144-byte blocks it touches");
+        // The blanked stretch is near silence, not full-scale noise.
+        let p = |s: &[Complex32]| s.iter().map(|c| c.norm_sqr()).sum::<f32>() / s.len() as f32;
+        assert!(p(&out[100..4000]) < 0.01 * p(&out[8000..]));
     }
 
     #[test]

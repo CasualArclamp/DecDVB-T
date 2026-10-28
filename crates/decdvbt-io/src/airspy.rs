@@ -52,6 +52,8 @@ const PID: u16 = 0x60a1;
 const QUEUE: usize = 64;
 /// Bulk transfers kept in flight (libairspy uses 8 x 262 144 bytes).
 const IN_FLIGHT: usize = 8;
+/// The most a raw dump (`DECDVBT_AIRSPY_RAW`) keeps: 15 s unpacked.
+const RAW_DUMP_BYTES: usize = 600 << 20;
 
 fn map_err(e: impl std::fmt::Display) -> Error {
     Error::Other(format!("Airspy: {e}"))
@@ -333,6 +335,7 @@ pub struct AirspyControl {
     usb: Arc<Usb>,
     settings: Arc<Mutex<AirspySettings>>,
     overflows: Arc<AtomicU64>,
+    blanked: Arc<AtomicU64>,
 }
 
 impl AirspyControl {
@@ -359,6 +362,18 @@ impl AirspyControl {
     /// Buffers dropped because the consumer fell behind.
     pub fn overflows(&self) -> u64 {
         self.overflows.load(Ordering::Relaxed)
+    }
+
+    /// Packed blocks of 4096 samples that came from the radio unpacked and
+    /// were blanked (see [`RealToIq::process_packed`]).
+    pub fn blanked(&self) -> u64 {
+        self.blanked.load(Ordering::Relaxed)
+    }
+
+    /// Everything lost on the radio's side: dropped buffers and blanked
+    /// blocks, the figure the apps show as drops.
+    pub fn lost(&self) -> u64 {
+        self.overflows() + self.blanked()
     }
 }
 
@@ -477,15 +492,17 @@ impl AirspySource {
         let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
         let stop = Arc::new(AtomicBool::new(false));
         let overflows = Arc::new(AtomicU64::new(0));
+        let blanked = Arc::new(AtomicU64::new(0));
         let thread = {
             let usb = Arc::clone(&usb);
             let stop = Arc::clone(&stop);
             let overflows = Arc::clone(&overflows);
+            let blanked = Arc::clone(&blanked);
             let packed = settings.packed;
             std::thread::Builder::new()
                 .name("airspy-rx".into())
                 .spawn(move || {
-                    reader(&usb, packed, &tx, &recycle_rx, &stop, &overflows);
+                    reader(&usb, packed, &tx, &recycle_rx, &stop, &overflows, &blanked);
                     let _ = done_tx.send(());
                 })
                 .map_err(|e| Error::Other(format!("cannot start the Airspy reader: {e}")))?
@@ -501,6 +518,7 @@ impl AirspySource {
                 usb,
                 settings: Arc::new(Mutex::new(AirspySettings { gains, ..settings })),
                 overflows,
+                blanked,
             },
             stop,
             thread: Some(thread),
@@ -522,6 +540,7 @@ fn reader(
     recycle: &Receiver<Vec<Iq>>,
     stop: &AtomicBool,
     overflows: &AtomicU64,
+    blanked: &AtomicU64,
 ) {
     let size = if packed {
         proto::TRANSFER_PACKED
@@ -533,11 +552,29 @@ fn reader(
         queue.submit(RequestBuffer::new(size));
     }
     let mut conv = RealToIq::new();
+    // For diagnosing the radio: env DECDVBT_AIRSPY_RAW=path keeps the first
+    // RAW_DUMP_BYTES of bulk transfers as they came (a u32 length, then the
+    // bytes, each); `--example airspy_replay` in decdvbt-cli reads it back.
+    let mut raw_dump = std::env::var_os("DECDVBT_AIRSPY_RAW").and_then(|p| {
+        std::fs::File::create(&p)
+            .inspect_err(|e| tracing::warn!("Airspy: cannot create the raw dump: {e}"))
+            .ok()
+            .map(std::io::BufWriter::new)
+    });
+    let mut raw_left = RAW_DUMP_BYTES;
     while !stop.load(Ordering::Relaxed) {
         let done = block_on(queue.next_complete());
         if let Err(e) = done.status {
             tracing::warn!("Airspy read failed: {e}");
             break;
+        }
+        if let Some(f) = raw_dump.as_mut()
+            && raw_left >= done.data.len()
+        {
+            use std::io::Write;
+            raw_left -= done.data.len();
+            let _ = f.write_all(&(done.data.len() as u32).to_le_bytes());
+            let _ = f.write_all(&done.data);
         }
         let mut buf = recycle.try_recv().unwrap_or_default();
         if !convert_transfer(&mut conv, packed, &done.data, &mut buf) {
@@ -546,6 +583,7 @@ fn reader(
             overflows.fetch_add(1, Ordering::Relaxed);
             conv.reset();
         }
+        blanked.store(conv.blanked(), Ordering::Relaxed);
         // The transfer goes straight back in so the queue stays full.
         queue.submit(RequestBuffer::reuse(done.data, size));
         match tx.try_send(buf) {
