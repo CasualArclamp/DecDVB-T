@@ -13,13 +13,16 @@
 //! panels).
 
 mod band;
+mod band_scan;
 mod card;
 mod channel_view;
 mod epg_view;
 mod errormaps;
 mod external;
 mod freq_display;
+mod gain_opt;
 mod heatmaps;
+mod ic_stream;
 mod player;
 mod prefs;
 mod redbutton;
@@ -118,6 +121,9 @@ struct Options {
     decode: bool,
     /// Open a window at the start (for screenshots): "ts" or "epg".
     window: Option<String>,
+    /// Fill the screen (`--fullscreen`; screenshots and videos at the
+    /// monitor's size rather than 1400x860).
+    fullscreen: bool,
     /// Select this service at the start (its number).
     service: Option<u16>,
     /// Play this service as soon as the receiver has read its tables.
@@ -200,6 +206,7 @@ impl Options {
             bottom: Bottom::Scopes,
             decode: true,
             window: None,
+            fullscreen: false,
             service: None,
             play: None,
             subs: false,
@@ -272,6 +279,7 @@ impl Options {
                             .map_err(|_| "bad --service")?,
                     )
                 }
+                "--fullscreen" => o.fullscreen = true,
                 "--decode" | "--no-decode" => {
                     o.decode = a == "--decode";
                     o.decode_given = true;
@@ -386,21 +394,31 @@ fn main() -> eframe::Result {
                  [--bandwidth 8|7|6|1.7|1] [--rate MSPS] \
                  [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] \
                  [--bottom scopes|channel|heat|none] [--window ts|epg|sdr] [--service ID] [--play ID] [--subs] \
-                 [--http ADDR] [--udp ADDR] [--record] [--no-decode]"
+                 [--http ADDR] [--udp ADDR] [--record] [--no-decode] [--fullscreen]"
             );
             std::process::exit(2);
         }
     };
-    let (w, h) = opts
-        .kept
-        .window
-        .filter(|_| opts.screenshot.is_none())
-        .unwrap_or((1400, 860));
+    let (w, h) = if opts.fullscreen {
+        // Borderless at the top left, 1080p: the whole of a 1080p screen
+        // (asking for fullscreen alone left screenshot runs at 1400x860).
+        (1920, 1080)
+    } else {
+        opts.kept
+            .window
+            .filter(|_| opts.screenshot.is_none())
+            .unwrap_or((1400, 860))
+    };
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([w as f32, h as f32])
         .with_min_inner_size([900.0, 560.0])
         .with_title("DecDVB-T")
-        .with_drag_and_drop(true);
+        .with_drag_and_drop(true)
+        .with_fullscreen(opts.fullscreen)
+        .with_decorations(!opts.fullscreen);
+    if opts.fullscreen {
+        viewport = viewport.with_position([0.0, 0.0]);
+    }
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -566,7 +584,7 @@ struct App {
     sdr: sdr::SdrSettings,
     sdr_sent: Option<sdr::SdrSettings>,
     sdr_open: bool,
-    optimiser: Option<sdr::Optimiser>,
+    optimiser: Option<gain_opt::Optimiser>,
     opt_result: Option<String>,
     /// The display rate the engine was last told (it makes a waterfall row
     /// a frame, and paces what it hands over by it).
@@ -575,6 +593,10 @@ struct App {
     /// a pixel, so it moves a whole pixel a frame and the frame rate is its
     /// speed (from DecDAB, same author).
     wf_rows: usize,
+    /// The band scan (the strip along the top): the radio is lent to it for
+    /// a few seconds at a time.
+    band_scan: band_scan::BandScan,
+    scan_env_done: bool,
     /// Frames that put 0, 1 and 2 rows on the waterfall (for the screenshot
     /// report: an even scroll is all 1s), and the rows come but not yet
     /// shown: one goes on each frame.
@@ -730,6 +752,8 @@ impl App {
             opt_result: None,
             fps_sent: None,
             wf_rows: 0,
+            band_scan: band_scan::BandScan::default(),
+            scan_env_done: false,
             wf_steps: [0; 3],
             rows_due: std::collections::VecDeque::new(),
             heat: heatmaps::HeatView::default(),
@@ -1129,7 +1153,10 @@ impl App {
             return;
         };
         let sel = player::selection(p, audio, subs);
-        if sel.video.is_none() && sel.audio.is_none() {
+        // A data service with an application plays it (it may bring a
+        // stream from the internet).
+        let app = services::Kind::of(p) == services::Kind::Data && services::has_app(p);
+        if sel.video.is_none() && sel.audio.is_none() && !app {
             self.note = format!(
                 "{} has no picture or sound on air right now",
                 p.name.as_deref().unwrap_or("that service")
@@ -1218,6 +1245,27 @@ impl App {
                 self.reset_stream();
             }
         }
+    }
+
+    /// Start the band scan, or stop it and go back to the channel.
+    fn toggle_band_scan(&mut self) {
+        if let Some(back) = self.band_scan.cancel() {
+            self.finish_band_scan(back);
+            return;
+        }
+        let Some(s) = self.session.as_ref().filter(|s| s.live) else {
+            return;
+        };
+        let first = self.band_scan.start(self.channel);
+        s.rx.send(Command::Retune(first));
+        self.rows_due.clear();
+    }
+
+    /// The radio goes back to channel `n` (the view is rebuilt: it was swept).
+    fn finish_band_scan(&mut self, n: u8) {
+        self.span_hz = 0.0;
+        self.rows_due.clear();
+        self.tune_channel(n);
     }
 
     fn step_channel(&mut self, up: bool) {
@@ -1449,20 +1497,47 @@ impl App {
             self.note = "Optimising the gain needs a live radio".into();
             return;
         }
-        if self.kind == SourceKind::Airspy {
-            self.note =
-                "The gain optimiser is for the HackRF; set the Airspy's gain by hand".into();
-            return;
-        }
         self.opt_result = None;
-        self.optimiser = Some(sdr::Optimiser::new(self.gains));
+        self.optimiser = Some(if self.kind == SourceKind::Airspy {
+            // libairspy's sensitivity ladder, every other rung and the top
+            // one; then each stage is stepped about the best (gain_opt.rs).
+            let mut ladder: Vec<AirGains> = (0..=20u8)
+                .step_by(2)
+                .chain(std::iter::once(21))
+                .map(|step| {
+                    Preset {
+                        linearity: false,
+                        step,
+                    }
+                    .gains()
+                })
+                .collect();
+            ladder.dedup();
+            gain_opt::Optimiser::airspy(self.air, ladder)
+        } else {
+            gain_opt::Optimiser::hackrf(self.gains)
+        });
+    }
+
+    /// Set the radio's gains to a setting of the optimiser's.
+    fn set_opt_gains(&mut self, g: gain_opt::Gains) {
+        match g {
+            gain_opt::Gains::Air(a) => {
+                self.air = a;
+                // Stages set one by one are no preset's.
+                if self.air_preset.is_some_and(|p| p.gains() != a) {
+                    self.air_preset = None;
+                }
+            }
+            gain_opt::Gains::Hack(h) => self.gains = h,
+        }
+        self.change_gains();
     }
 
     /// Stop the optimiser and put back the gains it began with.
     fn cancel_optimiser(&mut self) {
         if let Some(o) = self.optimiser.take() {
-            self.gains = o.original;
-            self.change_gains();
+            self.set_opt_gains(o.original);
             self.opt_result = Some("cancelled".into());
         }
     }
@@ -1476,7 +1551,7 @@ impl App {
             self.optimiser = None;
             return;
         }
-        let reading = sdr::Reading {
+        let reading = gain_opt::Reading {
             now: Instant::now(),
             mer: (self.dec.decoding && self.dec.snr_db.is_finite()).then_some(self.dec.snr_db),
             cn: self.cn_db,
@@ -1484,21 +1559,15 @@ impl App {
             clip_percent: self.stats.clip_percent,
         };
         match o.tick(&reading) {
-            sdr::Action::Wait => {}
-            sdr::Action::Apply(g) => {
-                self.gains = g;
-                self.change_gains();
-            }
-            sdr::Action::Finish(best) => {
+            gain_opt::Action::Wait => {}
+            gain_opt::Action::Apply(g) => self.set_opt_gains(g),
+            gain_opt::Action::Finish(best) => {
                 let o = self.optimiser.take().expect("running");
                 let found = best.zip(o.best());
-                self.gains = best.unwrap_or(o.original);
-                self.change_gains();
+                self.set_opt_gains(best.unwrap_or(o.original));
                 self.opt_result = Some(match found {
                     Some((g, p)) => format!(
-                        "best: LNA {} VGA {}, {:.1} dB {} (level {:.0} dBFS), {} settings tried",
-                        g.lna,
-                        g.vga,
+                        "best: {g}, {:.1} dB {} (level {:.0} dBFS), {} settings tried",
                         p.mer.or(p.cn).unwrap_or(0.0),
                         if p.mer.is_some() { "MER" } else { "C/N" },
                         p.rms_dbfs,
@@ -1609,6 +1678,18 @@ impl App {
         // frames do not fall in step; a queue that grows (the display slower
         // than asked) is caught up two rows a frame, and one that has run far
         // behind is cut.
+        if self.band_scan.running() {
+            match self.band_scan.feed(&rows) {
+                band_scan::Step::Retune(hz) => {
+                    if let Some(s) = &self.session {
+                        s.rx.send(Command::Retune(hz));
+                    }
+                }
+                band_scan::Step::Done(back) => self.finish_band_scan(back),
+                band_scan::Step::Idle => {}
+            }
+            return;
+        }
         self.rows_due.extend(rows);
         let backlog = self.rows_due.len();
         if backlog > (self.opts.fps as usize).max(10) {
@@ -1984,12 +2065,6 @@ impl App {
             if before != self.kind && running {
                 self.stop();
             }
-            // The Airspy's lowest rate is 10 MS/s, and the narrow channels
-            // need the radio at 2 MS/s: it offers only the wide ones.
-            if self.kind == SourceKind::Airspy && self.bandwidth.narrow() {
-                self.set_bandwidth(Bandwidth::Mhz8);
-            }
-
             // The channel's width: what the receiver looks for (both
             // sources).
             let mut bw = self.bandwidth;
@@ -1998,9 +2073,6 @@ impl App {
                 .width(70.0)
                 .show_ui(ui, |ui| {
                     for b in Bandwidth::ALL {
-                        if self.kind == SourceKind::Airspy && b.narrow() {
-                            continue;
-                        }
                         let label = match b {
                             Bandwidth::Mhz1 => "1 MHz (DVB-T)",
                             Bandwidth::Mhz1_7 => "1.7 MHz (T2)",
@@ -2013,7 +2085,8 @@ impl App {
                 .on_hover_text(
                     "The channel's width: the receiver must be told it. 1 MHz is DVB-T with \
                      every clock of 8 MHz divided by 8 (DecDVB-T's narrow mode); 1.7 MHz is \
-                     DVB-T2's narrow channel. Both run the radio at 2 MS/s.",
+                     DVB-T2's narrow channel. Both run the HackRF at 2 MS/s; the Airspy (10 \
+                     MS/s only) decodes them from its 10 MS/s stream.",
                 );
             self.set_bandwidth(bw);
 
@@ -2141,6 +2214,20 @@ impl App {
                 }
             }
             ui.separator();
+            let live_radio = self.session.as_ref().is_some_and(|s| s.live);
+            let label = match self.band_scan.progress() {
+                Some((i, n)) => format!("■ Scan {i}/{n}"),
+                None => "⇔ Scan".to_string(),
+            };
+            if ui
+                .add_enabled(live_radio, egui::Button::new(label))
+                .on_hover_text(
+                    "Sweep the UHF band: the radio steps over every channel and the strip                      along the top shows them side by side. The gains are not changed.",
+                )
+                .clicked()
+            {
+                self.toggle_band_scan();
+            }
             if ui
                 .selectable_label(self.sdr_open, "⚙ SDR")
                 .on_hover_text(
@@ -2381,6 +2468,15 @@ impl eframe::App for App {
             self.start_optimiser();
         }
         self.optimise_tick();
+        // DECDVBT_BANDSCAN=1 (screenshots, tests): sweep once the radio runs.
+        if !self.scan_env_done
+            && std::env::var_os("DECDVBT_BANDSCAN").is_some()
+            && self.session.as_ref().is_some_and(|s| s.live)
+            && self.tuned_at.elapsed() > Duration::from_secs(3)
+        {
+            self.scan_env_done = true;
+            self.toggle_band_scan();
+        }
         self.apply_dial(ctx);
         self.remember(ctx);
         self.cpu_percent = self.cpu.poll();
@@ -2396,6 +2492,14 @@ impl eframe::App for App {
         let t0 = Instant::now();
         self.frames += 1;
         egui::Panel::top("controls").show(ui, |ui| self.control_bar(ui));
+        egui::Panel::top("band_scan")
+            .resizable(false)
+            .show(ui, |ui| {
+                let cur = self.vfo_hz.and_then(uhf_channel_at).or(Some(self.channel));
+                if let Some(band_scan::Action::Tune(n)) = self.band_scan.show(ui, 54.0, cur) {
+                    self.tune_channel(n);
+                }
+            });
         egui::Panel::bottom("receiver").show(ui, |ui| self.status_panel(ui));
         match self.bottom {
             Bottom::Channel => {

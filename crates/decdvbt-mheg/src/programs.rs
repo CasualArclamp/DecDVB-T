@@ -85,6 +85,16 @@ impl Engine {
                 out(self, 2, Value::ObjRef(r));
                 true
             }
+            // CastToStringInt(object reference, out group id, out number):
+            // CTO the other way round.
+            "CSI" => {
+                let Some(Value::ObjRef(r)) = p(0).and_then(|n| self.gvalue(n, g)) else {
+                    return false;
+                };
+                out(self, 1, Value::Str(r.group.as_bytes().to_vec()));
+                out(self, 2, Value::Int(r.num));
+                true
+            }
             "GSL" => {
                 let n = char_len(&s(self, 0));
                 out(self, 1, Value::Int(n as i32));
@@ -195,14 +205,62 @@ impl Engine {
                 out(self, 0, Value::Int(2));
                 true
             }
-            // GetICStatus: 2, no interaction channel.
+            // GetICStatus: 0 the interaction channel is up, 2 there is none.
             "GIS" => {
-                out(self, 0, Value::Int(2));
+                out(self, 0, Value::Int(if self.ic { 0 } else { 2 }));
+                true
+            }
+            // ReturnData(url, name, value, ..., out response code, out
+            // data): the name/value pairs POSTed as a form. The action waits
+            // (is tried again) until the answer is in, as for a file.
+            "RDa" if self.ic => {
+                if params.len() < 3 {
+                    return false;
+                }
+                let url = String::from_utf8_lossy(&s(self, 0)).into_owned();
+                let pairs = (params.len() - 3) / 2;
+                let mut form = Vec::new();
+                for i in 0..pairs {
+                    if i > 0 {
+                        form.push(b'&');
+                    }
+                    form_encode(&mut form, &s(self, 1 + 2 * i));
+                    form.push(b'=');
+                    let v = p(2 + 2 * i).and_then(|n| self.gvalue(n, g));
+                    form_encode(&mut form, &v.map_or(Vec::new(), |v| printable(&v)));
+                }
+                let (code, data) = match files.post(&url, &form) {
+                    Fetch::Ready(b) => (200, b),
+                    Fetch::Missing => (0, Vec::new()),
+                    Fetch::Pending => {
+                        self.block_on(format!("POST {url}").into());
+                        return false;
+                    }
+                };
+                let at = 1 + 2 * pairs;
+                out(self, at, Value::Int(code));
+                out(self, at + 1, Value::Str(data));
+                true
+            }
+            // PersistentStorageInfo(out): there is persistent storage.
+            "PST" => {
+                out(self, 0, Value::Bool(true));
+                true
+            }
+            // MeasureStreamPerformance(url, out bytes per second): -1, not
+            // measured (as freemheg).
+            "MSP" => {
+                out(self, 1, Value::Int(-1));
+                true
+            }
+            // PromptForGuidance(text, out may go on): yes.
+            "PFG" => {
+                out(self, 1, Value::Bool(true));
                 true
             }
             // WhoAmI: manufacturer, model and version (D-Book 7 §13.10.4.24).
             "WAI" => {
-                out(self, 0, Value::Str(b"DDT DecDVB-T 010".to_vec()));
+                out(self, 0, Value::Str(crate::WHO_AM_I.as_bytes().to_vec()));
                 true
             }
             _ => {
@@ -268,6 +326,28 @@ impl Engine {
 
     fn service_triplet(&self, i: i32) -> Option<(u16, u16, u16)> {
         self.service.services.get(usize::try_from(i).ok()?).copied()
+    }
+}
+
+/// A value as ReturnData sends it (as freemheg's `MHUnion::Printable`).
+fn printable(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Str(s) | Value::ContentRef(s) => s.clone(),
+        Value::Int(i) => i.to_string().into_bytes(),
+        Value::Bool(b) => (if *b { "true" } else { "false" }).as_bytes().to_vec(),
+        Value::ObjRef(r) => format!("{} {}", r.group, r.num).into_bytes(),
+    }
+}
+
+/// application/x-www-form-urlencoded: letters, digits and "-._~" as they
+/// are, a space as '+', every other byte as %XX.
+fn form_encode(out: &mut Vec<u8>, s: &[u8]) {
+    for &b in s {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b),
+            b' ' => out.push(b'+'),
+            b => out.extend_from_slice(format!("%{b:02X}").as_bytes()),
+        }
     }
 }
 

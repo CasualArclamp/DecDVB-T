@@ -14,3 +14,12 @@ decdvbt-ts = { path = "../decdvbt-ts" }
 png = "0.18.1"
 # Glyph outlines and rasterising for the text classes.
 ab_glyph = "0.2.32"
+# The interaction channel: applications and files over HTTP(S) (`ic.rs`).
+ureq = "=3.1.0"
+# HTTPS to servers whose certificate the carousel carries (auth.tls.N),
+# checked against it exactly (`ic_tls.rs`).
+rustls = { version = "=0.23.31", default-features = false, features = ["ring", "std", "tls12"] }
+# Those certificates' 1024-bit RSA keys, which ring will not check
+# signatures with (`ic_tls.rs`).
+rsa = "=0.9.6"
+sha2 = { version = "=0.10.8", features = ["oid"] }

@@ -11,6 +11,14 @@
 //! it runs: the arrows, Enter (select), Backspace or Esc (back), 0–9, R G Y
 //! B for the colour keys and T for Text. The button stops it.
 //!
+//! The interaction channel is on: an application may fetch files over the
+//! internet from the servers its carousel lists (`auth.servers`), and may ask
+//! for a stream from there in place of the broadcast, which the player then
+//! plays ([`RedButton::take_ic_stream`]). Freeview's internet channels (NHK
+//! WORLD, Al Jazeera and the like: data services) work this way. What the
+//! applications keep in the receiver's non-volatile store ("pst://", their
+//! server's device id) is kept in `%APPDATA%\DecDVB-T\mheg-store.bin`.
+//!
 //! For screenshots and tests, `DECDVBT_REDBUTTON=100,wait,15` (UK key codes,
 //! `wait` a second) starts it on the playing service and presses the keys
 //! one a second once the application has a scene (the red key that starts it
@@ -25,7 +33,10 @@
 
 use std::time::{Duration, Instant};
 
+use crate::prefs;
+
 use decdvbt_engine::CarouselLink;
+use decdvbt_mheg::ic::{Http, IcFiles, USER_AGENT};
 use decdvbt_mheg::{Engine, Renderer, Request, Service, key};
 use eframe::egui::{
     self, Color32, ColorImage, Key, Modifiers, Rect, TextureHandle, TextureOptions, pos2,
@@ -34,6 +45,12 @@ use eframe::egui::{
 /// How long the application must sit idle in a scene before the red key
 /// that started it is pressed.
 const SETTLE: Duration = Duration::from_millis(1500);
+
+/// The status of a service whose carousel never came.
+const NO_APP: &str = "this service has no interactive application";
+
+/// How often the non-volatile store is looked at for changes to save.
+const STORE_EVERY_MS: u64 = 2000;
 
 /// The canvas (D-Book 7 §13.10.1).
 const W: f32 = 720.0;
@@ -55,6 +72,14 @@ pub struct RedButton {
     video: Option<(i32, i32, i32, i32)>,
     /// A service of this multiplex the application asked to tune to.
     tune: Option<u16>,
+    /// The interaction channel's fetches (made with the engine).
+    http: Option<Http>,
+    /// A stream the application asked for (Some(None): the broadcast
+    /// again), for the player to take.
+    ic_stream: Option<Option<String>>,
+    /// The non-volatile store as last saved, and when it was last looked at.
+    store_saved: Vec<u8>,
+    store_at: u64,
     pub status: String,
     /// `DECDVBT_REDBUTTON`'s keys still to press, and when the last was.
     script: Option<Vec<String>>,
@@ -65,6 +90,12 @@ pub struct RedButton {
 impl RedButton {
     pub fn active(&self) -> bool {
         self.link.is_some()
+    }
+
+    /// Whether the application has a scene to draw (a radio service shows
+    /// its level meters until it does, and when it has no application).
+    pub fn shows_app(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.has_scene())
     }
 
     pub fn service(&self) -> Option<u16> {
@@ -95,8 +126,14 @@ impl RedButton {
     }
 
     pub fn stop(&mut self) {
+        self.save_store();
         self.link = None;
         self.engine = None;
+        self.http = None;
+        // An internet stream it started stops with it.
+        if self.ic_stream.is_none() {
+            self.ic_stream = Some(None);
+        }
         self.texture = None;
         self.video = None;
         self.pending_red = false;
@@ -131,7 +168,7 @@ impl RedButton {
         let st = link.state.lock().unwrap();
         let Some(oc) = st.carousel.as_ref() else {
             if st.absent {
-                self.status = "this service has no interactive application".into();
+                self.status = NO_APP.into();
             }
             return;
         };
@@ -147,11 +184,21 @@ impl RedButton {
                 // DECDVBT_REDBUTTON_TRACE=1: the engine's trace on stderr.
                 e.tracing = std::env::var_os("DECDVBT_REDBUTTON_TRACE").is_some();
                 e.trace_stderr = e.tracing;
-                e.boot(oc);
+                if let Some(b) = prefs::mheg_store().and_then(|p| std::fs::read(p).ok()) {
+                    e.load_nonvolatile(&b);
+                }
+                self.store_saved = e.save_nonvolatile();
+                e.ic = true;
+                let http = self.http.insert(Http::new(USER_AGENT));
+                e.boot(&IcFiles { carousel: oc, http });
                 self.status.clear();
                 self.engine.insert(e)
             }
         };
+        let Some(http) = self.http.as_ref() else {
+            return;
+        };
+        let files = IcFiles { carousel: oc, http };
         engine.service = Service {
             original_network_id: st.original_network_id.unwrap_or(0),
             transport_stream_id: st.ts_id.unwrap_or(0),
@@ -178,10 +225,11 @@ impl RedButton {
             self.pending_red = false;
             engine.key(key::RED);
         }
-        let changed = engine.tick(now_ms, oc);
+        let changed = engine.tick(now_ms, &files);
         for r in engine.requests.drain(..) {
             match r {
                 Request::Video(v) => self.video = v,
+                Request::IcStream(s) => self.ic_stream = Some(s),
                 // TuneIndex: a service of this multiplex is played; others
                 // would need a retune, which is the app's to do (not yet).
                 Request::Tune(i) => {
@@ -192,6 +240,17 @@ impl RedButton {
                         self.tune = Some(sid);
                     }
                 }
+            }
+        }
+        if now_ms >= self.store_at + STORE_EVERY_MS {
+            self.store_at = now_ms;
+            let store = engine.save_nonvolatile();
+            if store != self.store_saved {
+                if let Some(p) = prefs::mheg_store() {
+                    let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+                    let _ = std::fs::write(&p, &store);
+                }
+                self.store_saved = store;
             }
         }
         if let Some(e) = &engine.error {
@@ -219,6 +278,25 @@ impl RedButton {
     /// The service the application asked to be tuned to, once.
     pub fn take_tune(&mut self) -> Option<u16> {
         self.tune.take()
+    }
+
+    /// The internet stream the application asked to play (Some(None): back
+    /// to the broadcast), once.
+    pub fn take_ic_stream(&mut self) -> Option<Option<String>> {
+        self.ic_stream.take()
+    }
+
+    /// Save the non-volatile store now if it changed.
+    fn save_store(&mut self) {
+        let Some(e) = &self.engine else { return };
+        let store = e.save_nonvolatile();
+        if store != self.store_saved
+            && let Some(p) = prefs::mheg_store()
+        {
+            let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+            let _ = std::fs::write(&p, &store);
+            self.store_saved = store;
+        }
     }
 
     /// Draw the canvas over the picture's `rect`.

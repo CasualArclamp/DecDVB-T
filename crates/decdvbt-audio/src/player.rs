@@ -43,8 +43,13 @@ const QUEUE: usize = 512;
 static VOLUME: AtomicU32 = AtomicU32::new(0x3F33_3333); // 0.7f32
 static MUTED: AtomicBool = AtomicBool::new(false);
 
+/// The gain at the top of the app-wide volume's travel: twice the decoded
+/// level (+6 dB), since broadcast sound is mastered quiet. Samples are
+/// clipped at full scale.
+const MAX_GAIN: f32 = 2.0;
+
 /// Set the app-wide volume, 0..=1 (a slider position; the gain applied is
-/// its cube, so the slider's travel follows loudness).
+/// its cube times [`MAX_GAIN`], so the slider's travel follows loudness).
 pub fn set_volume(v: f32) {
     VOLUME.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
 }
@@ -62,7 +67,11 @@ pub fn muted() -> bool {
 }
 
 fn gain() -> f32 {
-    if muted() { 0.0 } else { volume().powi(3) }
+    if muted() {
+        0.0
+    } else {
+        MAX_GAIN * volume().powi(3)
+    }
 }
 
 /// The sound output chosen by name (`None`: the system's default), and a
@@ -448,7 +457,7 @@ where
                 match (ring.buf.pop_front(), ring.buf.pop_front()) {
                     (Some(l), Some(r)) => {
                         played += 1;
-                        (l * g, r * g)
+                        ((l * g).clamp(-1.0, 1.0), (r * g).clamp(-1.0, 1.0))
                     }
                     _ => {
                         ring.primed = false;
@@ -647,7 +656,9 @@ mod tests {
     #[test]
     fn volume_is_cubed_and_mute_wins() {
         set_volume(0.5);
-        assert!((gain() - 0.125).abs() < 1e-6);
+        assert!((gain() - 0.125 * MAX_GAIN).abs() < 1e-6);
+        set_volume(1.0);
+        assert!((gain() - MAX_GAIN).abs() < 1e-6);
         set_muted(true);
         assert_eq!(gain(), 0.0);
         set_muted(false);

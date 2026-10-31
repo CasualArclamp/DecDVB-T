@@ -6,13 +6,23 @@
 
 use std::path::PathBuf;
 
-fn file() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
+/// The app's folder (`%APPDATA%\DecDVB-T`).
+pub fn dir() -> Option<PathBuf> {
+    if cfg!(windows) {
         std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("DecDVB-T"))
     } else {
         std::env::var_os("HOME").map(|d| PathBuf::from(d).join(".config").join("decdvbt"))
-    }?;
-    Some(base.join("prefs.txt"))
+    }
+}
+
+fn file() -> Option<PathBuf> {
+    Some(dir()?.join("prefs.txt"))
+}
+
+/// The MHEG engine's non-volatile store ("pst://": Freeview's internet
+/// channels keep the device id their server gave this receiver there).
+pub fn mheg_store() -> Option<PathBuf> {
+    Some(dir()?.join("mheg-store.bin"))
 }
 
 pub fn get(key: &str) -> Option<String> {

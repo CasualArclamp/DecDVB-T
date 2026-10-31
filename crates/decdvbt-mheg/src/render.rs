@@ -67,6 +67,10 @@ struct Glyph {
     cover: Vec<u8>,
 }
 
+/// A bitmap scaled down into its box: the image it came from (to tell a
+/// reused address) and the small copy.
+type Shrunk = (std::rc::Weak<Image>, Rc<Image>);
+
 /// The canvas and what draws on it.
 pub struct Renderer {
     pub rgba: Vec<u8>,
@@ -75,6 +79,9 @@ pub struct Renderer {
     /// The font's horizontal scale (see [`font_candidates`]).
     squeeze: f32,
     glyphs: HashMap<(GlyphId, u32, u32), Rc<Glyph>>,
+    /// Bitmaps scaled down into their boxes: (image's address, w, h) ->
+    /// (the image, to tell a reused address, and the small copy).
+    shrunk: HashMap<(usize, u32, u32), Shrunk>,
 }
 
 impl Default for Renderer {
@@ -137,6 +144,7 @@ impl Renderer {
             font_name,
             squeeze,
             glyphs: HashMap::new(),
+            shrunk: HashMap::new(),
         }
     }
 
@@ -196,7 +204,23 @@ impl Renderer {
                 offset,
             } => {
                 if let Some(img) = image {
-                    self.bitmap(img, x, y, w, h, *tiling, *scale, *offset);
+                    // A bitmap larger than its box is scaled into it, not
+                    // clipped (MythTV's mhi.cpp: "the BBC expects bitmaps
+                    // to be scaled"; Freeview's internet channels send their
+                    // titles and logos at the HD plane's size, 500x70 for a
+                    // 282x56 box): drawn in the part of the box it covers.
+                    let fit = (img.w as i32).min(w).max(1) as u32;
+                    let fit_h = (img.h as i32).min(h).max(1) as u32;
+                    if !*tiling
+                        && scale.is_none()
+                        && *offset == (0, 0)
+                        && (fit, fit_h) != (img.w, img.h)
+                    {
+                        let small = self.shrunk(img, fit, fit_h);
+                        self.bitmap(&small, x, y, w, h, false, None, (0, 0));
+                    } else {
+                        self.bitmap(img, x, y, w, h, *tiling, *scale, *offset);
+                    }
                 }
                 let _ = o.class == C_BITMAP;
             }
@@ -303,6 +327,53 @@ impl Renderer {
                 self.blend((row * WIDTH + col) * 4, [p[0], p[1], p[2]], p[3] as u32);
             }
         }
+    }
+
+    /// `img` made `w` x `h` by averaging the pixels each new one covers
+    /// (alpha-weighted, so a white title on clear stays white), kept until
+    /// the image goes.
+    fn shrunk(&mut self, img: &Rc<Image>, w: u32, h: u32) -> Rc<Image> {
+        let key = (Rc::as_ptr(img) as usize, w, h);
+        if let Some((weak, small)) = self.shrunk.get(&key)
+            && weak.upgrade().is_some_and(|i| Rc::ptr_eq(&i, img))
+        {
+            return small.clone();
+        }
+        // Images that went are dropped from the cache now and then.
+        self.shrunk.retain(|_, (weak, _)| weak.strong_count() > 0);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for dy in 0..h {
+            let (y0, y1) = (
+                dy * img.h / h,
+                ((dy + 1) * img.h / h).max(dy * img.h / h + 1),
+            );
+            for dx in 0..w {
+                let (x0, x1) = (
+                    dx * img.w / w,
+                    ((dx + 1) * img.w / w).max(dx * img.w / w + 1),
+                );
+                let (mut acc, mut alpha, mut n) = ([0u64; 3], 0u64, 0u64);
+                for sy in y0..y1.min(img.h) {
+                    for sx in x0..x1.min(img.w) {
+                        let p = &img.rgba[((sy * img.w + sx) * 4) as usize..][..4];
+                        let a = p[3] as u64;
+                        for k in 0..3 {
+                            acc[k] += p[k] as u64 * a;
+                        }
+                        alpha += a;
+                        n += 1;
+                    }
+                }
+                let o = ((dy * w + dx) * 4) as usize;
+                for k in 0..3 {
+                    rgba[o + k] = acc[k].checked_div(alpha).unwrap_or(0) as u8;
+                }
+                rgba[o + 3] = (alpha / n.max(1)) as u8;
+            }
+        }
+        let small = Rc::new(Image { w, h, rgba });
+        self.shrunk.insert(key, (Rc::downgrade(img), small.clone()));
+        small
     }
 
     /// A glyph at `size`, squeezed across by `k` on top of the font's own

@@ -28,16 +28,92 @@ impl std::fmt::Display for Ref {
     }
 }
 
+thread_local! {
+    /// The root of the current source while the running application came
+    /// over the interaction channel: the folder of its URL, which "/x" and
+    /// "//x" are taken from. Set by the engine on Launch, Spawn and Quit.
+    /// (A thread-local because group ids are made absolute in many places
+    /// with only the group at hand; the engine is single-threaded, `Rc`.)
+    pub(crate) static IC_ROOT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether a reference is a URL (the interaction channel).
+pub fn is_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// A URL's folder, with its trailing slash: "http://h/d/a" is "http://h/d/".
+pub fn url_dir(u: &str) -> &str {
+    let path_from = u.find("://").map_or(0, |i| i + 3);
+    let end = u[path_from..].split('?').next().unwrap_or("").len() + path_from;
+    match u[path_from..end].rfind('/') {
+        Some(i) => &u[..path_from + i + 1],
+        None => u,
+    }
+}
+
+/// "a/./b" and "a/../b" taken out of a URL's path (not its query).
+fn normal_url(u: &str) -> String {
+    let (head, query) = match u.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (u, None),
+    };
+    let Some(i) = head.find("://") else {
+        return u.to_string();
+    };
+    let (scheme_host, path) = match head[i + 3..].find('/') {
+        Some(j) => head.split_at(i + 3 + j),
+        None => (head, ""),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for c in path.split('/').skip(1) {
+        match c {
+            "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    let mut out = format!("{scheme_host}/{}", parts.join("/"));
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    out
+}
+
 /// A group id as written in a file ("~//a", "DSM://s/x.mhg", "/s/x.mhg",
 /// "x.mhg") made absolute against `base` (the group it was written in): the
 /// carousel path, "/s/x.mhg".
+///
+/// The interaction channel (ETSI ES 202 184, the IC part): a URL stays a URL;
+/// in an application that came over HTTP, a path with no source is on that
+/// source too ("x" from the group's folder, "/x" and "//x" from the root of
+/// the current source, [`IC_ROOT`]), and "DSM:" still names the carousel.
 pub fn canonical(id: &[u8], base: &str) -> Rc<str> {
     let s = String::from_utf8_lossy(id);
     let mut s: &str = &s;
+    if is_url(s) {
+        return normal_url(s).into();
+    }
+    let carousel = s.starts_with("DSM:") || s.starts_with("dsm:");
     for p in ["DSM:", "dsm:", "~"] {
         if let Some(r) = s.strip_prefix(p) {
             s = r;
         }
+    }
+    if !carousel && is_url(base) && !s.contains("://") {
+        let joined = if let Some(rest) = s.strip_prefix('/') {
+            let root = IC_ROOT
+                .with(|r| r.borrow().clone())
+                .unwrap_or_else(|| url_dir(base).to_string());
+            format!("{root}{}", rest.trim_start_matches('/'))
+        } else {
+            format!("{}{s}", url_dir(base))
+        };
+        return normal_url(&joined).into();
     }
     let path = if s.starts_with('/') {
         s.trim_start_matches('/').to_string()
@@ -337,6 +413,27 @@ pub struct TokenGroup {
     pub no_token_slots: Vec<Slot>,
     /// 1-based; 0 means none.
     pub token: i32,
+    /// A ListGroup's list (None for a plain token group).
+    pub list: Option<Box<List>>,
+}
+
+/// A ListGroup's own state (ISO/IEC 13522-5 §37): its items in list order,
+/// the cells they are shown in, and the first item shown.
+#[derive(Debug, Clone, Default)]
+pub struct List {
+    /// The cells' positions; cell n shows item `first + n - 1`.
+    pub positions: Vec<(i32, i32)>,
+    pub wrap_around: bool,
+    pub multiple_selection: bool,
+    /// (item, selected).
+    pub items: Vec<(Ref, bool)>,
+    /// 1-based.
+    pub first: i32,
+    pub first_shown: bool,
+    pub last_shown: bool,
+    /// The size and first item at the last update (HeadItems, TailItems).
+    pub last_count: i32,
+    pub last_first: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -554,12 +651,30 @@ pub fn load_ingredient(n: &Node, group: &Rc<str>) -> Vec<Obj> {
                     })
                     .collect()
             };
-            let items = n
+            let items: Vec<(Ref, Vec<Slot>)> = n
                 .get(C_TOKEN_GROUP_ITEMS)
                 .map_or(&[][..], |s| s.args())
                 .iter()
                 .filter_map(|it| Some((object_ref(it.arg(0)?, group)?, slots(it.arg(1)))))
                 .collect();
+            // The list starts as the token group's items (freemheg's
+            // MHListGroup::Preparation).
+            let list = (class == C_LIST_GROUP).then(|| {
+                Box::new(List {
+                    positions: n
+                        .get(C_POSITIONS)
+                        .map_or(&[][..], |s| s.args())
+                        .iter()
+                        .filter_map(|p| pair(Some(p)))
+                        .collect(),
+                    wrap_around: n.get_bool(C_WRAP_AROUND).unwrap_or(false),
+                    multiple_selection: n.get_bool(C_MULTIPLE_SELECTION).unwrap_or(false),
+                    items: items.iter().map(|i| (i.0.clone(), false)).collect(),
+                    first: 1,
+                    last_first: 1,
+                    ..Default::default()
+                })
+            });
             let movement = n
                 .get(C_MOVEMENT_TABLE)
                 .map_or(&[][..], |s| s.args())
@@ -571,6 +686,7 @@ pub fn load_ingredient(n: &Node, group: &Rc<str>) -> Vec<Obj> {
                 items,
                 no_token_slots: slots(n.get(C_NO_TOKEN_ACTION_SLOTS)),
                 token: 1,
+                list,
             })
         }
         C_STREAM => {
@@ -645,5 +761,45 @@ mod tests {
         assert_eq!(&*canonical(b"/g/r.png", base), "/g/r.png");
         assert_eq!(&*canonical(b"menu.mhg", base), "/s/menu.mhg");
         assert_eq!(&*canonical(b"../g/x.png", base), "/g/x.png");
+    }
+
+    #[test]
+    fn group_ids_over_http() {
+        // NHK WORLD's loader on Freeview asks for "/apps.txt" beside itself.
+        let base = "http://cdn.example.com/apps/nhk/cont/a";
+        IC_ROOT.with(|r| *r.borrow_mut() = Some(url_dir(base).to_string()));
+        let c = |s: &[u8]| canonical(s, base).to_string();
+        assert_eq!(
+            c(b"/apps.txt"),
+            "http://cdn.example.com/apps/nhk/cont/apps.txt"
+        );
+        assert_eq!(
+            c(b"//apps.txt"),
+            "http://cdn.example.com/apps/nhk/cont/apps.txt"
+        );
+        assert_eq!(
+            c(b"s/x.mhg"),
+            "http://cdn.example.com/apps/nhk/cont/s/x.mhg"
+        );
+        assert_eq!(
+            c(b"../img/x.png"),
+            "http://cdn.example.com/apps/nhk/img/x.png"
+        );
+        assert_eq!(c(b"DSM://ml/icerror.txt"), "/ml/icerror.txt");
+        assert_eq!(
+            c(b"https://h.example.com/m/?op=a&x=b/../c"),
+            "https://h.example.com/m/?op=a&x=b/../c"
+        );
+        // A scene in a sub-folder still takes "/" from the application's root.
+        let scene = "http://cdn.example.com/apps/nhk/cont/s/menu.mhg";
+        assert_eq!(
+            canonical(b"/i.png", scene).to_string(),
+            "http://cdn.example.com/apps/nhk/cont/i.png"
+        );
+        IC_ROOT.with(|r| *r.borrow_mut() = None);
+        assert_eq!(
+            url_dir("http://h.example.com/a?x=/y"),
+            "http://h.example.com/"
+        );
     }
 }

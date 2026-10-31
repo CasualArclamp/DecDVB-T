@@ -1702,6 +1702,21 @@ echoes' relative delays are right.
   `--target x86_64-pc-windows-msvc` links the C runtime statically (no Visual
   C++ redistributable); the earlier releases' exes did need it.
 
+## Radio autostart and the band scan strip (2026-10-28)
+
+- **A radio service's MHEG app starts on tuning**, without the red key (`TvWindow::start`):
+  BBC radio shows its album art / "Now Playing" screen as a set-top box does, and the
+  Red Button toggle no longer presses red (which opened the menu over the art). The
+  level meters show until the app has a scene (or when it has none). Checked headless on
+  C39 (BBC Radio 2). Heart/Capital (C34) draw only their red brand
+  rectangle: the logo Bitmap has no image (not investigated).
+- **Band scan** (`apps/decdvbt-gui/src/band_scan.rs`, the "⇔ Scan" button; `DECDVBT_BANDSCAN=1`
+  runs one for screenshots): the live radio steps over C21-C48, averages 8 engine
+  rows per channel (32 columns across 8 MHz), puts itself back on the channel, and
+  a short strip under the controls shows the stitched trace with channel numbers; a
+  click tunes. It leaves the gains alone. Checked on the Airspy:
+  C32-35, C39, C42 (DVB-T) and C45 (T2) stand out.
+
 ## Airspy R2 glitches: packed blanking, timing slips (2026-10-28)
 
 Found with a live soak on a 64-QAM 2/3 8K mux (`--example airspy_live`) and replays of
@@ -1728,3 +1743,86 @@ the radio.
   went from a false 20-80 ppm (the CP and pilot loops pulling against each other)
   to 1-4 ppm.
 - Live 60 s unpacked before/after: 47 loss bursts → 13 single blips.
+
+## Narrow channels on the Airspy R2 (2026-10-28)
+
+- The 1 MHz (DVB-T) and 1.7 MHz (DVB-T2) widths are offered for the Airspy in the GUI and
+  CLI (they were hidden: "its lowest rate is 10 MS/s"). No DSP change was needed: the
+  receivers take the radio's rate and their own DDC/FFT front end decimates, so a narrow
+  signal decodes from the 10 MS/s stream as it does from the HackRF's 2 MS/s.
+  `crates/decdvbt-rx/tests/narrow_wide.rs` checks both byte for byte at 10 MS/s (the T2
+  signal is generated at 2 MS/s and upsampled by 5: the modulator has no simple ratio from
+  1.845 MS/s to 10): 1 MHz 2k QPSK ~5 % and 1.7 MHz 8k 16-QAM ~14 % of real time in the
+  receiver alone. Not yet tried on air with the Airspy.
+
+## Gain optimiser for the Airspy R2 (2026-10-29)
+
+- `apps/decdvbt-gui/src/gain_opt.rs`, copied back from DecLAB: one optimiser for
+  both radios. The HackRF's search is unchanged (total gain in 4 dB steps, then
+  LNA/VGA splits), plus DecLAB's "no signal" guard (best C/N under 3 dB: keep
+  the old gains). The Airspy climbs libairspy's sensitivity ladder (every other
+  rung and 21), then up to three rounds stepping each stage by 2 about the best.
+  "Optimise gain" now shows for the Airspy in the SDR window (and `--optimise`).
+  Gains it sets that match no preset show as "custom". Unit-tested only; not
+  yet run on air.
+
+## Freeview's internet channels: the MHEG-5 interaction channel (2026-10-31)
+
+Asked for: the data services of a UK commercial mux that a television plays (NHK WORLD,
+Al Jazeera, FRANCE 24, EuroNews, Tiny Pop… listed as "data", "off air"). They are
+MHEG-IC: the service's carousel has a launcher (`/startup`) and a table (`cse.cfg`)
+naming, per service id, an MHEG-5 application on the internet; that application fetches
+its scenes and a stream description, asks the operator's server for a device id and a
+playlist, and plays an MPEG transport stream over HTTP (H.264 SD, AAC-LATM). Done as a
+receiver would, with nothing pretended: the requests carry `WhoAmI` ("DDT DecDVB-T 010",
+user agent `DecDVB-T MHEG-5 (…)`), and the applications' own logic then serves an unknown
+receiver its SD streams.
+
+- **`decdvbt-mheg::ic`**: `Http` (GETs on four threads, cached; ReturnData POSTs) and
+  `IcFiles` (the carousel with URLs beside it, only to servers in the carousel's
+  `auth.servers`). Group ids and content refs may be URLs; in an application that came
+  over HTTP, "/x" and "//x" are from its folder (`obj::IC_ROOT`), "DSM:" still the
+  carousel. `GetICStatus` 0 and `ICProfile` when `Engine::ic`.
+- **TLS from the carousel** (`ic_tls.rs`): the carousel's `auth.tls.N` (16-bit count,
+  24-bit length + DER each) are the server certificates to trust. Freeview's is
+  self-signed, CA:TRUE, RSA-1024, SHA-1, which webpki (CA as end entity) and ring (key
+  under 2048 bits) refuse: a server is taken only if it shows exactly one of those
+  certificates, and the handshake signature is checked with RustCrypto `rsa`.
+- **Engine fixes the application needed** (each was a stall): SetData drops the old
+  content's queued ContentAvailable (it read the old file as the new); Run/Stop/Preload/
+  Unload/SetData on object 0 (a group) are ignored, ISO/IEC 13522-5 gives them to
+  ingredients only (its image table "freed" slot 0 and stopped its own scene); a
+  close-down that stops its own group no longer recurses; the **ListGroup class**
+  (`list.rs`, after freemheg's MHListGroup: AddItem, DelItem, GetListItem, GetListSize,
+  GetCellItem, selection, scrolling, cells, the presented/head/tail events);
+  `GetBitmapDecodeOffset`; programs `CSI` (CastToStringInt), `RDa` (ReturnData, a form
+  POST; the action waits for the answer), `PST`, `MSP`, `PFG`.
+- **Non-volatile store**: "pst://" names (the server's device id) are kept:
+  `Engine::save_nonvolatile` / `load_nonvolatile`; the GUI keeps them in
+  `%APPDATA%\DecDVB-T\mheg-store.bin`. The first tuning registers ("#duidAssigned"),
+  later ones log in ("#duidOkay") and get the playlist.
+- **`Request::IcStream(Some(url))`** when a Stream with an http(s) content runs (or is
+  given one); `None` when it stops.
+- **GUI**: a data service with an MHEG application (data broadcast id 0x0106) lists as
+  "app" and plays: its application starts on tuning (as radio's), no broadcast ffmpeg.
+  `ic_stream.rs` reads the stream on a thread, waits for its PAT/PMT, and hands the
+  packets to the usual `VideoPlayer` **paced by the stream's PCR** (the server sends the
+  first seconds in a burst; unpaced, the sound ran 5 s ahead and the player went by the
+  wall clock and skipped pictures). "Back to broadcast" plays the service again.
+- `redbutton` example: `--ic` (files over HTTP, real time) and `--nv FILE`; it prints
+  the fetches and what the operator's server answered.
+- **Checked live** (Airspy R2, a UK commercial mux): NHK WORLD plays in the TV window,
+  timed by the sound (1911 pictures shown, 1 dropped in ~75 s), whole app ~70 % of a
+  core with the receiver running (the stream itself is ffmpeg's H.264 decode). Only NHK
+  WORLD was tried; the other channels use the same launcher with their own applications
+  and may need more of the engine. The application's own graphics (its menus, now/next
+  banner) were not checked. Not done: the IC stream's counter actions
+  (`GetCounterMaxPosition`, `SetCounterEndPosition`), cookies, HTTPS streams to
+  carousel-pinned servers (ureq only), a setting to turn the interaction channel off.
+- **On Demand 365** (same mux, its app builds its EPG from a server template) needed two more
+  fixes, checked headless against a photo of a television showing it: bitmaps larger than their
+  box are scaled into it, as MythTV draws them ("the BBC expects bitmaps to be scaled"), not
+  clipped (its titles and logos are HD-plane sized: 500x70 for a 282x56 box; downscaled by
+  averaging, cached); and a ListGroup applies its update behaviour only while running (the app
+  stops a list and keeps its background panels and grid cells in it; updating hid them). The
+  BBC Red Button pages are unchanged.

@@ -20,6 +20,7 @@ cargo run --release -p decdvbt-cli -- sound captures/c26_514.000MHz_10Msps.cs8  
 cargo run --release -p decdvbt-cli -- decode captures/c23_490.000MHz_10Msps_amp.cs8 -o out/c23.ts  # a transport stream, the services, RS and CPU stats
 cargo run --release -p decdvbt-cli -- decode out/c23.ts --carousel 4416 out/rb   # a .ts as it is; service 4416's DSM-CC carousel (Red Button) to a folder
 cargo run --release -p decdvbt-mheg --example redbutton -- out/live_c30.ts --sid 17536 --keys wait,100,wait,15 --png out/rb.png   # a service's MHEG-5 app, headless (--trace)
+cargo run --release -p decdvbt-mheg --example redbutton -- out/x.ts --sid SID --ic --nv out/nv.bin --seconds 30   # a Freeview internet channel's app over the interaction channel (real servers; prints the fetches and the stream it asks for)
 cargo run --release -p decdvbt-cli -- capture C23 --amp --lna 32 --vga 8 --record x.cs8  # the RF amp must be on for DVB-T
 cargo run --release -p decdvbt-cli -- decode C23 --radio airspy -o out/c23.ts   # Airspy R2 (10 MS/s only; --airspy-preset sensitivity:10|linearity:N, --airspy-lna/-mixer/-vga, --airspy-packed)
 cargo run --release -p decdvbt-io --features airspy --example airspy_convert_bench   # the Airspy real-to-IQ converter: ns per sample
