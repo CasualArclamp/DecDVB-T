@@ -121,6 +121,9 @@ struct Options {
     decode: bool,
     /// Open a window at the start (for screenshots): "ts" or "epg".
     window: Option<String>,
+    /// Fill the screen (`--fullscreen`; screenshots and videos at the
+    /// monitor's size rather than 1400x860).
+    fullscreen: bool,
     /// Select this service at the start (its number).
     service: Option<u16>,
     /// Play this service as soon as the receiver has read its tables.
@@ -203,6 +206,7 @@ impl Options {
             bottom: Bottom::Scopes,
             decode: true,
             window: None,
+            fullscreen: false,
             service: None,
             play: None,
             subs: false,
@@ -275,6 +279,7 @@ impl Options {
                             .map_err(|_| "bad --service")?,
                     )
                 }
+                "--fullscreen" => o.fullscreen = true,
                 "--decode" | "--no-decode" => {
                     o.decode = a == "--decode";
                     o.decode_given = true;
@@ -389,21 +394,31 @@ fn main() -> eframe::Result {
                  [--bandwidth 8|7|6|1.7|1] [--rate MSPS] \
                  [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] \
                  [--bottom scopes|channel|heat|none] [--window ts|epg|sdr] [--service ID] [--play ID] [--subs] \
-                 [--http ADDR] [--udp ADDR] [--record] [--no-decode]"
+                 [--http ADDR] [--udp ADDR] [--record] [--no-decode] [--fullscreen]"
             );
             std::process::exit(2);
         }
     };
-    let (w, h) = opts
-        .kept
-        .window
-        .filter(|_| opts.screenshot.is_none())
-        .unwrap_or((1400, 860));
+    let (w, h) = if opts.fullscreen {
+        // Borderless at the top left, 1080p: the whole of a 1080p screen
+        // (asking for fullscreen alone left screenshot runs at 1400x860).
+        (1920, 1080)
+    } else {
+        opts.kept
+            .window
+            .filter(|_| opts.screenshot.is_none())
+            .unwrap_or((1400, 860))
+    };
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([w as f32, h as f32])
         .with_min_inner_size([900.0, 560.0])
         .with_title("DecDVB-T")
-        .with_drag_and_drop(true);
+        .with_drag_and_drop(true)
+        .with_fullscreen(opts.fullscreen)
+        .with_decorations(!opts.fullscreen);
+    if opts.fullscreen {
+        viewport = viewport.with_position([0.0, 0.0]);
+    }
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
     }
