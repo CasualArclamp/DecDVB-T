@@ -1819,3 +1819,10 @@ receiver its SD streams.
   banner) were not checked. Not done: the IC stream's counter actions
   (`GetCounterMaxPosition`, `SetCounterEndPosition`), cookies, HTTPS streams to
   carousel-pinned servers (ureq only), a setting to turn the interaction channel off.
+- **On Demand 365** (same mux, its app builds its EPG from a server template) needed two more
+  fixes, checked headless against a photo of a television showing it: bitmaps larger than their
+  box are scaled into it, as MythTV draws them ("the BBC expects bitmaps to be scaled"), not
+  clipped (its titles and logos are HD-plane sized: 500x70 for a 282x56 box; downscaled by
+  averaging, cached); and a ListGroup applies its update behaviour only while running (the app
+  stops a list and keeps its background panels and grid cells in it; updating hid them). The
+  BBC Red Button pages are unchanged.

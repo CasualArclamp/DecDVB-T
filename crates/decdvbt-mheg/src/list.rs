@@ -124,6 +124,17 @@ impl Engine {
         }
     }
 
+    /// The list changed (an item added, scrolled): a running list shows it
+    /// at once; a stopped one only holds its items (ISO/IEC 13522-5 §37:
+    /// the update behaviour is the active list's; On Demand 365's app
+    /// stops a list and keeps its graphics in it, which an update would
+    /// have hidden).
+    fn list_changed(&mut self, t: &Ref, files: &dyn Files) {
+        if self.objs.get(t).is_some_and(|o| o.running) {
+            self.list_update(t, files);
+        }
+    }
+
     /// Activation of a list: nothing presented yet, then an update.
     pub(crate) fn list_activated(&mut self, t: &Ref, files: &dyn Files) {
         if let Some(l) = self.list_mut(t) {
@@ -237,7 +248,7 @@ impl Engine {
                 if index <= l.first && l.first < l.items.len() as i32 {
                     l.first += 1;
                 }
-                self.list_update(t, files);
+                self.list_changed(t, files);
             }
             C_DEL_ITEM => {
                 let Some(item) = arg(1).and_then(|n| self.gref(n, g)) else {
@@ -323,7 +334,7 @@ impl Engine {
                 if let Some(l) = self.list_mut(t) {
                     l.first = i;
                 }
-                self.list_update(t, files);
+                self.list_changed(t, files);
             }
             _ => return false,
         }

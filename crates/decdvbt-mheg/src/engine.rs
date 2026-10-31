@@ -1486,6 +1486,7 @@ impl Engine {
             | C_SET_BITMAP_DECODE_OFFSET
             | C_SET_VIDEO_DECODE_OFFSET => {
                 let (x, y) = (self.gint(arg(1), g), self.gint(arg(2), g));
+                self.log(|| format!("    ({x}, {y})"));
                 if let Some(v) = self.visible_mut(&t) {
                     match tag {
                         C_SET_POSITION => v.pos = (x, y),
@@ -1551,6 +1552,7 @@ impl Engine {
             }
             C_SET_FILL_COLOUR | C_SET_LINE_COLOUR | C_SET_TEXT_COLOUR | C_SET_BACKGROUND_COLOUR => {
                 let c = self.colour(arg(1), g);
+                self.log(|| format!("    {c:?}"));
                 if let Some(v) = self.visible_mut(&t) {
                     match tag {
                         C_SET_FILL_COLOUR => v.fill_colour = c,
@@ -1667,6 +1669,7 @@ impl Engine {
             C_GET_ENGINE_SUPPORT => {
                 let f = self.gstr(arg(1), g);
                 let ok = engine_support(&String::from_utf8_lossy(&f), self.ic);
+                self.log(|| format!("    {:?} -> {ok}", String::from_utf8_lossy(&f)));
                 if let Some(v) = arg(2).and_then(|n| object_ref(n, g)) {
                     self.set_var(&v, Value::Bool(ok));
                 }
