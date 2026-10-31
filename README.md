@@ -12,7 +12,8 @@
 **DecDVB-T** is a software-defined digital TV receiver. It takes raw radio
 samples from a **HackRF One** or an **Airspy R2** (or an IQ recording) and does the whole job in
 software: OFDM demodulation, equalisation, error correction, the transport
-stream, the programme guide, video and audio, and the BBC's Red Button. It
+stream, the programme guide, video and audio, the BBC's Red Button and
+Freeview's internet channels. It
 receives both of the UK's Freeview standards, **DVB-T** and **DVB-T2** (the HD
 multiplex), and shows you everything about the signal on the way.
 
@@ -42,6 +43,12 @@ main requirement: a DVB-T multiplex decodes in about a third of one core, a
 - **BBC Red Button**: DSM-CC object carousels and a UK-profile **MHEG-5**
   engine. Red Button Text pages are drawn over the picture and work with the
   remote keys.
+- **Freeview's internet channels** (NHK WORLD, On Demand 365 and the other
+  "data" services of the commercial multiplexes): the MHEG-5 **interaction
+  channel**. The service's own application is fetched over the internet and
+  run as a receiver runs it, and the stream it asks for plays in the player.
+  The servers reached are only those the broadcast lists, over TLS with the
+  certificates the broadcast carries.
 - An **8-day programme guide** for every channel on the network, Freeview's
   Huffman-compressed text decoded, with series, HD, subtitle, audio-description
   and signing marks and the guidance warnings.
@@ -49,7 +56,8 @@ main requirement: a DVB-T multiplex decodes in about a third of one core, a
 
 **Seeing the signal**
 - Spectrum and waterfall, a frequency dial, UHF channel tuning and a channel
-  **scan** that says DVB-T or DVB-T2 and which mode.
+  **scan** that says DVB-T or DVB-T2 and which mode; in the app, a **band
+  scan** strip that sweeps C21–C48 and tunes on a click.
 - **Constellation scopes**, sharp and live, with a rotated T2 constellation's
   points put back on the grid.
 - The **channel**: gain and SNR on every carrier, the impulse response and
@@ -174,7 +182,7 @@ unoptimised.
 | `decdvbt-fec` | Viterbi, Reed–Solomon, LDPC (AVX2), BCH, the T2 demappers |
 | `decdvbt-rx` | the receivers: acquisition, tracking, equalisers, the sounder |
 | `decdvbt-ts` | transport stream: PSI/SI, the guide, DSM-CC carousels, outputs |
-| `decdvbt-mheg` | the MHEG-5 engine for Red Button |
+| `decdvbt-mheg` | the MHEG-5 engine for Red Button and the interaction channel (Freeview's internet channels) |
 | `decdvbt-video`, `decdvbt-audio` | the player's ffmpeg pipeline and sound |
 | `decdvbt-mod` | DVB-T and T2 modulators and channel models, for tests and the transmitter |
 | `decdvbt-tx` | the transmit engine: ffmpeg, the rate-exact transport stream, the modulator, the arm gate, the sinks |
