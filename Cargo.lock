@@ -622,14 +622,14 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "decdvbt-audio"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "cpal",
 ]
 
 [[package]]
 name = "decdvbt-cli"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-core"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "num-complex",
  "thiserror 2.0.21",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-dsp"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-core",
  "num-complex",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-engine"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-core",
  "decdvbt-io",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-fec"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-core",
  "num-complex",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-gui"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "decdvbt-audio",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-io"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-core",
  "futures-lite",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-mheg"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "decdvbt-ts",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-mod"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-core",
  "decdvbt-dsp",
@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-ofdm"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-core",
  "num-complex",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-rx"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-core",
  "decdvbt-dsp",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-ts"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-core",
  "miniz_oxide 0.8.9",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-tx"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-core",
  "decdvbt-dsp",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-tx-app"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "decdvbt-core",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "decdvbt-video"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "decdvbt-audio",
  "decdvbt-ts",
