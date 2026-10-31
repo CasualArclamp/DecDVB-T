@@ -232,3 +232,31 @@ fn a_missing_scene_is_an_engine_event_not_a_hang() {
     }
     assert_eq!(e.scene(), None);
 }
+
+#[test]
+fn the_non_volatile_store_round_trips() {
+    use crate::obj::{Ref, Value};
+    let mut e = Engine::new();
+    let vals = vec![
+        Value::Str(b"duid\x1dabc".to_vec()),
+        Value::Int(-7),
+        Value::Bool(true),
+        Value::ContentRef(b"/x.png".to_vec()),
+        Value::ObjRef(Ref {
+            group: "http://h.example.com/a".into(),
+            num: 3,
+        }),
+    ];
+    e.persistent.insert(b"pst://SYNNHK".to_vec(), vals.clone());
+    // "ram://" is not kept.
+    e.persistent
+        .insert(b"ram://x".to_vec(), vec![Value::Int(1)]);
+    let saved = e.save_nonvolatile();
+    let mut f = Engine::new();
+    f.load_nonvolatile(&saved);
+    assert_eq!(f.persistent.get(&b"pst://SYNNHK"[..]), Some(&vals));
+    assert!(!f.persistent.contains_key(&b"ram://x"[..]));
+    // A cut-short store loads what it can and does not panic.
+    let mut g = Engine::new();
+    g.load_nonvolatile(&saved[..saved.len() - 3]);
+}

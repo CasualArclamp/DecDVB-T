@@ -45,6 +45,12 @@ pub mod ev {
     pub const HIGHLIGHT_ON: i32 = 17;
     pub const HIGHLIGHT_OFF: i32 = 18;
     pub const TEST_EVENT: i32 = 23;
+    pub const FIRST_ITEM_PRESENTED: i32 = 24;
+    pub const LAST_ITEM_PRESENTED: i32 = 25;
+    pub const HEAD_ITEMS: i32 = 26;
+    pub const TAIL_ITEMS: i32 = 27;
+    pub const ITEM_SELECTED: i32 = 28;
+    pub const ITEM_DESELECTED: i32 = 29;
     pub const ENGINE_EVENT: i32 = 31;
     pub const FOCUS_MOVED: i32 = 32;
 }
@@ -77,6 +83,11 @@ pub enum Fetch {
 /// Where the engine's files come from (an object carousel).
 pub trait Files {
     fn fetch(&self, path: &str) -> Fetch;
+    /// POST a form to `url` (ReturnData, over the interaction channel); the
+    /// answer once, then the next call posts again. A carousel cannot.
+    fn post(&self, _url: &str, _form: &[u8]) -> Fetch {
+        Fetch::Missing
+    }
 }
 
 impl Files for decdvbt_ts::ObjectCarousel {
@@ -124,6 +135,10 @@ pub enum Request {
     /// The video component to show, and its rectangle on the 720x576
     /// canvas (None: full screen).
     Video(Option<(i32, i32, i32, i32)>),
+    /// Play this stream from the interaction channel in place of the
+    /// broadcast (an MPEG transport stream over HTTP; Freeview's internet
+    /// channels); None: back to the broadcast.
+    IcStream(Option<String>),
 }
 
 /// How long after the last application quits the boot application starts.
@@ -153,7 +168,7 @@ pub struct Engine {
     /// When to boot again after the last application quit.
     reboot_at: Option<u64>,
     now_ms: u64,
-    persistent: HashMap<Vec<u8>, Vec<Value>>,
+    pub(crate) persistent: HashMap<Vec<u8>, Vec<Value>>,
     lock: i32,
     pub(crate) dirty: bool,
     pub service: Service,
@@ -174,6 +189,11 @@ pub struct Engine {
     /// Local time's offset from UTC, seconds (the TOT's, in the UK 0 or 3600).
     pub local_offset_s: i64,
     pub(crate) rng: u64,
+    /// The receiver has an interaction channel (the files go through an
+    /// [`crate::ic::IcFiles`]): GetICStatus says so and URLs are fetched.
+    pub ic: bool,
+    /// Groups whose close-down is running.
+    closing: Vec<Ref>,
 }
 
 impl Default for Engine {
@@ -212,6 +232,8 @@ impl Engine {
             clock_unix: None,
             local_offset_s: 0,
             rng: 0x853C_49E6_748F_EA9B,
+            ic: false,
+            closing: Vec::new(),
         }
     }
 
@@ -249,6 +271,101 @@ impl Engine {
             at: 0,
         });
         self.run(files);
+    }
+
+    /// What applications stored under "pst://" names (the receiver's
+    /// non-volatile store: Freeview's internet channels keep the device id
+    /// the server gave them there), as bytes for the receiver to keep.
+    pub fn save_nonvolatile(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let put = |out: &mut Vec<u8>, b: &[u8]| {
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        };
+        let mut names: Vec<&Vec<u8>> = self
+            .persistent
+            .keys()
+            .filter(|k| k.starts_with(b"pst://"))
+            .collect();
+        names.sort();
+        for name in names {
+            let vals = &self.persistent[name];
+            put(&mut out, name);
+            out.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+            for v in vals {
+                match v {
+                    Value::Bool(b) => out.extend_from_slice(&[0, *b as u8]),
+                    Value::Int(i) => {
+                        out.push(1);
+                        out.extend_from_slice(&i.to_le_bytes());
+                    }
+                    Value::Str(s) => {
+                        out.push(2);
+                        put(&mut out, s);
+                    }
+                    Value::ContentRef(s) => {
+                        out.push(3);
+                        put(&mut out, s);
+                    }
+                    Value::ObjRef(r) => {
+                        out.push(4);
+                        put(&mut out, r.group.as_bytes());
+                        out.extend_from_slice(&r.num.to_le_bytes());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Restore what [`Engine::save_nonvolatile`] gave (anything malformed
+    /// is dropped from there on).
+    pub fn load_nonvolatile(&mut self, b: &[u8]) {
+        // A small reader over the bytes; `?` ends the load at a short read.
+        fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            let (h, t) = (b.get(..n)?, b.get(n..)?);
+            *b = t;
+            Some(h)
+        }
+        fn u32_of(b: &mut &[u8]) -> Option<u32> {
+            Some(u32::from_le_bytes(take(b, 4)?.try_into().ok()?))
+        }
+        fn bytes(b: &mut &[u8]) -> Option<Vec<u8>> {
+            let n = u32_of(b)? as usize;
+            Some(take(b, n)?.to_vec())
+        }
+        fn entry(b: &mut &[u8]) -> Option<(Vec<u8>, Vec<Value>)> {
+            let name = bytes(b)?;
+            let n = u32_of(b)?;
+            let mut vals = Vec::new();
+            for _ in 0..n.min(1024) {
+                vals.push(match take(b, 1)?[0] {
+                    0 => Value::Bool(take(b, 1)?[0] != 0),
+                    1 => Value::Int(u32_of(b)? as i32),
+                    2 => Value::Str(bytes(b)?),
+                    3 => Value::ContentRef(bytes(b)?),
+                    4 => {
+                        let g = String::from_utf8(bytes(b)?).ok()?;
+                        let num = u32_of(b)? as i32;
+                        Value::ObjRef(Ref {
+                            group: g.into(),
+                            num,
+                        })
+                    }
+                    _ => return None,
+                });
+            }
+            Some((name, vals))
+        }
+        let mut b = b;
+        while !b.is_empty() {
+            let Some((name, vals)) = entry(&mut b) else {
+                break;
+            };
+            if name.starts_with(b"pst://") {
+                self.persistent.insert(name, vals);
+            }
+        }
     }
 
     /// The application is running and has a scene.
@@ -577,13 +694,26 @@ impl Engine {
             Content::None => {}
             Content::Included(b) => self.content_arrived(r, b),
             // A stream's "rec://svc/def" or "dvb://…" names the broadcast,
-            // not a file.
+            // not a file; a stream's URL is played, not fetched. Other
+            // URLs are files over the interaction channel.
             Content::Referenced(path)
-                if path.windows(3).any(|w| w == b"://") && !path.starts_with(b"DSM:") => {}
+                if path.windows(3).any(|w| w == b"://")
+                    && !path.starts_with(b"DSM:")
+                    && (!(path.starts_with(b"http://") || path.starts_with(b"https://"))
+                        || self.objs.get(r).is_some_and(|o| o.class == C_STREAM)) => {}
             Content::Referenced(path) => {
                 let path = canonical(&path, &r.group);
                 self.awaiting.retain(|(o, _)| o != r);
-                match files.fetch(&path) {
+                let f = files.fetch(&path);
+                self.log(|| {
+                    let s = match &f {
+                        Fetch::Ready(b) => format!("{} bytes", b.len()),
+                        Fetch::Pending => "pending".into(),
+                        Fetch::Missing => "missing".into(),
+                    };
+                    format!("    {r}: content {path}: {s}")
+                });
+                match f {
                     Fetch::Ready(b) => self.content_arrived(r, b),
                     Fetch::Pending => self.awaiting.push((r.clone(), path)),
                     Fetch::Missing => {
@@ -675,6 +805,9 @@ impl Engine {
             }
             Kind::Stream { components } => {
                 let comps = components.clone();
+                if let Some(url) = ic_stream_url(&o.content) {
+                    self.requests.push(Request::IcStream(Some(url)));
+                }
                 self.set_running(r, true);
                 for num in comps {
                     let cr = Ref {
@@ -696,6 +829,8 @@ impl Engine {
                     self.activation(&i, files);
                 }
                 self.event(r.clone(), ev::TOKEN_MOVED_TO, Some(Value::Int(token)));
+                // A ListGroup then shows the items in its cells only.
+                self.list_activated(r, files);
             }
             Kind::Visible(v) => {
                 if matches!(v.draw, Draw::Video { .. }) {
@@ -711,7 +846,7 @@ impl Engine {
 
     pub(crate) fn deactivation(&mut self, r: &Ref, files: &dyn Files) {
         let Some(o) = self.objs.get(r) else { return };
-        if !o.running {
+        if !o.running || self.closing.contains(r) {
             return;
         }
         match &o.kind {
@@ -722,7 +857,11 @@ impl Engine {
                     seq: close,
                     at: 0,
                 });
+                // A close-down that stops its own group (NHK WORLD's scene
+                // does, on an error) must not start the close-down again.
+                self.closing.push(r.clone());
                 self.run_actions(files);
+                self.closing.retain(|c| c != r);
                 if let Some(Obj {
                     kind: Kind::Group(g),
                     ..
@@ -733,6 +872,9 @@ impl Engine {
             }
             Kind::Link(_) => self.links.retain(|l| l != r),
             Kind::Stream { components } => {
+                if ic_stream_url(&o.content).is_some() {
+                    self.requests.push(Request::IcStream(None));
+                }
                 for num in components.clone() {
                     let cr = Ref {
                         group: r.group.clone(),
@@ -745,6 +887,7 @@ impl Engine {
             Kind::TokenGroup(tg) => {
                 let token = tg.token;
                 self.event(r.clone(), ev::TOKEN_MOVED_FROM, Some(Value::Int(token)));
+                self.list_deactivated(r, files);
             }
             Kind::Visible(v) => {
                 if matches!(v.draw, Draw::Video { .. }) {
@@ -943,6 +1086,7 @@ impl Engine {
         let g = target.group.clone();
         self.insert(objs);
         self.apps.push(g.clone());
+        set_ic_root(&g);
         let r = Ref { group: g, num: 0 };
         self.preparation(&r, files);
         self.activation(&r, files);
@@ -970,6 +1114,7 @@ impl Engine {
             self.destruction(&r, files);
             self.remove_group(&app);
             self.apps.pop();
+            set_ic_root(self.apps.last().map_or("", |a| a));
         }
         self.events.clear();
         self.delayed.clear();
@@ -1126,6 +1271,32 @@ impl Engine {
             });
         }
         let Some(t) = target else { return };
+        // Run, Stop, Preload, Unload and SetData are the Ingredient class's
+        // actions (ISO/IEC 13522-5): an application or scene (object 0)
+        // ignores them. NHK WORLD's app frees an empty slot of its image
+        // table with them, through a reference whose number is 0.
+        if t.num == 0 && matches!(tag, C_RUN | C_STOP | C_PRELOAD | C_UNLOAD | C_SET_DATA) {
+            self.log(|| "    (not for a group: ignored)".into());
+            return;
+        }
+        if matches!(
+            tag,
+            C_ADD_ITEM
+                | C_DEL_ITEM
+                | C_GET_LIST_SIZE
+                | C_GET_FIRST_ITEM
+                | C_GET_LIST_ITEM
+                | C_GET_ITEM_STATUS
+                | C_GET_CELL_ITEM
+                | C_SELECT_ITEM
+                | C_DESELECT_ITEM
+                | C_TOGGLE_ITEM
+                | C_SCROLL_ITEMS
+                | C_SET_FIRST_ITEM
+        ) && self.list_action(tag, &t, a, g, files)
+        {
+            return;
+        }
         match tag {
             C_ACTIVATE | C_RUN => self.activation(&t, files),
             C_DEACTIVATE | C_STOP => self.deactivation(&t, files),
@@ -1271,7 +1442,19 @@ impl Engine {
                     None => return,
                 };
                 self.log(|| format!("    content {content:?}"));
+                // The old content's ContentAvailable, if still queued, is
+                // for content that is gone: an application that reads the
+                // data on that event would read the old file as the new.
+                self.events
+                    .retain(|e| !(e.source == t && e.kind == ev::CONTENT_AVAILABLE));
                 if let Some(o) = self.objs.get_mut(&t) {
+                    // A running stream given a new URL plays it.
+                    if o.class == C_STREAM
+                        && o.running
+                        && let Some(url) = ic_stream_url(&content)
+                    {
+                        self.requests.push(Request::IcStream(Some(url)));
+                    }
                     o.content = content.clone();
                     if o.available {
                         self.content_preparation(&t, content, files);
@@ -1281,6 +1464,7 @@ impl Engine {
             C_GET_TEXT_DATA => {
                 if let Some(v) = arg(1).and_then(|n| object_ref(n, g)) {
                     let d = self.objs.get(&t).map_or(Vec::new(), |o| o.data.clone());
+                    self.log(|| format!("    = {}", show_value(&Value::Str(d.clone()))));
                     self.set_var(&v, Value::Str(d));
                 }
             }
@@ -1330,10 +1514,14 @@ impl Engine {
                     self.video_request(&t);
                 }
             }
-            C_GET_POSITION | C_GET_BOX_SIZE => {
+            C_GET_POSITION | C_GET_BOX_SIZE | C_GET_BITMAP_DECODE_OFFSET => {
                 let pair = match self.objs.get(&t).map(|o| &o.kind) {
                     Some(Kind::Visible(v)) if tag == C_GET_POSITION => v.pos,
-                    Some(Kind::Visible(v)) => v.size,
+                    Some(Kind::Visible(v)) if tag == C_GET_BOX_SIZE => v.size,
+                    Some(Kind::Visible(v)) => match &v.draw {
+                        Draw::Bitmap { offset, .. } => *offset,
+                        _ => return,
+                    },
                     _ => return,
                 };
                 if let Some(x) = arg(1).and_then(|n| object_ref(n, g)) {
@@ -1478,7 +1666,7 @@ impl Engine {
             }
             C_GET_ENGINE_SUPPORT => {
                 let f = self.gstr(arg(1), g);
-                let ok = engine_support(&String::from_utf8_lossy(&f));
+                let ok = engine_support(&String::from_utf8_lossy(&f), self.ic);
                 if let Some(v) = arg(2).and_then(|n| object_ref(n, g)) {
                     self.set_var(&v, Value::Bool(ok));
                 }
@@ -1556,6 +1744,23 @@ impl Engine {
     }
 }
 
+/// A stream's content when it is a URL over the interaction channel (not
+/// "rec://svc/def" or "dvb://…", the broadcast).
+fn ic_stream_url(c: &Content) -> Option<String> {
+    let Content::Referenced(p) = c else {
+        return None;
+    };
+    let s = String::from_utf8_lossy(p);
+    is_url(&s).then(|| s.into_owned())
+}
+
+/// The current source's root follows the running application: its URL's
+/// folder if it came over the interaction channel, else none (the carousel).
+fn set_ic_root(app: &str) {
+    let root = is_url(app).then(|| url_dir(app).to_string());
+    IC_ROOT.with(|r| *r.borrow_mut() = root);
+}
+
 /// A value, short, for traces.
 fn show_value(v: &Value) -> String {
     match v {
@@ -1569,7 +1774,7 @@ fn show_value(v: &Value) -> String {
 
 /// GetEngineSupport (ISO/IEC 13522-5 §46.30; the UK strings, D-Book 7
 /// §13.12.1): what this engine says it has.
-fn engine_support(f: &str) -> bool {
+fn engine_support(f: &str, ic: bool) -> bool {
     let (name, arg) = match f.split_once('(') {
         Some((n, a)) => (n, a.trim_end_matches(')')),
         None => (f, ""),
@@ -1585,15 +1790,12 @@ fn engine_support(f: &str) -> bool {
         "UniversalEngineProfile" | "UEP" | "UKEngineProfile" | "UEP2" => {
             matches!(arg, "1" | "")
         }
-        "DownloadableFont"
-        | "DLF"
-        | "HDExtension"
-        | "HDE"
-        | "HDGraphicsPlaneExtension"
-        | "HDG"
-        | "ICProfile"
-        | "ICP"
-        | "IPStreaming" => false,
+        "DownloadableFont" | "DLF" | "HDExtension" | "HDE" | "HDGraphicsPlaneExtension" | "HDG" => {
+            false
+        }
+        // The interaction channel's profile 1 (files and streams over HTTP).
+        "ICProfile" | "ICP" => ic && matches!(arg, "0" | "1" | ""),
+        "IPStreaming" => false,
         "PNGBitmap" | "PNG" | "BitmapScaling" | "BSc" | "VideoScaling" | "VSc"
         | "BitmapDecodeOffset" | "BDO" | "VideoDecodeOffset" | "VDO" => true,
         "UKEngineProfileVersion" | "UniversalEngineProfileVersion" => true,

@@ -72,6 +72,16 @@ pub fn on_air(p: &Programme) -> bool {
     p.streams.iter().any(|e| e.is_video() || e.is_audio())
 }
 
+/// Whether the service carries an MHEG-5 application (a carousel with the
+/// UK profile's data broadcast id, 0x0106): a data service with one can be
+/// played, its application being what it shows (Freeview's internet
+/// channels).
+pub fn has_app(p: &Programme) -> bool {
+    p.streams
+        .iter()
+        .any(|e| e.data_broadcast_id == Some(0x0106))
+}
+
 /// A service's bitrate, bit/s, from its streams' PIDs.
 pub fn service_rate(p: &Programme, rates: &HashMap<u16, f64>) -> f64 {
     p.streams
@@ -132,8 +142,11 @@ pub fn list(ui: &mut Ui, view: &TsView, selected: &mut Option<u16>) -> Option<Ac
                 let lcn = p.lcn.map_or("   ".into(), |n| format!("{n:>3}"));
                 let on_air = on_air(p);
                 let kbps = service_rate(p, &rates) / 1e3;
-                // Off air: what is flowing is its data carousel, not a picture.
-                let rate = if !on_air {
+                // Off air: what is flowing is its data carousel, not a picture
+                // ("app": an application that may play a stream of its own).
+                let rate = if !on_air && kind == Kind::Data && has_app(p) {
+                    "app".to_string()
+                } else if !on_air {
                     "off air".to_string()
                 } else if kbps > 0.5 {
                     format!("{kbps:.0}k")

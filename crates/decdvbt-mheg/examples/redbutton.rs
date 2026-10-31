@@ -15,7 +15,11 @@
 
 use std::path::{Path, PathBuf};
 
+use decdvbt_mheg::ic::{Http, IcFiles};
 use decdvbt_mheg::{Engine, Fetch, Files, Renderer};
+
+/// What the interaction channel's requests say they come from.
+const USER_AGENT: &str = decdvbt_mheg::ic::USER_AGENT;
 use decdvbt_ts::{ObjectCarousel, TS_LEN, TsAnalyser};
 
 struct Dir(PathBuf);
@@ -111,7 +115,29 @@ fn main() {
         service = s;
         &oc
     };
+    // --ic: the interaction channel, files over HTTP(S) from the servers in
+    // the carousel's auth.servers; time then runs at the real rate.
+    let ic = args.iter().any(|a| a == "--ic");
+    let http = ic.then(|| Http::new(USER_AGENT));
+    let icf;
+    let files: &dyn Files = match &http {
+        Some(h) => {
+            icf = IcFiles {
+                carousel: files,
+                http: h,
+            };
+            &icf
+        }
+        None => files,
+    };
     let mut e = Engine::new();
+    // --nv FILE: the receiver's non-volatile store ("pst://"), read before
+    // and written after (Freeview's internet channels keep a device id).
+    let nv = opt("--nv").map(PathBuf::from);
+    if let Some(b) = nv.as_ref().and_then(|p| std::fs::read(p).ok()) {
+        e.load_nonvolatile(&b);
+    }
+    e.ic = ic;
     e.service = service;
     e.tracing = trace;
     e.trace_stderr = args.iter().any(|a| a == "--live-trace");
@@ -125,6 +151,9 @@ fn main() {
         while now < end {
             now += 40;
             e.tick(now, files);
+            if ic {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
         }
     };
     step(&mut e, 1000);
@@ -154,6 +183,20 @@ fn main() {
     for r in &e.requests {
         eprintln!("  request: {r:?}");
     }
+    if let Some(h) = &http {
+        for l in h.log() {
+            eprintln!("  http: {} {}", l.outcome, l.url);
+            // Show what a server worked out (its replies are small).
+            if l.url.contains("?op=")
+                && let Fetch::Ready(b) = h.fetch(&l.url)
+            {
+                eprintln!(
+                    "    -> {:?}",
+                    String::from_utf8_lossy(&b[..b.len().min(2000)])
+                );
+            }
+        }
+    }
     for s in e.shown() {
         eprintln!("  shown: {s}");
     }
@@ -161,6 +204,9 @@ fn main() {
         for l in &e.trace {
             println!("{l}");
         }
+    }
+    if let Some(p) = &nv {
+        std::fs::write(p, e.save_nonvolatile()).expect("write the non-volatile store");
     }
     if let Some(p) = png {
         save_png(&r, &p);

@@ -9,6 +9,11 @@
 //! the picture when a subtitle stream is chosen. The service's Red Button
 //! application ([`crate::redbutton`]) draws over the picture.
 //!
+//! A data service (Freeview's internet channels among them) has no picture
+//! or sound of its own: its application starts on tuning, and when it asks
+//! for a stream from the internet ([`crate::ic_stream`]) that is played in
+//! the broadcast's place, until it asks for the broadcast again.
+//!
 //! Format after DecSAT's player window.
 
 use std::path::PathBuf;
@@ -21,6 +26,7 @@ use eframe::egui::{
     Ui, pos2, vec2,
 };
 
+use crate::ic_stream::{IcStream, Poll};
 use crate::prefs;
 use crate::redbutton::RedButton;
 use crate::services::Kind;
@@ -89,6 +95,11 @@ pub struct TvWindow {
     picture: bool,
     /// The service's interactive application.
     pub red: RedButton,
+    /// A data service: nothing of its own to play, its application is all.
+    app_only: bool,
+    /// The internet stream its application asked for, in the broadcast's
+    /// place.
+    ic: Option<IcStream>,
 }
 
 impl Default for TvWindow {
@@ -108,6 +119,8 @@ impl Default for TvWindow {
             tap_dropped: 0,
             picture: false,
             red: RedButton::default(),
+            app_only: false,
+            ic: None,
         }
     }
 }
@@ -123,10 +136,33 @@ impl TvWindow {
     ) {
         self.stop();
         self.open = true;
-        if self.red.service().is_some_and(|s| s != p.number) {
+        // A radio service's application is its screen (album art, "now
+        // playing"), and a data service's is all it has (Freeview's internet
+        // channels): a receiver boots it on tuning, without the red key.
+        let kind = Kind::of(p);
+        if matches!(kind, Kind::Radio | Kind::Data) {
+            if self.red.service() != Some(p.number) {
+                self.red.follow(p.number);
+            }
+        } else if self.red.service().is_some_and(|s| s != p.number) {
             self.red.follow(p.number);
         }
         self.service = Some(p.number);
+        let sel = self.selection(p, audio, subs);
+        self.audio = sel.audio;
+        self.subs = sel.subs;
+        self.picture = sel.video.is_some();
+        // Nothing for ffmpeg in a data service (it would start and stop
+        // over and over): its application asks for a stream if it has one.
+        self.app_only = kind == Kind::Data && sel.video.is_none() && sel.audio.is_none();
+        if self.app_only {
+            return;
+        }
+        self.launch(rx, sel);
+    }
+
+    /// `selection` with the window's deinterlacing and decoder.
+    fn selection(&self, p: &Programme, audio: Option<u16>, subs: Option<u16>) -> Selection {
         let mut sel = selection(p, audio, subs);
         sel.deint = if self.bob {
             Deinterlace::Bob
@@ -134,9 +170,11 @@ impl TvWindow {
             Deinterlace::Frame
         };
         sel.gpu = self.gpu;
-        self.audio = sel.audio;
-        self.subs = sel.subs;
-        self.picture = sel.video.is_some();
+        sel
+    }
+
+    /// Start ffmpeg on `sel` of the packets from `rx`.
+    fn launch(&mut self, rx: Receiver<Vec<[u8; TS_LEN]>>, sel: Selection) {
         let configured = prefs::ffmpeg_path();
         let Some(exe) = decdvbt_video::find_ffmpeg(configured.as_deref()) else {
             self.error = Some(
@@ -155,15 +193,53 @@ impl TvWindow {
         }
     }
 
+    /// The application's requests for an internet stream: start reading
+    /// one (the broadcast's player stops), play it once its programme is
+    /// known, or go back to the broadcast (a Play request).
+    fn follow_ic_stream(&mut self) -> Option<Request> {
+        match self.red.take_ic_stream() {
+            Some(Some(url)) if self.ic.as_ref().map(|s| &s.url) != Some(&url) => {
+                self.player = None;
+                self.error = None;
+                self.ic = Some(IcStream::start(&url));
+            }
+            // Back to the broadcast, if an internet stream was playing.
+            Some(None) if self.ic.take().is_some() => {
+                self.player = None;
+                if let Some(s) = self.service {
+                    return Some(Request::Play(s, None, None));
+                }
+            }
+            _ => {}
+        }
+        let ic = self.ic.as_mut()?;
+        match ic.poll() {
+            Poll::Ready(r) => {
+                let crate::ic_stream::Ready { programme, packets } = *r;
+                let sel = self.selection(&programme, None, None);
+                self.picture = sel.video.is_some();
+                self.launch(packets, sel);
+            }
+            Poll::Failed(e) => {
+                self.error = Some(format!("the internet stream: {e}"));
+                self.ic = None;
+            }
+            Poll::Waiting => {}
+        }
+        None
+    }
+
     /// Stop playing (the window stays as it is).
     pub fn stop(&mut self) {
         self.player = None;
+        self.ic = None;
         self.error = None;
     }
 
-    /// Whether service `sid` is playing now.
+    /// Whether service `sid` is playing now (its application, for a data
+    /// service).
     pub fn is_playing(&self, sid: u16) -> bool {
-        self.player.is_some() && self.service == Some(sid)
+        (self.player.is_some() || self.app_only) && self.service == Some(sid)
     }
 
     pub fn close(&mut self) {
@@ -198,7 +274,12 @@ impl TvWindow {
         }
         self.tap_dropped = tap_dropped;
         self.red.update(ctx);
-        let playing = self.service.filter(|_| self.player.is_some());
+        if let Some(r) = self.follow_ic_stream() {
+            return Some(r);
+        }
+        let playing = self
+            .service
+            .filter(|_| self.player.is_some() || self.app_only);
         self.red.keyboard(ctx, playing);
         if let Some(sid) = self.red.take_tune() {
             return Some(Request::Play(sid, None, None));
@@ -229,7 +310,7 @@ impl TvWindow {
             .show(ctx, |ui| {
                 self.controls(ui, programmes, current, &mut req);
                 self.red.remote(ui, playing);
-                if current.is_some_and(|p| Kind::of(p) == Kind::Radio) && !self.red.active() {
+                if current.is_some_and(|p| Kind::of(p) == Kind::Radio) && !self.red.shows_app() {
                     self.radio(ui, current);
                 } else {
                     self.picture(ui);

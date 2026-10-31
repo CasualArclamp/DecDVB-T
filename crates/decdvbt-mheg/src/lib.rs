@@ -8,12 +8,16 @@
 //! - [`engine`]: applications, scenes, links, events and actions.
 //! - [`programs`]: the resident programs.
 //! - [`render`]: the canvas.
+//! - [`ic`]: the interaction channel, files over HTTP(S).
 //!
 //! MythTV's freemheg (GPL-2.0-or-later, by David C. J. Matthews) is the
 //! reference throughout; each module says what it follows.
 
 pub mod asn1;
 pub mod engine;
+pub mod ic;
+mod ic_tls;
+mod list;
 pub mod obj;
 mod programs;
 pub mod render;
@@ -22,4 +26,10 @@ pub mod tags;
 mod tests;
 
 pub use engine::{Engine, Fetch, Files, Request, Service, key};
+
+/// What the engine says it is (WhoAmI: manufacturer, model, version; D-Book
+/// 7 §13.10.4.24). Applications pick their files by it (Freeview's internet
+/// channels give an unknown receiver their SD streams), and the interaction
+/// channel's requests carry it ([`ic::USER_AGENT`]).
+pub const WHO_AM_I: &str = "DDT DecDVB-T 010";
 pub use render::Renderer;
