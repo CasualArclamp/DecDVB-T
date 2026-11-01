@@ -93,6 +93,23 @@ impl BandScan {
         self.run.take().map(|r| r.restore)
     }
 
+    /// Each channel's mean level in the last scan, dBFS (a channel that gave
+    /// no rows is left out).
+    pub fn levels(&self) -> Vec<(u8, f32)> {
+        self.strip
+            .iter()
+            .filter(|(_, d)| !d.is_empty())
+            .map(|(n, d)| (*n, d.iter().sum::<f32>() / d.len() as f32))
+            .collect()
+    }
+
+    /// The channels scanned so far in this scan (for a progress display).
+    pub fn done_so_far(&self) -> Vec<u8> {
+        self.run
+            .as_ref()
+            .map_or_else(Vec::new, |r| r.new.iter().map(|(n, _)| *n).collect())
+    }
+
     /// The channel being scanned and how many there are.
     pub fn progress(&self) -> Option<(usize, usize)> {
         self.run.as_ref().map(|r| (r.at, r.chans.len()))

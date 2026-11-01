@@ -1826,3 +1826,35 @@ receiver its SD streams.
   averaging, cached); and a ListGroup applies its update behaviour only while running (the app
   stops a list and keeps its background panels and grid cells in it; updating hid them). The
   BBC Red Button pages are unchanged.
+
+## Simple mode: the set-top box screens (2026-10-31)
+
+Asked for: a "simple" mode that looks like a set-top box, toggled from the top, with a
+channel scan and a TV guide like a television's; a choice of two of five mocked-up looks,
+**Native** (the expert window's dark panels and amber) and **Teletext** (Ceefax colours,
+monospaced, Fastext).
+
+- `apps/decdvbt-gui/src/simple.rs`. **📺 Simple** in the expert top bar switches; in simple
+  mode a strip along the top has TV / Guide / Channel scan, the look, and **Expert**. The
+  mode and the look are remembered (`simple`, `simple_theme`; the last service
+  `simple_sid`).
+- **TV**: the picture full size (`TvWindow::draw_into`; the TV window is `embedded`, its
+  per-frame work unchanged), a now/next banner for 5 s on a change; ▲▼/PgUp/PgDn step
+  through the channel list (the scan's, else this multiplex's and the others the network
+  names), retuning when the service is another multiplex's (played once its tables are in).
+- **Guide**: two hours across, every channel of the network (the EIT schedule of one
+  multiplex holds them all: 172 here), focus box, now-line, the focused programme's time,
+  progress and description, the picture in the corner (Native). Arrows, OK/red watch, blue
+  now, yellow scan, green/Esc TV; click focuses, a second click watches.
+- **Channel scan**: the band scan sweeps C21–C48, channels 8 dB over the median are locked
+  in turn until their named services hold for 2.5 s (14 s give-up); the list goes to
+  `%APPDATA%\DecDVB-T\channels.txt`. Live (Airspy): 7 candidates, 6 multiplexes, 149
+  services (one T2, five T), about two and a half minutes.
+- The guide data is now fetched whenever simple mode is on (it was only with the guide
+  window open).
+- Screenshots: `--simple native|teletext`, `--screen tv|guide|scan`, env
+  `DECDVBT_SIMPLE_SCAN=1` (scan once the radio runs). A screenshot run shows simple mode
+  only when asked and never writes prefs.
+- Not done: favourites, channel numbers typed with the digits, a programme info page,
+  Teletext with a real teletext font (the system monospace stands in), radio services'
+  own screen in simple mode (their application shows when they have one).

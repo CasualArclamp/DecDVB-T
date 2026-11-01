@@ -100,6 +100,8 @@ pub struct TvWindow {
     /// The internet stream its application asked for, in the broadcast's
     /// place.
     ic: Option<IcStream>,
+    /// Drawn by simple mode ([`TvWindow::draw_into`]), not in its own window.
+    pub embedded: bool,
 }
 
 impl Default for TvWindow {
@@ -121,6 +123,7 @@ impl Default for TvWindow {
             red: RedButton::default(),
             app_only: false,
             ic: None,
+            embedded: false,
         }
     }
 }
@@ -292,6 +295,9 @@ impl TvWindow {
                 Some(t) => t.set(img, TextureOptions::LINEAR),
                 None => self.texture = Some(ctx.load_texture("tv", img, TextureOptions::LINEAR)),
             }
+        }
+        if self.embedded {
+            return None;
         }
         let current = programmes
             .iter()
@@ -517,6 +523,37 @@ impl TvWindow {
                 }
             });
         }
+    }
+
+    /// The service playing (or whose application runs), if any.
+    pub fn service(&self) -> Option<u16> {
+        self.service
+            .filter(|_| self.player.is_some() || self.app_only || self.ic.is_some())
+    }
+
+    /// The picture (and the application over it) in `rect`, 16:9 in the
+    /// middle of it, black around: simple mode's screen.
+    pub fn draw_into(&self, p: &egui::Painter, rect: Rect) {
+        p.rect_filled(rect, 0.0, Color32::BLACK);
+        let w = rect.width().min(rect.height() * 16.0 / 9.0);
+        let pic = Rect::from_center_size(rect.center(), vec2(w, w * 9.0 / 16.0));
+        if let Some(t) = &self.texture
+            && self.player.is_some()
+            && self.picture
+        {
+            p.image(
+                t.id(),
+                self.red.video_rect(pic),
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        self.red.paint(p, pic);
+    }
+
+    /// What is wrong, if the picture cannot come (ffmpeg missing and the like).
+    pub fn problem(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     /// The picture, as large as the window allows at 16:9.
