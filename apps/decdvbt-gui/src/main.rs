@@ -2513,6 +2513,7 @@ impl eframe::App for App {
         }
         self.optimise_tick();
         self.simple_tick();
+        self.simple_script(ctx);
         // DECDVBT_BANDSCAN=1 (screenshots, tests): sweep once the radio runs.
         if !self.scan_env_done
             && std::env::var_os("DECDVBT_BANDSCAN").is_some()

@@ -214,6 +214,9 @@ pub struct Simple {
     log: Vec<String>,
     /// `DECDVBT_SIMPLE_SCAN=1` (screenshots, tests) has started its scan.
     env_scan_done: bool,
+    /// `DECDVBT_SIMPLE_KEYS`'s steps still to do, and when the last was.
+    script: Option<std::collections::VecDeque<String>>,
+    script_at: Option<Instant>,
 }
 
 impl Simple {
@@ -231,6 +234,8 @@ impl Simple {
             started: false,
             log: Vec::new(),
             env_scan_done: false,
+            script: None,
+            script_at: None,
         }
     }
 }
@@ -390,6 +395,73 @@ impl App {
     // ---- per frame ----
 
     /// Simple mode's work each frame: put a channel on, drive a scan.
+    /// `DECDVBT_SIMPLE_KEYS=wait,guide,down,ok,teletext,expert…` (demos,
+    /// screenshots): once something plays, a step a second. Keys (up, down,
+    /// left, right, ok, esc, tab, r, g, y, b, i) go in as key presses; native,
+    /// teletext and expert switch the look or leave simple mode; wait waits.
+    pub(crate) fn simple_script(&mut self, ctx: &egui::Context) {
+        if self.simple.script.is_none() {
+            let Some(v) = std::env::var_os("DECDVBT_SIMPLE_KEYS") else {
+                return;
+            };
+            let steps = v
+                .to_string_lossy()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
+            self.simple.script = Some(steps);
+        }
+        if self.tv.service().is_none() && self.simple.on {
+            return;
+        }
+        let at = *self.simple.script_at.get_or_insert_with(Instant::now);
+        if at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.simple.script_at = Some(Instant::now());
+        let Some(step) = self.simple.script.as_mut().and_then(|q| q.pop_front()) else {
+            return;
+        };
+        let key = match step.as_str() {
+            "up" => Some(Key::ArrowUp),
+            "down" => Some(Key::ArrowDown),
+            "left" => Some(Key::ArrowLeft),
+            "right" => Some(Key::ArrowRight),
+            "ok" => Some(Key::Enter),
+            "esc" => Some(Key::Escape),
+            "tab" => Some(Key::Tab),
+            "r" => Some(Key::R),
+            "g" => Some(Key::G),
+            "y" => Some(Key::Y),
+            "b" => Some(Key::B),
+            "i" => Some(Key::I),
+            "native" => {
+                self.simple_theme(Theme::Native);
+                None
+            }
+            "teletext" => {
+                self.simple_theme(Theme::Teletext);
+                None
+            }
+            "expert" => {
+                self.simple_set(false);
+                None
+            }
+            _ => None,
+        };
+        if let Some(key) = key {
+            ctx.input_mut(|i| {
+                i.events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                })
+            });
+        }
+    }
+
     pub(crate) fn simple_tick(&mut self) {
         if !self.simple.on {
             return;
