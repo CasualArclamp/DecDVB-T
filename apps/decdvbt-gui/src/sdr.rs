@@ -384,7 +384,13 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
         list.sort_by_key(|(c, _)| **c);
         let text: Vec<String> = list
             .iter()
-            .map(|(c, o)| format!("C{c} {:+.0} kHz", **o / 1e3))
+            .map(|(c, o)| {
+                format!(
+                    "{} {:+.0} kHz",
+                    decdvbt_core::channel::channel_label(**c),
+                    **o / 1e3
+                )
+            })
             .collect();
         ui.label(RichText::new(format!("    {}", text.join("  "))).small());
         if ui.small_button("Forget them").clicked() {

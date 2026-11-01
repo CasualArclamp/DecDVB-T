@@ -55,9 +55,10 @@ main requirement: a DVB-T multiplex decodes in about a third of one core, a
 - **Outputs**: the transport stream to a file, UDP or HTTP (VLC opens it).
 
 **Seeing the signal**
-- Spectrum and waterfall, a frequency dial, UHF channel tuning and a channel
-  **scan** that says DVB-T or DVB-T2 and which mode; in the app, a **band
-  scan** strip that sweeps C21–C48 and tunes on a click.
+- Spectrum and waterfall, a frequency dial, tuning by channel across the European plan
+  (VHF E5–E12 at 7 MHz, UHF C21–C69 at 8 MHz; the width follows the channel) and a
+  channel **scan** that says DVB-T or DVB-T2 and which mode; in the app, a **band
+  scan** strip that sweeps every channel and tunes on a click.
 - **Constellation scopes**, sharp and live, with a rotated T2 constellation's
   points put back on the grid.
 - The **channel**: gain and SNR on every carrier, the impulse response and

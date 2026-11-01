@@ -65,9 +65,10 @@ ring overflow on one DVB-T mux). Every design choice is weighed against this:
   over 25 s) | none. A frequency dial heads the control bar and an SDR window
   holds the front-end settings and the gain optimiser.
 - **Discovery**: automatic T vs T2 detection (P1 symbol → T2, else T with TPS
-  sync; FFT size and guard interval found blind), a **UHF band scan** (channels
-  21–48, NIT network name and services listed), and **channel-number tuning**
-  (`C34`, UK channel list).
+  sync; FFT size and guard interval found blind), a **band scan** (the European
+  plan: VHF E5–E12, UHF 21–69; NIT network name and services listed), and
+  **channel-number tuning** (`C34`, `E7`; VHF channels are 7 MHz wide and the width
+  follows the channel).
 
 ## 3. Outputs
 

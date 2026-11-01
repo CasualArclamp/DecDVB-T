@@ -551,6 +551,20 @@ impl TvWindow {
         self.red.paint(p, pic);
     }
 
+    /// ffmpeg's descriptions of the streams being played ("Video: h264 …,
+    /// 1920x1080 [SAR 1:1 DAR 16:9]", "Audio: aac_latm (HE-AAC) …, 5.1"),
+    /// with their PIDs.
+    pub fn stream_info(&self) -> Vec<(Option<u16>, String)> {
+        self.player
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.status().streams)
+    }
+
+    /// The sound stream chosen (`None`: the service's first).
+    pub fn audio_pid(&self) -> Option<u16> {
+        self.audio
+    }
+
     /// What is wrong, if the picture cannot come (ffmpeg missing and the like).
     pub fn problem(&self) -> Option<&str> {
         self.error.as_deref()

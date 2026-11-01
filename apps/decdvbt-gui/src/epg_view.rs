@@ -7,7 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use decdvbt_core::channel::uhf_channel_at;
+use decdvbt_core::channel::{channel_at, channel_label};
 use decdvbt_ts::epg::{civil, weekday};
 use decdvbt_ts::{Epg, EpgEvent, LocalTime, TsReport};
 use eframe::egui::{
@@ -30,6 +30,20 @@ pub fn local_stamp(t: i64, lt: Option<LocalTime>) -> String {
     format!(
         "{} {y:04}-{mo:02}-{d:02} {h:02}:{mi:02}",
         DAYS[weekday(local) as usize]
+    )
+}
+
+/// "Sun 1 Nov" for `t` in local time.
+pub(crate) fn day_date(t: i64, lt: Option<LocalTime>) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let local = t + 60 * i64::from(lt.map_or(0, |l| l.offset_at(t)));
+    let (_, mo, d, _, _, _) = civil(local);
+    format!(
+        "{} {d} {}",
+        DAYS[weekday(local) as usize],
+        MONTHS[(mo as usize).clamp(1, 12) - 1]
     )
 }
 
@@ -100,7 +114,7 @@ pub(crate) fn rows(report: &TsReport, epg: &Epg, all: bool) -> Vec<Row> {
                     lcn: o.lcn,
                     name: o.name.clone().unwrap_or_else(|| "?".into()),
                     playable: false,
-                    elsewhere: Some(o.centre_hz.and_then(|f| uhf_channel_at(f as f64))),
+                    elsewhere: Some(o.centre_hz.and_then(|f| channel_at(f as f64))),
                     internet: o.service_type == Some(0x0C),
                 }),
         );
@@ -431,9 +445,9 @@ impl EpgView {
             .others
             .iter()
             .find(|o| o.number == sid)
-            .map(|o| o.centre_hz.and_then(|f| uhf_channel_at(f as f64)))
+            .map(|o| o.centre_hz.and_then(|f| channel_at(f as f64)))
         {
-            meta.push(format!("on C{ch}"));
+            meta.push(format!("on {}", channel_label(ch)));
         }
         ui.label(RichText::new(meta.join(" · ")).small().weak());
         if let Some(g) = &e.guidance {

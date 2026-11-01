@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use decdvbt_core::channel::{uhf_centre_hz, uhf_channel_at};
+use decdvbt_core::channel::{bandwidth_hz, centre_hz, channel_at, parse_channel};
 use decdvbt_core::dvbt::Bandwidth;
+use decdvbt_io::name_hint;
 use decdvbt_rx::auto::{AutoReceiver, Standard};
 use decdvbt_rx::t2::receiver::s1_name;
 use decdvbt_ts::TS_LEN;
@@ -22,13 +23,14 @@ use crate::source;
 
 #[derive(clap::Args)]
 pub struct DecodeArgs {
-    /// An IQ file, a transport stream (`.ts`), a UHF channel ("C26") for the
-    /// HackRF or (with `--radio airspy`) the Airspy R2, or `hackrf` with
-    /// `--freq`.
+    /// An IQ file, a transport stream (`.ts`), a channel ("C26", or VHF
+    /// "E7") for the HackRF or (with `--radio airspy`) the Airspy R2, or
+    /// `hackrf` with `--freq`.
     source: String,
-    /// The channel's width, MHz: 8 (default), 7, 6, 1.7 (DVB-T2 only) or 1
-    /// (DecDVB-T's 1 MHz DVB-T). Nothing in the signal says it.
-    #[arg(long, default_value = "8")]
+    /// The channel's width, MHz: auto (default: 7 for a VHF channel E5–E12,
+    /// else 8), 8, 7, 6, 1.7 (DVB-T2 only) or 1 (DecDVB-T's 1 MHz DVB-T).
+    /// Nothing in the signal says it.
+    #[arg(long, default_value = "auto")]
     bandwidth: String,
     /// The signal's centre, MHz: for `hackrf` the radio's tuning; for a file
     /// whose name gives its centre, where the signal is in it.
@@ -194,9 +196,26 @@ pub fn run(a: DecodeArgs) -> Result<()> {
     if a.source.to_ascii_lowercase().ends_with(".ts") {
         return run_ts(&a, dump);
     }
-    let bandwidth = Bandwidth::parse(&a.bandwidth)
-        .with_context(|| format!("not a bandwidth: {} (8, 7, 6, 1.7 or 1)", a.bandwidth))?;
     let freq_hz = a.freq.map(|f| f * 1e6);
+    let bandwidth = if a.bandwidth.eq_ignore_ascii_case("auto") {
+        // The channel the source names, or the one its centre is in.
+        let ch = parse_channel(&a.source)
+            .or_else(|| freq_hz.and_then(channel_at))
+            .or_else(|| {
+                name_hint(std::path::Path::new(&a.source))
+                    .center_hz
+                    .and_then(channel_at)
+            });
+        if ch.and_then(bandwidth_hz) == Some(7e6) {
+            Bandwidth::Mhz7
+        } else {
+            Bandwidth::Mhz8
+        }
+    } else {
+        Bandwidth::parse(&a.bandwidth).with_context(|| {
+            format!("not a bandwidth: {} (auto, 8, 7, 6, 1.7 or 1)", a.bandwidth)
+        })?
+    };
     let mut src = source::open(
         &a.source,
         a.file_rate,
@@ -216,7 +235,7 @@ pub fn run(a: DecodeArgs) -> Result<()> {
         Some(f) if centre > 0.0 => Some(f),
         Some(_) => None,
         None if bandwidth.narrow() => None,
-        None => uhf_channel_at(centre).and_then(uhf_centre_hz),
+        None => channel_at(centre).and_then(centre_hz),
     };
     println!(
         "{} (centre {:.3} MHz{})",

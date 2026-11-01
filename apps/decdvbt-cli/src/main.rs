@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use decdvbt_core::SampleFormat;
-use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_channels};
+use decdvbt_core::channel::{
+    all_channels, bandwidth_hz, centre_hz, channel_at, channel_label, parse_channel,
+};
 use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_engine::{Command as RxCommand, CpuGauge, Rx, RxOptions, Stage, spectral_cn_db};
 use decdvbt_io::{IqFileReader, IqSource, format_from_path, name_hint};
@@ -105,17 +107,29 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Channels => {
-            for n in uk_channels() {
-                println!("C{n:<3} {:>7.3} MHz", uhf_centre_hz(n).unwrap() / 1e6);
+            for n in all_channels() {
+                println!(
+                    "{:<4} {:>7.3} MHz",
+                    channel_label(n),
+                    centre_hz(n).unwrap() / 1e6
+                );
             }
         }
         Command::Channel { which } => {
             if let Some(n) = parse_channel(&which) {
-                println!("C{n} {:.3} MHz", uhf_centre_hz(n).unwrap() / 1e6);
+                println!(
+                    "{} {:.3} MHz",
+                    channel_label(n),
+                    centre_hz(n).unwrap() / 1e6
+                );
             } else if let Ok(mhz) = which.parse::<f64>() {
-                match uhf_channel_at(mhz * 1e6) {
-                    Some(n) => println!("C{n} {:.3} MHz", uhf_centre_hz(n).unwrap() / 1e6),
-                    None => bail!("{mhz} MHz is not in a UHF channel (21–69)"),
+                match channel_at(mhz * 1e6) {
+                    Some(n) => println!(
+                        "{} {:.3} MHz",
+                        channel_label(n),
+                        centre_hz(n).unwrap() / 1e6
+                    ),
+                    None => bail!("{mhz} MHz is not in a channel (E5–E12, 21–69)"),
                 }
             } else {
                 bail!("not a channel or a frequency: {which}");
@@ -193,9 +207,15 @@ fn capture(
         std::thread::sleep(Duration::from_millis(500));
         for r in rx.take_rows() {
             rows += 1;
-            let vfo = uhf_channel_at(r.center_hz).and_then(uhf_centre_hz);
-            if let Some(e) = vfo
-                .and_then(|v| spectral_cn_db(&r.db, r.center_hz, r.sample_rate, v, Bandwidth::Mhz8))
+            let ch = channel_at(r.center_hz);
+            let bw = if ch.and_then(bandwidth_hz) == Some(7e6) {
+                Bandwidth::Mhz7
+            } else {
+                Bandwidth::Mhz8
+            };
+            if let Some(e) = ch
+                .and_then(centre_hz)
+                .and_then(|v| spectral_cn_db(&r.db, r.center_hz, r.sample_rate, v, bw))
             {
                 cn = Some(cn.map_or(e, |c| c + 0.1 * (e - c)));
             }
@@ -273,13 +293,13 @@ fn scan(
     dwell: f64,
     classify: f64,
 ) -> Result<()> {
-    let first = uk_channels().next().unwrap();
+    let first = all_channels().next().unwrap();
     let (src, drops) = live(first, 10.0, lna, vga, amp, radio)?;
     let rx = Rx::start(src, RxOptions::default(), drops);
     println!("chan   MHz     inband   ripple  shoulder  over floor");
     let mut looks = Vec::new();
-    for n in uk_channels() {
-        rx.send(RxCommand::Retune(uhf_centre_hz(n).unwrap()));
+    for n in all_channels() {
+        rx.send(RxCommand::Retune(centre_hz(n).unwrap()));
         std::thread::sleep(Duration::from_millis(150));
         rx.take_rows();
         // Rows keep coming at 20 a second; average what the dwell gives.
@@ -315,8 +335,9 @@ fn scan(
             String::new()
         };
         println!(
-            "C{n:<4} {:6.1}  {:6.1}  {:6.1}  {:7.1}  {:9.1}  {what}",
-            uhf_centre_hz(n).unwrap() / 1e6,
+            "{:<5} {:6.1}  {:6.1}  {:6.1}  {:7.1}  {:9.1}  {what}",
+            channel_label(n),
+            centre_hz(n).unwrap() / 1e6,
             l.inband_db,
             l.ripple_db,
             l.shoulder_db,
@@ -330,7 +351,7 @@ fn scan(
 /// DVB-T2, and its mode, within `seconds`.
 fn classify_channel(rx: &Rx, n: u8, seconds: f64) -> String {
     use decdvbt_rx::auto::Standard;
-    let centre = uhf_centre_hz(n).unwrap();
+    let centre = centre_hz(n).unwrap();
     rx.send(RxCommand::Retune(centre));
     std::thread::sleep(Duration::from_millis(300));
     rx.send(RxCommand::Decode(Some(centre)));
