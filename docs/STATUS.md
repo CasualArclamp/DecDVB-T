@@ -1855,6 +1855,27 @@ monospaced, Fastext).
 - Screenshots: `--simple native|teletext`, `--screen tv|guide|scan`, env
   `DECDVBT_SIMPLE_SCAN=1` (scan once the radio runs). A screenshot run shows simple mode
   only when asked and never writes prefs.
-- Not done: favourites, channel numbers typed with the digits, a programme info page,
+- Not done: favourites, a programme info page,
   Teletext with a real teletext font (the system monospace stands in), radio services'
   own screen in simple mode (their application shows when they have one).
+
+### Simple mode: on by itself, information box, channel numbers (2026-11-01)
+
+- **The radio comes on by itself** (live runs, not screenshots): with it stopped, simple
+  mode starts it on the last multiplex watched if the scan found it, else the scan's first
+  (the guide was empty until something was tuned). With it on but no guide events after
+  20 s, it moves to the scan's first multiplex. Tried again after 30 s. Live: started on
+  C21, 172 channels in the guide.
+- **Information box** (top right, with the banner on a change and on **I**), as a
+  television's: time and date; standard, channel and the sound ("DVB-T · C42 | MPEG
+  Stereo"); the language and badges for the picture (576i/1080i from ffmpeg's stream
+  line: a field order means interlaced), the aspect (its DAR), HD (720 lines or more, or
+  the event's component), AD (a second sound stream, or the event's), SUBS (a DVB
+  subtitle stream, or the event's), SL (signed). ffmpeg's stream lines are read only while
+  the box shows.
+- **Channel numbers**: digits on the TV screen type a number (top left, with the
+  channel's name as it is typed); taken at the third digit, OK or a 2 s pause; Backspace
+  takes one back, Esc drops it; "No channel N" if none has it. Live: 2 → BBC TWO (another
+  multiplex), 22 → TJC. `DECDVBT_SIMPLE_KEYS` takes digits too.
+- The banner's channel number comes from the scan's list until the new multiplex's tables
+  are in.

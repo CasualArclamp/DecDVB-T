@@ -53,7 +53,7 @@ cargo run --release -p decdvbt-tx --example txfile -- --stages --t2 8k-1/16-pp4-
 # the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|maps|history|none,
 # --window ts|epg|sdr, --service ID (select), --play ID, --http 127.0.0.1:8001,
 # --simple native|teletext, --screen tv|guide|scan (simple mode; env DECDVBT_SIMPLE_SCAN=1 runs its channel scan;
-# env DECDVBT_SIMPLE_KEYS=wait,g,down,ok,teletext,expert presses remote keys, one a second once something plays),
+# env DECDVBT_SIMPLE_KEYS=wait,g,down,ok,2,2,i,teletext,expert presses remote keys (digits too), one a second once something plays),
 # --fullscreen (1080p screenshots/videos),
 # --udp 127.0.0.1:1234, --record, --fps N (the waterfall scrolls a pixel a frame: the rate is its speed), --video OUT.mp4 --video-secs N (with --screenshot and
 # --after: record the window itself from --after on, for demos; out/promo has the release promo), env DECDVBT_REDBUTTON=wait,15 (start the playing

@@ -33,6 +33,20 @@ pub fn local_stamp(t: i64, lt: Option<LocalTime>) -> String {
     )
 }
 
+/// "Sun 1 Nov" for `t` in local time.
+pub(crate) fn day_date(t: i64, lt: Option<LocalTime>) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let local = t + 60 * i64::from(lt.map_or(0, |l| l.offset_at(t)));
+    let (_, mo, d, _, _, _) = civil(local);
+    format!(
+        "{} {d} {}",
+        DAYS[weekday(local) as usize],
+        MONTHS[(mo as usize).clamp(1, 12) - 1]
+    )
+}
+
 pub(crate) fn hhmm(t: i64, lt: Option<LocalTime>) -> String {
     let local = t + 60 * i64::from(lt.map_or(0, |l| l.offset_at(t)));
     let (_, _, _, h, m, _) = civil(local);

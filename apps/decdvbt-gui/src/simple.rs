@@ -12,11 +12,18 @@
 //! `%APPDATA%\DecDVB-T\channels.txt`.
 //!
 //! Keys (the Red Button application, when it shows, has the arrows and OK):
-//! TV: ▲▼ or PgUp/PgDn change channel, OK or G the guide, I the banner.
+//! TV: ▲▼ or PgUp/PgDn change channel, digits type a channel number (taken
+//! at the third digit, OK, or a pause), OK or G the guide, I the banner and
+//! the information box (picture, sound, language, HD, AD, subtitles).
 //! Guide: arrows move, OK or red (R) watches, blue (B) back to now, yellow (Y)
 //! the scan, Esc, green (G) or Tab the TV. Scan: OK or red starts and stops,
 //! green the TV, yellow the guide. Tab opens or closes the guide whatever has
 //! the keys. Teletext shows the colour keys as Fastext.
+//!
+//! A set-top box is on when it is: in a live run with the radio stopped,
+//! simple mode starts it on the last multiplex watched (or the scan's first),
+//! and with the radio on but no guide after a while it moves to the scan's
+//! first multiplex (any one carries the whole network's guide).
 //!
 //! Cost: nothing new runs per sample; the screens are painted shapes and
 //! text, drawn only when the app repaints anyway.
@@ -44,6 +51,26 @@ const SETTLE: Duration = Duration::from_millis(2500);
 const LOCK_GIVE_UP: Duration = Duration::from_secs(14);
 /// A channel this far over the band's median level is worth locking to.
 const OVER_FLOOR_DB: f32 = 8.0;
+/// A channel number being typed is taken after this pause.
+const DIGIT_WAIT: Duration = Duration::from_millis(2000);
+/// How long "No channel 123" stays.
+const MISS_SHOWN: Duration = Duration::from_millis(2000);
+/// With the radio on, how long to wait for a guide before moving to the
+/// scan's first multiplex; and how long before trying again.
+const NO_GUIDE_WAIT: Duration = Duration::from_secs(20);
+const AUTO_RETRY: Duration = Duration::from_secs(30);
+const DIGIT_KEYS: [Key; 10] = [
+    Key::Num0,
+    Key::Num1,
+    Key::Num2,
+    Key::Num3,
+    Key::Num4,
+    Key::Num5,
+    Key::Num6,
+    Key::Num7,
+    Key::Num8,
+    Key::Num9,
+];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
@@ -217,6 +244,13 @@ pub struct Simple {
     /// `DECDVBT_SIMPLE_KEYS`'s steps still to do, and when the last was.
     script: Option<std::collections::VecDeque<String>>,
     script_at: Option<Instant>,
+    /// The channel number being typed, when its last digit came, and the
+    /// last number that matched nothing.
+    digits: String,
+    digits_at: Option<Instant>,
+    miss: Option<(u16, Instant)>,
+    /// When the radio was last started or moved for want of a guide.
+    auto_at: Option<Instant>,
 }
 
 impl Simple {
@@ -236,6 +270,10 @@ impl Simple {
             env_scan_done: false,
             script: None,
             script_at: None,
+            digits: String::new(),
+            digits_at: None,
+            miss: None,
+            auto_at: None,
         }
     }
 }
@@ -435,6 +473,9 @@ impl App {
             "y" => Some(Key::Y),
             "b" => Some(Key::B),
             "i" => Some(Key::I),
+            d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => {
+                Some(DIGIT_KEYS[usize::from(d.as_bytes()[0] - b'0')])
+            }
             "native" => {
                 self.simple_theme(Theme::Native);
                 None
@@ -476,6 +517,14 @@ impl App {
             self.simple_start_scan();
         }
         self.scan_tick();
+        self.simple_auto_tune();
+        if self
+            .simple
+            .digits_at
+            .is_some_and(|t| t.elapsed() >= DIGIT_WAIT)
+        {
+            self.take_digits();
+        }
         // Something on: the last channel watched if this multiplex has it,
         // else the first with a picture.
         if !self.simple.started && self.simple.scan.is_none() && self.opts.play.is_none() {
@@ -495,6 +544,83 @@ impl App {
                 self.watch(sid);
             }
         }
+    }
+
+    /// Start the radio if it is stopped, or move it to the scan's first
+    /// multiplex if no guide has come (live runs only: a screenshot run never
+    /// opens the radio by itself).
+    fn simple_auto_tune(&mut self) {
+        if self.keeper.is_none()
+            || !self.kind.live()
+            || self.simple.scan.is_some()
+            || self.band_scan.running()
+            || self
+                .simple
+                .auto_at
+                .is_some_and(|t| t.elapsed() < AUTO_RETRY)
+        {
+            return;
+        }
+        let first = self.simple.found.first().map(|m| m.ch);
+        if self.session.is_none() {
+            let known = self.simple.found.iter().any(|m| m.ch == self.channel);
+            let ch = if known {
+                self.channel
+            } else {
+                first.unwrap_or(self.channel)
+            };
+            self.simple.auto_at = Some(Instant::now());
+            self.tune_channel(ch);
+            self.start();
+            return;
+        }
+        if self.epg.events() == 0
+            && self.tuned_at.elapsed() > NO_GUIDE_WAIT
+            && let Some(c) = first.filter(|&c| c != self.channel)
+        {
+            self.simple.auto_at = Some(Instant::now());
+            self.tune_channel(c);
+            self.simple.started = false;
+        }
+    }
+
+    /// Watch the channel number typed, if there is one.
+    fn take_digits(&mut self) {
+        let typed = std::mem::take(&mut self.simple.digits);
+        self.simple.digits_at = None;
+        let Ok(n) = typed.parse::<u16>() else { return };
+        match self.zap_list().into_iter().find(|e| e.0 == n) {
+            Some((_, sid, ch)) => self.simple_watch(sid, ch),
+            None => self.simple.miss = Some((n, Instant::now())),
+        }
+    }
+
+    /// The name of the service numbered `lcn`, from the scan's list or the
+    /// multiplex's tables.
+    fn lcn_name(&self, lcn: u16) -> Option<String> {
+        let found = self
+            .simple
+            .found
+            .iter()
+            .flat_map(|m| &m.services)
+            .find(|s| s.0 == Some(lcn))
+            .map(|s| s.2.clone());
+        let report = &self.ts.report;
+        found
+            .or_else(|| {
+                report
+                    .programmes
+                    .iter()
+                    .find(|p| p.lcn == Some(lcn))
+                    .and_then(|p| p.name.clone())
+            })
+            .or_else(|| {
+                report
+                    .others
+                    .iter()
+                    .find(|o| o.lcn == Some(lcn))
+                    .and_then(|o| o.name.clone())
+            })
     }
 
     pub(crate) fn simple_start_scan(&mut self) {
@@ -660,6 +786,27 @@ impl App {
             Screen::Tv => {
                 // The application, when it shows, has the arrows and OK.
                 if self.tv.red.shows_app() {
+                    return;
+                }
+                if let Some(d) = (0..10).find(|&d| press(DIGIT_KEYS[d])) {
+                    self.simple.digits.push(char::from(b'0' + d as u8));
+                    self.simple.digits_at = Some(Instant::now());
+                    self.simple.miss = None;
+                    if self.simple.digits.len() == 3 {
+                        self.take_digits();
+                    }
+                    return;
+                }
+                if !self.simple.digits.is_empty() {
+                    if press(Key::Enter) {
+                        self.take_digits();
+                    } else if press(Key::Backspace) {
+                        self.simple.digits.pop();
+                        self.simple.digits_at = (!self.simple.digits.is_empty()).then(Instant::now);
+                    } else if press(Key::Escape) {
+                        self.simple.digits.clear();
+                        self.simple.digits_at = None;
+                    }
                     return;
                 }
                 if press(Key::ArrowUp) || press(Key::PageUp) {
@@ -836,6 +983,177 @@ impl App {
         let show = self.simple.banner.is_some_and(|t| t.elapsed() < BANNER);
         if show && let Some(sid) = self.tv.service().or(self.selected) {
             self.draw_banner(p, rect, look, sid);
+            self.draw_info(p, rect, look, sid);
+        }
+        self.draw_digits(p, rect, look);
+    }
+
+    /// The number being typed (and the channel it is), or "No channel 123".
+    fn draw_digits(&self, p: &Painter, rect: Rect, look: &Look) {
+        let (big, small) = if !self.simple.digits.is_empty() {
+            let shown = format!("{:-<3}", self.simple.digits);
+            let name = self
+                .simple
+                .digits
+                .parse()
+                .ok()
+                .and_then(|n| self.lcn_name(n))
+                .unwrap_or_default();
+            (shown, name)
+        } else if let Some((n, t)) = self.simple.miss
+            && t.elapsed() < MISS_SHOWN
+        {
+            (format!("{n}"), "No channel".to_string())
+        } else {
+            return;
+        };
+        let b = Rect::from_min_size(
+            pos2(rect.left() + 40.0, rect.top() + 30.0),
+            vec2(300.0, 104.0),
+        );
+        p.rect_filled(b, if look.mono { 0.0 } else { 8.0 }, banner_bg(look));
+        p.text(
+            pos2(b.left() + 24.0, b.top() + 8.0),
+            Align2::LEFT_TOP,
+            big,
+            look.font(56.0),
+            look.accent,
+        );
+        p.text(
+            pos2(b.left() + 24.0, b.bottom() - 12.0),
+            Align2::LEFT_BOTTOM,
+            small,
+            look.font(20.0),
+            look.text,
+        );
+    }
+
+    /// What the service is: picture, sound, language and its access
+    /// services, as ffmpeg found the streams and the tables and guide say.
+    fn av_info(&self, sid: u16) -> AvInfo {
+        let report = &self.ts.report;
+        let prog = report.programmes.iter().find(|q| q.number == sid);
+        let streams = self.tv.stream_info();
+        let audio_pid = self.tv.audio_pid().or_else(|| {
+            prog.and_then(|p| p.streams.iter().find(|e| e.is_audio()))
+                .map(|e| e.pid)
+        });
+        let is_audio = |d: &str| d.starts_with("Audio:");
+        let audio = streams
+            .iter()
+            .find(|(pid, d)| is_audio(d) && audio_pid.is_some() && *pid == audio_pid)
+            .or_else(|| streams.iter().find(|(_, d)| is_audio(d)))
+            .and_then(|(_, d)| audio_format(d));
+        let (lines, interlaced, aspect) = streams
+            .iter()
+            .find(|(_, d)| d.starts_with("Video:"))
+            .map_or((None, false, None), |(_, d)| video_format(d));
+        let now = report.utc_unix.unwrap_or_else(now_unix);
+        let ev = self.epg.now_next(sid, now).0;
+        let flag = |f: fn(&decdvbt_ts::EpgEvent) -> bool| ev.is_some_and(f);
+        let audios = prog.map_or(0, |p| p.streams.iter().filter(|e| e.is_audio()).count());
+        let language = prog
+            .and_then(|p| p.streams.iter().find(|e| Some(e.pid) == audio_pid))
+            .and_then(|e| e.language.as_deref())
+            .map(language_name);
+        AvInfo {
+            audio,
+            language,
+            picture: lines.map(|l| format!("{l}{}", if interlaced { "i" } else { "p" })),
+            aspect,
+            hd: lines.is_some_and(|l| l >= 720) || flag(|e| e.hd),
+            ad: audios > 1 || flag(|e| e.audio_description),
+            subtitles: prog.is_some_and(|p| crate::player::subtitle_streams(p).next().is_some())
+                || flag(|e| e.subtitles),
+            signed: flag(|e| e.signed),
+        }
+    }
+
+    /// The information box, top right, as a television's: the time, the
+    /// standard and the sound, then the language and a badge for each of
+    /// the picture's format, HD, AD, subtitles and signing.
+    fn draw_info(&self, p: &Painter, rect: Rect, look: &Look, sid: u16) {
+        let i = self.av_info(sid);
+        let report = &self.ts.report;
+        let now = report.utc_unix.unwrap_or_else(now_unix);
+        let lt = report.local_time;
+        let b = Rect::from_min_size(
+            pos2(rect.right() - 680.0, rect.top() + 30.0),
+            vec2(640.0, 156.0),
+        );
+        p.rect_filled(b, if look.mono { 0.0 } else { 8.0 }, banner_bg(look));
+        let (x0, x1) = (b.left() + 24.0, b.right() - 24.0);
+        p.text(
+            pos2(x0, b.top() + 14.0),
+            Align2::LEFT_TOP,
+            "Information",
+            look.font(28.0),
+            look.text,
+        );
+        p.text(
+            pos2(x1, b.top() + 16.0),
+            Align2::RIGHT_TOP,
+            format!(
+                "{}  {}",
+                epg_view::hhmm(now, lt),
+                epg_view::day_date(now, lt)
+            ),
+            look.font(24.0),
+            look.accent,
+        );
+        let mut second = format!("{}  ·  C{}", self.standard.name(), self.channel);
+        if let Some(a) = &i.audio {
+            second.push_str("  |  ");
+            second.push_str(a);
+        }
+        p.text(
+            pos2(x1, b.top() + 62.0),
+            Align2::RIGHT_TOP,
+            second,
+            look.font(22.0),
+            look.text,
+        );
+        // The badges, right to left, then the language before them.
+        let badges: Vec<&str> = [
+            i.picture.as_deref(),
+            i.aspect.as_deref(),
+            i.hd.then_some("HD"),
+            i.ad.then_some("AD"),
+            i.subtitles.then_some("SUBS"),
+            i.signed.then_some("SL"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let font = look.font(20.0);
+        let (fill, fg) = if look.mono {
+            (TT_CYAN, Color32::BLACK)
+        } else {
+            (Color32::TRANSPARENT, look.text)
+        };
+        let y = b.top() + 106.0;
+        let mut x = x1;
+        for t in badges.iter().rev() {
+            let g = p.layout_no_wrap(t.to_string(), font.clone(), fg);
+            let r = Rect::from_min_max(
+                pos2(x - g.size().x - 16.0, y),
+                pos2(x, y + g.size().y + 8.0),
+            );
+            p.rect_filled(r, 2.0, fill);
+            if !look.mono {
+                p.rect_stroke(r, 2.0, Stroke::new(1.5, look.dim), StrokeKind::Inside);
+            }
+            p.galley(pos2(r.left() + 8.0, r.top() + 4.0), g, fg);
+            x = r.left() - 8.0;
+        }
+        if let Some(l) = &i.language {
+            p.text(
+                pos2(x - 6.0, y + 4.0),
+                Align2::RIGHT_TOP,
+                l,
+                look.font(22.0),
+                look.text,
+            );
         }
     }
 
@@ -846,20 +1164,24 @@ impl App {
         let lt = report.local_time;
         let prog = report.programmes.iter().find(|q| q.number == sid);
         let name = prog.and_then(|q| q.name.clone()).unwrap_or_default();
+        // Before the multiplex's tables are in, the scan's list knows it.
         let lcn = prog
             .and_then(|q| q.lcn)
+            .or_else(|| {
+                self.simple
+                    .found
+                    .iter()
+                    .flat_map(|m| &m.services)
+                    .find(|s| s.1 == sid)
+                    .and_then(|s| s.0)
+            })
             .map_or(String::new(), |l| l.to_string());
         let (ev_now, ev_next) = self.epg.now_next(sid, now);
         let b = Rect::from_min_max(
             pos2(rect.left() + 40.0, rect.bottom() - 150.0),
             pos2(rect.right() - 40.0, rect.bottom() - 30.0),
         );
-        let bg = if look.mono {
-            TT_BLUE
-        } else {
-            look.panel.gamma_multiply(0.93)
-        };
-        p.rect_filled(b, if look.mono { 0.0 } else { 8.0 }, bg);
+        p.rect_filled(b, if look.mono { 0.0 } else { 8.0 }, banner_bg(look));
         let x = b.left() + 24.0;
         p.text(
             pos2(x, b.top() + 16.0),
@@ -1656,6 +1978,100 @@ impl App {
 }
 
 /// A multiplex's first few service names, for the scan's lists.
+/// The banners' background.
+fn banner_bg(look: &Look) -> Color32 {
+    if look.mono {
+        TT_BLUE
+    } else {
+        look.panel.gamma_multiply(0.93)
+    }
+}
+
+/// The information box's contents.
+struct AvInfo {
+    /// "HE-AAC 5.1".
+    audio: Option<String>,
+    language: Option<String>,
+    /// "1080i".
+    picture: Option<String>,
+    /// "16:9".
+    aspect: Option<String>,
+    hd: bool,
+    ad: bool,
+    subtitles: bool,
+    signed: bool,
+}
+
+/// From ffmpeg's video stream ("Video: h264 (High) …, yuv420p(tv, bt709,
+/// top first), 1920x1080 [SAR 1:1 DAR 16:9], 25 fps"): the lines, whether it
+/// is interlaced (a field order given), and the display aspect.
+fn video_format(desc: &str) -> (Option<u32>, bool, Option<String>) {
+    let lines = desc
+        .split([',', ' ', '[', ']'])
+        .filter_map(|t| t.split_once('x'))
+        .find_map(|(w, h)| w.parse::<u32>().ok().and(h.parse::<u32>().ok()));
+    let interlaced = [
+        "top first",
+        "bottom first",
+        "top coded first",
+        "bottom coded first",
+    ]
+    .iter()
+    .any(|f| desc.contains(f));
+    let aspect = desc
+        .split_once("DAR ")
+        .and_then(|(_, r)| r.split([']', ',', ' ']).next())
+        .filter(|a| !a.is_empty())
+        .map(str::to_string);
+    (lines, interlaced, aspect)
+}
+
+/// From ffmpeg's audio stream ("Audio: aac_latm (HE-AAC) (…), 48000 Hz,
+/// 5.1, fltp"): "HE-AAC 5.1".
+fn audio_format(desc: &str) -> Option<String> {
+    let rest = desc.strip_prefix("Audio: ")?;
+    let codec = rest.split([' ', ',']).next()?;
+    let name = match codec {
+        "aac" | "aac_latm" if rest.contains("HE-AACv2") => "HE-AAC v2",
+        "aac" | "aac_latm" if rest.contains("HE-AAC") => "HE-AAC",
+        "aac" | "aac_latm" => "AAC",
+        "mp2" | "mp3" => "MPEG",
+        "ac3" => "Dolby Digital",
+        "eac3" => "Dolby Digital Plus",
+        other => other,
+    };
+    let layout = rest.split(", ").find_map(|f| match f.trim() {
+        "mono" => Some("Mono"),
+        "stereo" | "2 channels" => Some("Stereo"),
+        "5.1" | "5.1(side)" => Some("5.1"),
+        "7.1" => Some("7.1"),
+        _ => None,
+    });
+    Some(match layout {
+        Some(l) => format!("{name} {l}"),
+        None => name.to_string(),
+    })
+}
+
+/// An ISO 639 code's name, as a television shows it.
+fn language_name(code: &str) -> String {
+    match code.to_ascii_lowercase().as_str() {
+        "eng" => "English",
+        "cym" | "wel" => "Welsh",
+        "gla" => "Gaelic",
+        "gle" | "iri" => "Irish",
+        "fra" | "fre" => "French",
+        "deu" | "ger" => "German",
+        "spa" => "Spanish",
+        "ita" => "Italian",
+        "pol" => "Polish",
+        "jpn" => "Japanese",
+        "ara" => "Arabic",
+        _ => return code.to_ascii_uppercase(),
+    }
+    .to_string()
+}
+
 fn first_names(m: &Found) -> String {
     let mut v: Vec<&(Option<u16>, u16, String)> = m.services.iter().collect();
     v.sort_by_key(|s| s.0.unwrap_or(u16::MAX));
@@ -1667,6 +2083,21 @@ fn first_names(m: &Found) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_ffmpegs_streams() {
+        let v = "Video: h264 (High) ([27][0][0][0] / 0x001B), yuv420p(tv, bt709, top first), 1920x1080 [SAR 1:1 DAR 16:9], 25 fps, 25 tbr";
+        assert_eq!(video_format(v), (Some(1080), true, Some("16:9".into())));
+        let sd = "Video: mpeg2video (Main) ([2][0][0][0] / 0x0002), yuv420p(tv), 720x576 [SAR 64:45 DAR 16:9], 25 fps";
+        assert_eq!(video_format(sd), (Some(576), false, Some("16:9".into())));
+        let a = "Audio: aac_latm (HE-AAC) ([17][0][0][0] / 0x0011), 48000 Hz, 5.1, fltp";
+        assert_eq!(audio_format(a).as_deref(), Some("HE-AAC 5.1"));
+        let m = "Audio: mp2 ([3][0][0][0] / 0x0003), 48000 Hz, stereo, fltp, 256 kb/s";
+        assert_eq!(audio_format(m).as_deref(), Some("MPEG Stereo"));
+        assert_eq!(audio_format("Video: h264"), None);
+        assert_eq!(language_name("eng"), "English");
+        assert_eq!(language_name("xyz"), "XYZ");
+    }
 
     #[test]
     fn half_hours() {
