@@ -52,6 +52,8 @@ cargo run --release -p decdvbt-tx --example txfile -- clip.mp4 out.cs8 --null --
 cargo run --release -p decdvbt-tx --example txfile -- --stages --t2 8k-1/16-pp4-16qam-3/4-rot-1.7mhz   # per-stage CPU of a narrow mode (or --mode ...-1mhz)
 # the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|maps|history|none,
 # --window ts|epg|sdr, --service ID (select), --play ID, --http 127.0.0.1:8001,
+# --simple native|teletext, --screen tv|guide|scan (simple mode; env DECDVBT_SIMPLE_SCAN=1 runs its channel scan),
+# --fullscreen (1080p screenshots/videos),
 # --udp 127.0.0.1:1234, --record, --fps N (the waterfall scrolls a pixel a frame: the rate is its speed), --video OUT.mp4 --video-secs N (with --screenshot and
 # --after: record the window itself from --after on, for demos; out/promo has the release promo), env DECDVBT_REDBUTTON=wait,15 (start the playing
 # service's Red Button and press keys, one a second), --optimise (live: run the gain optimiser

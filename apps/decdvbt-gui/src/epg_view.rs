@@ -33,7 +33,7 @@ pub fn local_stamp(t: i64, lt: Option<LocalTime>) -> String {
     )
 }
 
-fn hhmm(t: i64, lt: Option<LocalTime>) -> String {
+pub(crate) fn hhmm(t: i64, lt: Option<LocalTime>) -> String {
     let local = t + 60 * i64::from(lt.map_or(0, |l| l.offset_at(t)));
     let (_, _, _, h, m, _) = civil(local);
     format!("{h:02}:{m:02}")
@@ -62,27 +62,31 @@ fn genre_colour(g: Option<u8>) -> Color32 {
 }
 
 /// A row of the guide: a service of this multiplex or another.
-struct Row {
-    number: u16,
-    lcn: Option<u16>,
-    name: String,
-    /// On this multiplex, with a picture or sound: it can be played.
-    playable: bool,
+pub(crate) struct Row {
+    pub(crate) number: u16,
+    pub(crate) lcn: Option<u16>,
+    pub(crate) name: String,
+    /// On this multiplex, with a picture or sound (or an application that
+    /// may bring one, Freeview's internet channels): it can be played.
+    pub(crate) playable: bool,
     /// On another multiplex: its UHF channel.
-    elsewhere: Option<Option<u8>>,
+    pub(crate) elsewhere: Option<Option<u8>>,
+    /// An internet channel (a data service with an application).
+    pub(crate) internet: bool,
 }
 
 /// The guide's rows: this multiplex's services and, if asked, the others' that
 /// have events, by channel number.
-fn rows(report: &TsReport, epg: &Epg, all: bool) -> Vec<Row> {
+pub(crate) fn rows(report: &TsReport, epg: &Epg, all: bool) -> Vec<Row> {
     let mut v: Vec<Row> = services::ordered(report)
         .into_iter()
         .map(|p| Row {
             number: p.number,
             lcn: p.lcn,
             name: p.name.clone().unwrap_or_else(|| "?".into()),
-            playable: services::on_air(p),
+            playable: services::on_air(p) || internet(p),
             elsewhere: None,
+            internet: internet(p),
         })
         .collect();
     if all {
@@ -97,11 +101,17 @@ fn rows(report: &TsReport, epg: &Epg, all: bool) -> Vec<Row> {
                     name: o.name.clone().unwrap_or_else(|| "?".into()),
                     playable: false,
                     elsewhere: Some(o.centre_hz.and_then(|f| uhf_channel_at(f as f64))),
+                    internet: o.service_type == Some(0x0C),
                 }),
         );
     }
     v.sort_by_key(|r| (r.lcn.unwrap_or(u16::MAX), r.number));
     v
+}
+
+/// A data service with an MHEG-5 application (Freeview's internet channels).
+fn internet(p: &decdvbt_ts::Programme) -> bool {
+    services::Kind::of(p) == services::Kind::Data && services::has_app(p)
 }
 
 /// The access and picture marks of an event: HD, S(ubtitles), HoH, AD, SL, 5.1.

@@ -30,6 +30,7 @@ mod remember;
 mod scopes;
 mod sdr;
 mod services;
+mod simple;
 mod source;
 mod t2card;
 mod ts_viewer;
@@ -124,6 +125,10 @@ struct Options {
     /// Fill the screen (`--fullscreen`; screenshots and videos at the
     /// monitor's size rather than 1400x860).
     fullscreen: bool,
+    /// Start in simple mode with this look (`--simple native|teletext`).
+    simple: Option<simple::Theme>,
+    /// Simple mode's screen at the start (`--screen tv|guide|scan`).
+    screen: Option<simple::Screen>,
     /// Select this service at the start (its number).
     service: Option<u16>,
     /// Play this service as soon as the receiver has read its tables.
@@ -207,6 +212,8 @@ impl Options {
             decode: true,
             window: None,
             fullscreen: false,
+            simple: None,
+            screen: None,
             service: None,
             play: None,
             subs: false,
@@ -280,6 +287,16 @@ impl Options {
                     )
                 }
                 "--fullscreen" => o.fullscreen = true,
+                "--simple" => {
+                    let v = value("native or teletext")?;
+                    o.simple =
+                        Some(simple::Theme::parse(&v).ok_or("--simple: native or teletext")?);
+                }
+                "--screen" => {
+                    let v = value("tv, guide or scan")?;
+                    o.screen =
+                        Some(simple::Screen::parse(&v).ok_or("--screen: tv, guide or scan")?);
+                }
                 "--decode" | "--no-decode" => {
                     o.decode = a == "--decode";
                     o.decode_given = true;
@@ -476,6 +493,8 @@ struct App {
     ts_window: ts_viewer::TsViewer,
     epg_window: epg_view::EpgView,
     tv: player::TvWindow,
+    /// The set-top box screens ([`simple`]).
+    simple: simple::Simple,
     /// The player's tap, and the outputs as last sent to the hub.
     tap: Option<TsTap>,
     outputs_ui: services::OutputsUi,
@@ -708,6 +727,20 @@ impl App {
                 v
             },
             tv: player::TvWindow::default(),
+            simple: {
+                // A screenshot run shows simple mode only when asked.
+                let from_prefs =
+                    opts.screenshot.is_none() && prefs::get("simple").as_deref() == Some("1");
+                let theme = opts
+                    .simple
+                    .or_else(|| prefs::get("simple_theme").and_then(|t| simple::Theme::parse(&t)))
+                    .unwrap_or(simple::Theme::Native);
+                simple::Simple::new(
+                    opts.simple.is_some() || from_prefs,
+                    theme,
+                    opts.screen.unwrap_or_default(),
+                )
+            },
             tap: None,
             outputs_ui: {
                 let mut o = services::OutputsUi::default();
@@ -782,6 +815,7 @@ impl App {
         if app.opts.screenshot.is_none() {
             app.keeper = Some(remember::Keeper::new());
         }
+        app.tv.embedded = app.simple.on;
         app
     }
 
@@ -1109,7 +1143,10 @@ impl App {
             self.ts_at = Instant::now();
             self.ts = s.rx.ts_view();
         }
-        if self.epg_window.open && self.epg_at.elapsed() >= Duration::from_secs(1) {
+        // The guide window and simple mode (its guide and banner) read it.
+        if (self.epg_window.open || self.simple.on)
+            && self.epg_at.elapsed() >= Duration::from_secs(1)
+        {
             self.epg_at = Instant::now();
             self.epg = s.rx.epg();
         }
@@ -2229,6 +2266,13 @@ impl App {
                 self.toggle_band_scan();
             }
             if ui
+                .selectable_label(false, "📺 Simple")
+                .on_hover_text("The set-top box screens: TV, guide and channel scan")
+                .clicked()
+            {
+                self.simple_set(true);
+            }
+            if ui
                 .selectable_label(self.sdr_open, "⚙ SDR")
                 .on_hover_text(
                     "DC removal, I/Q balance, filter, frequency correction, gain optimiser",
@@ -2468,6 +2512,7 @@ impl eframe::App for App {
             self.start_optimiser();
         }
         self.optimise_tick();
+        self.simple_tick();
         // DECDVBT_BANDSCAN=1 (screenshots, tests): sweep once the radio runs.
         if !self.scan_env_done
             && std::env::var_os("DECDVBT_BANDSCAN").is_some()
@@ -2491,6 +2536,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let t0 = Instant::now();
         self.frames += 1;
+        if self.simple.on {
+            self.simple_ui(ui);
+            self.frame_cost[1] += t0.elapsed();
+            return;
+        }
         egui::Panel::top("controls").show(ui, |ui| self.control_bar(ui));
         egui::Panel::top("band_scan")
             .resizable(false)
