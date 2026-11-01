@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use decdvbt_core::channel::{uhf_centre_hz, uhf_channel_at};
+use decdvbt_core::channel::{centre_hz, channel_at};
 use decdvbt_rx::delay_doppler::DelayDoppler;
 use decdvbt_rx::sounder::{Sounder, SounderConfig};
 
@@ -66,7 +66,7 @@ pub fn run(a: SoundArgs) -> Result<()> {
     )?;
     let fs = src.sample_rate();
     let centre = src.center_freq();
-    let channel_centre = uhf_channel_at(centre).and_then(uhf_centre_hz);
+    let channel_centre = channel_at(centre).and_then(centre_hz);
     println!(
         "{} (centre {:.3} MHz{})",
         src.describe(),

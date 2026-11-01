@@ -42,7 +42,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use decdvbt_core::channel::{parse_channel, uhf_centre_hz, uhf_channel_at, uk_channels};
+use decdvbt_core::channel::{
+    all_channels, bandwidth_hz, centre_hz, channel_at, channel_label, parse_channel,
+};
 use decdvbt_core::dvbt::{Bandwidth, Mode};
 use decdvbt_engine::{
     Command, CpuGauge, FrontEndSettings, Outputs, Row, Stats, TsView, signal_block, spectral_cn_db,
@@ -233,7 +235,7 @@ impl Options {
             match a.as_str() {
                 "--channel" => {
                     let v = value("a channel, e.g. C26")?;
-                    o.channel = Some(parse_channel(&v).ok_or(format!("not a UHF channel: {v}"))?);
+                    o.channel = Some(parse_channel(&v).ok_or(format!("not a channel: {v}"))?);
                 }
                 "--rate" => {
                     o.rate_msps = Some(value("MS/s")?.parse().map_err(|_| "bad --rate")?);
@@ -641,7 +643,7 @@ impl App {
         let mut channel = opts.channel.or(kept.channel).unwrap_or(26);
         let sdr = sdr::SdrSettings::load();
         let offsets = load_offsets();
-        let mut tune_hz = uhf_centre_hz(channel).map_or(0.0, |c| {
+        let mut tune_hz = centre_hz(channel).map_or(0.0, |c| {
             c + if sdr.auto_centre {
                 offsets.get(&channel).copied().unwrap_or(0.0)
             } else {
@@ -650,11 +652,11 @@ impl App {
         });
         if !by_hand && let Some(h) = kept.tune_hz {
             tune_hz = h;
-            channel = uhf_channel_at(h).unwrap_or(channel);
+            channel = channel_at(h).unwrap_or(channel);
         }
         if let Some(f) = opts.freq_hz {
             tune_hz = f;
-            channel = uhf_channel_at(f).unwrap_or(channel);
+            channel = channel_at(f).unwrap_or(channel);
         }
         // The capture last opened (offered again, not opened).
         let file = kept.file.clone().filter(|f| f.exists());
@@ -683,7 +685,7 @@ impl App {
             bandwidth,
             bandwidth_sent: None,
             channel,
-            channel_text: format!("C{channel}"),
+            channel_text: channel_label(channel),
             rate_msps: opts
                 .rate_msps
                 .or(kept.rate_msps.filter(|r| rates_for(bandwidth).contains(r)))
@@ -909,11 +911,21 @@ impl App {
                     center_hz: self.file_centre_mhz * 1e6,
                     rate_hz: self.file_rate_msps * 1e6,
                 };
-                // A capture's signal is in its channel; a narrow one is
-                // taken at the capture's centre (it is off the UHF raster).
-                let vfo = uhf_channel_at(self.file_centre_mhz * 1e6)
+                // A capture's signal is in its channel (its width the
+                // channel's: 7 MHz in VHF); a narrow one is taken at the
+                // capture's centre (it is off the raster).
+                if matches!(self.bandwidth, Bandwidth::Mhz7 | Bandwidth::Mhz8)
+                    && let Some(bw) = channel_at(self.file_centre_mhz * 1e6).and_then(bandwidth_hz)
+                {
+                    self.set_bandwidth(if bw == 7e6 {
+                        Bandwidth::Mhz7
+                    } else {
+                        Bandwidth::Mhz8
+                    });
+                }
+                let vfo = channel_at(self.file_centre_mhz * 1e6)
                     .filter(|_| !self.bandwidth.narrow())
-                    .and_then(uhf_centre_hz)
+                    .and_then(centre_hz)
                     .or((self.file_centre_mhz > 0.0).then_some(self.file_centre_mhz * 1e6));
                 self.begin(spec, vfo);
             }
@@ -1066,15 +1078,15 @@ impl App {
         match self.vfo_hz {
             Some(v) if self.bandwidth.narrow() => format!("{:.3}MHz", v / 1e6),
             v => v
-                .and_then(uhf_channel_at)
-                .map_or_else(|| format!("C{}", self.channel), |c| format!("C{c}")),
+                .and_then(channel_at)
+                .map_or_else(|| channel_label(self.channel), channel_label),
         }
     }
 
     /// The UHF channel of the VFO for the card (none for a narrow signal).
     fn card_channel(&self) -> Option<u8> {
         self.vfo_hz
-            .and_then(uhf_channel_at)
+            .and_then(channel_at)
             .filter(|_| !self.bandwidth.narrow())
     }
 
@@ -1258,8 +1270,17 @@ impl App {
         let Some(fc) = self.channel_hz(n) else { return };
         self.cancel_optimiser();
         self.channel = n;
-        self.channel_text = format!("C{n}");
+        self.channel_text = channel_label(n);
         self.tune_hz = fc;
+        // VHF channels are 7 MHz wide, UHF 8: the width follows the channel
+        // (a narrow width chosen by hand stays).
+        if matches!(self.bandwidth, Bandwidth::Mhz7 | Bandwidth::Mhz8) {
+            self.set_bandwidth(if bandwidth_hz(n) == Some(7e6) {
+                Bandwidth::Mhz7
+            } else {
+                Bandwidth::Mhz8
+            });
+        }
         self.tuned_at = Instant::now();
         self.card_held = None;
         self.centre_checked = false;
@@ -1275,7 +1296,7 @@ impl App {
                 self.vfo_hz = Some(fc);
             }
             Some(s) if !s.live && !fits => {
-                self.note = format!("C{n} is outside this capture");
+                self.note = format!("{} is outside this capture", channel_label(n));
             }
             _ => {
                 self.vfo_hz = Some(fc);
@@ -1306,7 +1327,7 @@ impl App {
     }
 
     fn step_channel(&mut self, up: bool) {
-        let list: Vec<u8> = uk_channels().collect();
+        let list: Vec<u8> = all_channels().collect();
         let at = list.iter().position(|&c| c >= self.channel).unwrap_or(0);
         let next = if up {
             list[(at + usize::from(list[at] == self.channel)).min(list.len() - 1)]
@@ -1328,7 +1349,7 @@ impl App {
     /// Where channel `n` is tuned: its place in the plan, and, with centring
     /// on, the offset found for it.
     fn channel_hz(&self, n: u8) -> Option<f64> {
-        let nominal = uhf_centre_hz(n)?;
+        let nominal = centre_hz(n)?;
         let off = if self.sdr.auto_centre {
             self.cur_offsets().get(&n).copied().unwrap_or(0.0)
         } else {
@@ -1344,9 +1365,9 @@ impl App {
         self.tuned_at = Instant::now();
         self.card_held = None;
         self.centre_checked = true;
-        if let Some(ch) = uhf_channel_at(hz) {
+        if let Some(ch) = channel_at(hz) {
             self.channel = ch;
-            self.channel_text = format!("C{ch}");
+            self.channel_text = channel_label(ch);
         }
         match &self.session {
             Some(s) if s.live => {
@@ -1413,7 +1434,7 @@ impl App {
         if self.tuned_at.elapsed() < Duration::from_secs(2) || self.span_hz <= 0.0 {
             return;
         }
-        let Some(nominal) = uhf_centre_hz(self.channel) else {
+        let Some(nominal) = centre_hz(self.channel) else {
             self.centre_checked = true;
             return;
         };
@@ -1457,7 +1478,11 @@ impl App {
         let target = nominal + off;
         if (target - self.tune_hz).abs() > 25e3 {
             self.set_frequency(target);
-            self.note = format!("C{ch} is {:+.0} kHz off: retuned", off / 1e3);
+            self.note = format!(
+                "{} is {:+.0} kHz off: retuned",
+                channel_label(ch),
+                off / 1e3
+            );
         }
         self.centre_checked = true;
     }
@@ -1647,7 +1672,7 @@ impl App {
         }
         let name = format!(
             "c{}_{:.3}MHz_{}Msps_{}.cs8",
-            uhf_channel_at(self.centre_hz)
+            channel_at(self.centre_hz)
                 .filter(|_| !self.bandwidth.narrow())
                 .unwrap_or(0),
             self.centre_hz / 1e6,
@@ -2152,10 +2177,10 @@ impl App {
                         }
                     }
                     self.channel_text = match self.vfo_hz {
-                        Some(v) if uhf_channel_at(v).is_none() || self.bandwidth.narrow() => {
+                        Some(v) if channel_at(v).is_none() || self.bandwidth.narrow() => {
                             format!("{:.3}", v / 1e6)
                         }
-                        _ => format!("C{}", self.channel),
+                        _ => channel_label(self.channel),
                     };
                 }
                 if ui.small_button("▶").clicked() {
@@ -2163,7 +2188,7 @@ impl App {
                 }
                 ui.label(format!(
                     "{:.3} MHz",
-                    self.vfo_hz.or(uhf_centre_hz(self.channel)).unwrap_or(0.0) / 1e6
+                    self.vfo_hz.or(centre_hz(self.channel)).unwrap_or(0.0) / 1e6
                 ));
 
                 ui.separator();
@@ -2379,8 +2404,8 @@ impl App {
                         ui,
                         "channel",
                         self.vfo_hz
-                            .and_then(uhf_channel_at)
-                            .map_or("—".into(), |c| format!("C{c}")),
+                            .and_then(channel_at)
+                            .map_or("—".into(), channel_label),
                     );
                 });
             ui.add_space(30.0);
@@ -2546,7 +2571,7 @@ impl eframe::App for App {
         egui::Panel::top("band_scan")
             .resizable(false)
             .show(ui, |ui| {
-                let cur = self.vfo_hz.and_then(uhf_channel_at).or(Some(self.channel));
+                let cur = self.vfo_hz.and_then(channel_at).or(Some(self.channel));
                 if let Some(band_scan::Action::Tune(n)) = self.band_scan.show(ui, 54.0, cur) {
                     self.tune_channel(n);
                 }
@@ -2688,8 +2713,8 @@ impl eframe::App for App {
         if let Some(n) = tune {
             if self.session.is_none() && self.kind.live() {
                 self.channel = n;
-                self.channel_text = format!("C{n}");
-                self.vfo_hz = uhf_centre_hz(n);
+                self.channel_text = channel_label(n);
+                self.vfo_hz = centre_hz(n);
             } else {
                 self.tune_channel(n);
             }

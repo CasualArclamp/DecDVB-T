@@ -1,8 +1,10 @@
 // made by CasualArclamp
-//! The band scan: the radio steps over the UK UHF channels, a short average
-//! of its spectrum is kept for each, and the pieces are stitched into one wide,
-//! short trace along the top of the window with each channel's number on its
-//! carrier. The channel being received is bracketed; a click tunes one.
+//! The band scan: the radio steps over every channel of the plan (VHF E5–E12,
+//! UHF 21–69), a short average of its spectrum is kept for each, and the
+//! pieces are laid side by side in one wide, short trace along the top of the
+//! window, a slot a channel (the gap between the bands left out), with each
+//! channel's number on its carrier. The channel being received is
+//! bracketed; a click tunes one.
 //!
 //! The scan borrows the live radio: it retunes it channel by channel, reads
 //! the rows the engine already makes (nothing new is computed per sample), and
@@ -12,16 +14,19 @@
 
 use std::time::{Duration, Instant};
 
-use decdvbt_core::channel::{uhf_centre_hz, uk_channels};
+use decdvbt_core::channel::{all_channels, bandwidth_hz, centre_hz, channel_label};
 use decdvbt_engine::Row;
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2,
 };
 
-/// Columns kept across each channel's 8 MHz.
+/// Columns kept across each channel's width.
 const COLS: usize = 32;
-/// Half the width kept for a channel, Hz (the raster's 8 MHz).
-const HALF_HZ: f64 = 4.0e6;
+
+/// Half the width kept for channel `n`, Hz (3.5 MHz in VHF, 4 in UHF).
+fn half_hz(n: u8) -> f64 {
+    bandwidth_hz(n).unwrap_or(8e6) / 2.0
+}
 /// Rows thrown away after a retune (the radio and the engine's filters
 /// settle), and rows averaged.
 const SKIP_ROWS: u32 = 4;
@@ -74,8 +79,8 @@ impl BandScan {
     /// Begin a scan; the radio is on channel `restore`. Returns the first
     /// centre to tune.
     pub fn start(&mut self, restore: u8) -> f64 {
-        let chans: Vec<u8> = uk_channels().collect();
-        let first = uhf_centre_hz(chans[0]).unwrap_or(0.0);
+        let chans: Vec<u8> = all_channels().collect();
+        let first = centre_hz(chans[0]).unwrap_or(0.0);
         self.run = Some(Run {
             chans,
             at: 0,
@@ -121,7 +126,7 @@ impl BandScan {
         let Some(run) = &mut self.run else {
             return Step::Idle;
         };
-        let target = uhf_centre_hz(run.chans[run.at]).unwrap_or(0.0);
+        let target = centre_hz(run.chans[run.at]).unwrap_or(0.0);
         for row in rows {
             if (row.center_hz - target).abs() > CENTRE_TOL_HZ || row.db.is_empty() {
                 continue;
@@ -130,7 +135,7 @@ impl BandScan {
                 run.skipped += 1;
                 continue;
             }
-            add_row(&mut run.acc, row, target);
+            add_row(&mut run.acc, row, target, half_hz(run.chans[run.at]));
             run.kept += 1;
         }
         let done = run.kept >= KEEP_ROWS;
@@ -152,7 +157,7 @@ impl BandScan {
         run.skipped = 0;
         run.since = Instant::now();
         if run.at < run.chans.len() {
-            return Step::Retune(uhf_centre_hz(run.chans[run.at]).unwrap_or(0.0));
+            return Step::Retune(centre_hz(run.chans[run.at]).unwrap_or(0.0));
         }
         let run = self.run.take().unwrap();
         self.strip = run.new;
@@ -166,23 +171,24 @@ impl BandScan {
             ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, Color32::from_gray(14));
-        let chans: Vec<u8> = uk_channels().collect();
-        let (Some(&first), Some(&last)) = (chans.first(), chans.last()) else {
-            return None;
-        };
-        let lo = uhf_centre_hz(first).unwrap_or(0.0) - HALF_HZ;
-        let hi = uhf_centre_hz(last).unwrap_or(0.0) + HALF_HZ;
+        let chans: Vec<u8> = all_channels().collect();
         let plot = Rect::from_min_max(
             pos2(rect.left() + 4.0, rect.top() + 14.0),
             pos2(rect.right() - 4.0, rect.bottom() - 2.0),
         );
-        let x_of = |hz: f64| plot.left() + ((hz - lo) / (hi - lo)) as f32 * plot.width();
+        // A slot a channel: channel `n`'s band across its slot.
+        let slot_w = plot.width() / chans.len() as f32;
+        let slot_of = |n: u8| chans.iter().position(|&c| c == n).unwrap_or(0) as f32;
+        let x_of = |n: u8, hz: f64| {
+            let f = (hz - centre_hz(n).unwrap_or(0.0)) / (2.0 * half_hz(n)) + 0.5;
+            plot.left() + (slot_of(n) + f as f32) * slot_w
+        };
 
         if self.strip.is_empty() {
             let msg = if self.running() {
                 "scanning…"
             } else {
-                "Band scan: press Scan to sweep the UHF band"
+                "Band scan: press Scan to sweep the band (E5–E12, 21–69)"
             };
             p.text(
                 rect.center(),
@@ -211,8 +217,9 @@ impl BandScan {
 
         for (n, d) in &self.strip {
             let cur = current == Some(*n);
-            let centre = uhf_centre_hz(*n).unwrap_or(0.0);
-            let (x0, x1) = (x_of(centre - HALF_HZ), x_of(centre + HALF_HZ));
+            let centre = centre_hz(*n).unwrap_or(0.0);
+            let half = half_hz(*n);
+            let (x0, x1) = (x_of(*n, centre - half), x_of(*n, centre + half));
             if cur {
                 p.rect_filled(
                     Rect::from_min_max(pos2(x0, rect.top()), pos2(x1, rect.bottom())),
@@ -227,8 +234,8 @@ impl BandScan {
                 .iter()
                 .enumerate()
                 .map(|(k, &v)| {
-                    let f = centre - HALF_HZ + (k as f64 + 0.5) / COLS as f64 * 2.0 * HALF_HZ;
-                    pos2(x_of(f), y_of(v))
+                    let f = centre - half + (k as f64 + 0.5) / COLS as f64 * 2.0 * half;
+                    pos2(x_of(*n, f), y_of(v))
                 })
                 .collect();
             let mut fill = pts.clone();
@@ -248,7 +255,11 @@ impl BandScan {
             p.text(
                 pos2((x0 + x1) / 2.0, rect.top() + 1.0),
                 Align2::CENTER_TOP,
-                format!("{n}"),
+                if *n < 21 {
+                    channel_label(*n)
+                } else {
+                    format!("{n}")
+                },
                 FontId::monospace(if mean > dmin + 8.0 { 11.0 } else { 9.0 }),
                 if cur {
                     AMBER
@@ -262,15 +273,13 @@ impl BandScan {
 
         let mut action = None;
         if let Some(pos) = resp.hover_pos().filter(|q| rect.contains(*q)) {
-            let hz = lo + ((pos.x - plot.left()) / plot.width()) as f64 * (hi - lo);
-            if let Some(&n) = chans
-                .iter()
-                .min_by_key(|&&n| (uhf_centre_hz(n).unwrap_or(0.0) - hz).abs() as i64)
-            {
+            let slot = ((pos.x - plot.left()) / slot_w).floor().max(0.0) as usize;
+            if let Some(&n) = chans.get(slot.min(chans.len() - 1)) {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 resp.clone().on_hover_text(format!(
-                    "C{n}, {:.0} MHz: click to receive",
-                    uhf_centre_hz(n).unwrap_or(0.0) / 1e6
+                    "{}, {:.1} MHz: click to receive",
+                    channel_label(n),
+                    centre_hz(n).unwrap_or(0.0) / 1e6
                 ));
                 if resp.clicked() {
                     action = Some(Action::Tune(n));
@@ -281,8 +290,9 @@ impl BandScan {
     }
 }
 
-/// Add `row`'s power into the columns across the channel centred on `target`.
-fn add_row(acc: &mut [f32; COLS], row: &Row, target: f64) {
+/// Add `row`'s power into the columns across the channel centred on
+/// `target`, `half` either side.
+fn add_row(acc: &mut [f32; COLS], row: &Row, target: f64, half: f64) {
     let n = row.db.len();
     let step = row.sample_rate / n as f64;
     let start = row.center_hz - row.sample_rate / 2.0 - target;
@@ -290,10 +300,10 @@ fn add_row(acc: &mut [f32; COLS], row: &Row, target: f64) {
     let mut cnt = [0u32; COLS];
     for (i, &v) in row.db.iter().enumerate() {
         let f = start + (i as f64 + 0.5) * step;
-        if !(-HALF_HZ..HALF_HZ).contains(&f) {
+        if !(-half..half).contains(&f) {
             continue;
         }
-        let c = (((f + HALF_HZ) / (2.0 * HALF_HZ)) * COLS as f64) as usize;
+        let c = (((f + half) / (2.0 * half)) * COLS as f64) as usize;
         let c = c.min(COLS - 1);
         sum[c] += 10f32.powf(v / 10.0);
         cnt[c] += 1;

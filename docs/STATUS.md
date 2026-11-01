@@ -1879,3 +1879,19 @@ monospaced, Fastext).
   multiplex), 22 → TJC. `DECDVBT_SIMPLE_KEYS` takes digits too.
 - The banner's channel number comes from the scan's list until the new multiplex's tables
   are in.
+
+## The European channel plan (2026-11-01, issue 9)
+
+- `decdvbt_core::channel`: VHF Band III E5–E12 (7 MHz, centre 142.5 + 7·N MHz, GE06)
+  beside UHF 21–69. One `u8` names either (5–12 and 21–69 do not meet): `centre_hz`,
+  `bandwidth_hz`, `channel_at`, `channel_label` ("E7", "C21"), `all_channels`;
+  `parse_channel` takes "E7" too. The transmitter keeps to the `uhf_*` functions (its
+  safety check is unchanged; `--channel E7` is refused there).
+- Receiver: the CLI's `channels`, `channel`, `scan` and the GUI's band scan, channel steps
+  and raster cover every channel. The band scan strip is a slot a channel (the 230–470 MHz
+  gap left out). The width follows the channel: the GUI sets 7 or 8 MHz on tuning and on
+  opening a capture (a narrow width chosen by hand stays); `decode --bandwidth` defaults to
+  `auto` (7 for a VHF channel, by name, `--freq` or the file name's centre).
+- Checked: a 64-QAM 2/3 8k 7 MHz signal modulated on E7 decodes with `auto` (0 RS errors)
+  and in the GUI (E7, 7 MHz, MER 24 dB); C42 live (Airspy) still decodes at 8 MHz. Not
+  checked on air: the aerial here is filtered to UHF.

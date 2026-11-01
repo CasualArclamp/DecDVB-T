@@ -30,7 +30,7 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use decdvbt_core::channel::{uhf_centre_hz, uhf_channel_at};
+use decdvbt_core::channel::{centre_hz, channel_at, channel_label};
 use decdvbt_rx::auto::Standard;
 use eframe::egui::{
     self, Align2, Color32, FontId, Key, Modifiers, Painter, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -404,7 +404,7 @@ impl App {
                     o.service_type,
                     Some(0x01 | 0x02 | 0x0A | 0x0C | 0x16 | 0x19 | 0x1F)
                 ) {
-                    let ch = o.centre_hz.and_then(|f| uhf_channel_at(f as f64));
+                    let ch = o.centre_hz.and_then(|f| channel_at(f as f64));
                     v.push((o.lcn.unwrap_or(u16::MAX), o.number, ch));
                 }
             }
@@ -680,7 +680,7 @@ impl App {
                     if cands.len() == 1 { "" } else { "s" },
                     cands
                         .iter()
-                        .map(|c| format!("C{c}"))
+                        .map(|c| channel_label(*c))
                         .collect::<Vec<_>>()
                         .join(" ")
                 ));
@@ -721,14 +721,17 @@ impl App {
                 }
                 let ch = cands[*at];
                 if named.is_empty() {
-                    scan.log.push(format!("C{ch}: no lock"));
+                    scan.log.push(format!("{}: no lock", channel_label(ch)));
                 } else {
                     let standard = match self.standard {
                         Standard::Dvbt2 => "DVB-T2",
                         _ => "DVB-T",
                     };
-                    scan.log
-                        .push(format!("C{ch}: {standard}, {} services", named.len()));
+                    scan.log.push(format!(
+                        "{}: {standard}, {} services",
+                        channel_label(ch),
+                        named.len()
+                    ));
                     scan.found.push(Found {
                         ch,
                         standard: standard.into(),
@@ -1609,8 +1612,8 @@ impl App {
             pos2(cx, head.bottom() - 40.0),
             Align2::LEFT_TOP,
             format!(
-                "C{} · {}",
-                self.channel,
+                "{} · {}",
+                channel_label(self.channel),
                 if self.standard == Standard::Dvbt2 {
                     "DVB-T2"
                 } else {
@@ -1716,11 +1719,11 @@ impl App {
                 None => "Sweeping the band…".into(),
             },
             Some(Phase::Lock { cands, at, .. }) => format!(
-                "Reading C{} ({} of {}): {:.0} MHz",
-                cands[*at],
+                "Reading {} ({} of {}): {:.0} MHz",
+                channel_label(cands[*at]),
                 at + 1,
                 cands.len(),
-                uhf_centre_hz(cands[*at]).unwrap_or(0.0) / 1e6
+                centre_hz(cands[*at]).unwrap_or(0.0) / 1e6
             ),
             None if found.is_empty() => "Press OK (Enter) to find your channels".into(),
             None => "Your channels: press OK to scan again, Esc for TV".into(),
@@ -1798,8 +1801,8 @@ impl App {
             y += 36.0;
             for m in &found {
                 let s = format!(
-                    "C{:<4} {:<7} {:>3} services   {}",
-                    m.ch,
+                    "{:<5} {:<7} {:>3} services   {}",
+                    channel_label(m.ch),
                     m.standard,
                     m.services.len(),
                     first_names(m)
@@ -1884,8 +1887,8 @@ impl App {
                     Stroke::new(1.0, look.line),
                 );
                 let vals = [
-                    format!("C{}", m.ch),
-                    format!("{:.3}", uhf_centre_hz(m.ch).unwrap_or(0.0) / 1e6),
+                    channel_label(m.ch),
+                    format!("{:.3}", centre_hz(m.ch).unwrap_or(0.0) / 1e6),
                     m.standard.clone(),
                     format!("{}  ({})", m.services.len(), first_names(m)),
                 ];

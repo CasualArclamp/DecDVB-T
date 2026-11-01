@@ -11,7 +11,7 @@ crate layout and the milestone plan. Update it when a decision changes.
 cargo check --workspace --all-targets   # fast feedback
 cargo test --workspace                  # unit tests
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run --release -p decdvbt-cli -- channels
+cargo run --release -p decdvbt-cli -- channels                       # the European plan: VHF E5–E12 (7 MHz), UHF C21–C69 (8 MHz)
 cargo run --release -p decdvbt-cli -- scan                       # HackRF: which channels carry a mux
 cargo run --release -p decdvbt-cli -- scan --amp --lna 32 --vga 8 --classify 5   # ... and say DVB-T or DVB-T2 (and the mode) for each
 cargo run --release -p decdvbt-cli -- capture C26 --record x.cs8 # level, drops, CPU; optional IQ

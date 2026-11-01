@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use decdvbt_core::SampleFormat;
-use decdvbt_core::channel::{parse_channel, uhf_centre_hz};
+use decdvbt_core::channel::{centre_hz, channel_label, parse_channel};
 use decdvbt_core::dvbt::{Bandwidth, Mode};
 use decdvbt_io::IqFileWriter;
 use decdvbt_mod::channel::{Channel, Impulse, PROFILES, Path as ChannelPath, profile};
@@ -131,9 +131,12 @@ fn centre_of(a: &ModulateArgs) -> Result<(String, f64)> {
         return Ok((format!("{mhz:.3}MHz"), mhz));
     }
     let chan_no =
-        parse_channel(&a.channel).with_context(|| format!("not a UHF channel: {}", a.channel))?;
-    let centre_mhz = uhf_centre_hz(chan_no).unwrap() / 1e6;
-    Ok((format!("C{chan_no}_{centre_mhz:.3}MHz"), centre_mhz))
+        parse_channel(&a.channel).with_context(|| format!("not a channel: {}", a.channel))?;
+    let centre_mhz = centre_hz(chan_no).unwrap() / 1e6;
+    Ok((
+        format!("{}_{centre_mhz:.3}MHz", channel_label(chan_no)),
+        centre_mhz,
+    ))
 }
 
 fn channel_of(a: &ModulateArgs) -> Result<Channel> {

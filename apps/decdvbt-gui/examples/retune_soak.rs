@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use decdvbt_core::channel::{parse_channel, uhf_centre_hz};
+use decdvbt_core::channel::{centre_hz, parse_channel};
 use decdvbt_engine::{Command, Rx, RxOptions};
 use decdvbt_io::{HackRfGains, HackRfSettings, HackRfSource};
 
@@ -34,7 +34,7 @@ fn main() {
         }
     }
     assert!(!channels.is_empty(), "give some channels, e.g. C23 C26");
-    let first = uhf_centre_hz(channels[0]).expect("channel");
+    let first = centre_hz(channels[0]).expect("channel");
     let src = HackRfSource::open(HackRfSettings {
         center_hz: first.round() as u64,
         sample_rate: 10_000_000,
@@ -50,7 +50,7 @@ fn main() {
     let mut at_first = true;
     for round in 0..rounds {
         for &ch in &channels {
-            let fc = uhf_centre_hz(ch).expect("channel");
+            let fc = centre_hz(ch).expect("channel");
             if !at_first || round > 0 {
                 rx.send(Command::Retune(fc));
             }

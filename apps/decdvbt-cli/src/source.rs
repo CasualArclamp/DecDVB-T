@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use decdvbt_core::SampleFormat;
-use decdvbt_core::channel::{parse_channel, uhf_centre_hz};
+use decdvbt_core::channel::{centre_hz, parse_channel};
 use decdvbt_core::dvbt::Bandwidth;
 use decdvbt_engine::DropProbe;
 use decdvbt_io::{IqFileReader, IqSource, format_from_path, name_hint};
@@ -115,7 +115,7 @@ pub fn open_live(
     gains: Option<Gains>,
     radio: &RadioArgs,
 ) -> Result<(Box<dyn IqSource>, Option<DropProbe>)> {
-    let center = uhf_centre_hz(n).unwrap();
+    let center = centre_hz(n).unwrap();
     open_radio(center, rate_msps, None, gains, radio)
 }
 
@@ -193,7 +193,7 @@ pub fn open(
     radio: &RadioArgs,
 ) -> Result<Box<dyn IqSource>> {
     let centre = parse_channel(source)
-        .and_then(uhf_centre_hz)
+        .and_then(centre_hz)
         .or_else(|| source.eq_ignore_ascii_case("hackrf").then_some(0.0))
         .map(|c| tuning.freq_hz.unwrap_or(c));
     match centre {

@@ -101,7 +101,9 @@ impl Options {
                 }
                 "--channel" => {
                     let t = value("a channel, like C30")?;
-                    let n = parse_channel(&t).ok_or(format!("not a UHF channel (21-69): {t}"))?;
+                    let n = parse_channel(&t)
+                        .filter(|&n| uhf_centre_hz(n).is_some())
+                        .ok_or(format!("not a UHF channel (21-69): {t}"))?;
                     o.centre_hz = uhf_centre_hz(n);
                 }
                 "--sink" => {

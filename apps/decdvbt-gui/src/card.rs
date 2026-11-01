@@ -149,7 +149,7 @@ pub fn show(ui: &mut Ui, c: &Card) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(ch) = c.channel {
                         ui.label(
-                            RichText::new(format!("C{ch}"))
+                            RichText::new(decdvbt_core::channel::channel_label(ch))
                                 .monospace()
                                 .size(20.0)
                                 .color(strong),

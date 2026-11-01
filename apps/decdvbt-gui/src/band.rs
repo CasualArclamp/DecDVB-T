@@ -5,7 +5,7 @@
 //!
 //! Layout follows DecSAT's band view; the channel plan overlay is new here.
 
-use decdvbt_core::channel::{UHF_FIRST, UHF_LAST, uhf_centre_hz, uhf_channel_at};
+use decdvbt_core::channel::{all_channels, bandwidth_hz, centre_hz, channel_at, channel_label};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontId, Mesh, Pos2, Rect, Sense, Shape,
     Stroke, TextureId, pos2,
@@ -130,14 +130,13 @@ pub fn show(ui: &mut egui::Ui, inp: &BandInput) -> Option<Action> {
     // label at the top, and the one being received picked out.
     let selected = inp
         .vfo_hz
-        .and_then(uhf_channel_at)
-        .filter(|&n| uhf_centre_hz(n).is_some_and(|c| (c - inp.vfo_hz.unwrap()).abs() < 400e3));
-    for n in (UHF_FIRST..=UHF_LAST).filter(|_| inp.raster) {
-        let c = uhf_centre_hz(n).unwrap();
-        let (x0, x1) = (
-            x_of(c - OCCUPIED_HALF_HZ).max(plot_l),
-            x_of(c + OCCUPIED_HALF_HZ).min(plot_r),
-        );
+        .and_then(channel_at)
+        .filter(|&n| centre_hz(n).is_some_and(|c| (c - inp.vfo_hz.unwrap()).abs() < 400e3));
+    for n in all_channels().filter(|_| inp.raster) {
+        let c = centre_hz(n).unwrap();
+        // A 7 MHz VHF channel's signal is 7/8 of an 8 MHz one's.
+        let half = OCCUPIED_HALF_HZ * bandwidth_hz(n).unwrap_or(8e6) / 8e6;
+        let (x0, x1) = (x_of(c - half).max(plot_l), x_of(c + half).min(plot_r));
         if x1 <= plot_l || x0 >= plot_r || x1 - x0 < 4.0 {
             continue;
         }
@@ -162,7 +161,7 @@ pub fn show(ui: &mut egui::Ui, inp: &BandInput) -> Option<Action> {
             painter.text(
                 pos2(cx, spec.top() + 2.0),
                 Align2::CENTER_TOP,
-                format!("C{n}"),
+                channel_label(n),
                 font.clone(),
                 if is_sel { AMBER } else { dim },
             );
@@ -255,10 +254,10 @@ pub fn show(ui: &mut egui::Ui, inp: &BandInput) -> Option<Action> {
         );
         let bin = (((hz - lo_hz) / inp.span_hz) * n as f64) as usize;
         let level = inp.spectrum_db.get(bin).map(|d| format!("  {d:.1} dBFS"));
-        let chan = uhf_channel_at(hz)
+        let chan = channel_at(hz)
             .map(|c| {
-                let off = hz - uhf_centre_hz(c).unwrap();
-                format!("  C{c} {:+.0} kHz", off / 1e3)
+                let off = hz - centre_hz(c).unwrap();
+                format!("  {} {:+.0} kHz", channel_label(c), off / 1e3)
             })
             .unwrap_or_default();
         painter.text(
@@ -268,11 +267,11 @@ pub fn show(ui: &mut egui::Ui, inp: &BandInput) -> Option<Action> {
             FontId::monospace(12.0),
             Color32::WHITE,
         );
-        if uhf_channel_at(hz).is_some() {
+        if channel_at(hz).is_some() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         if resp.clicked()
-            && let Some(c) = uhf_channel_at(hz)
+            && let Some(c) = channel_at(hz)
         {
             action = Some(Action::Tune(c));
         }
