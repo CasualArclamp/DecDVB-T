@@ -77,6 +77,61 @@ impl SdrSettings {
     }
 }
 
+/// The Airspy's gain in the top bar: one slider (libairspy's preset step,
+/// 0–21) and beside it the kind, linear or sensitive. The three stages are
+/// in the SDR window ([`airspy_gain_row`]); set by hand there, the slider
+/// shows "custom" until it is moved. True if the gains changed.
+pub fn airspy_gain_bar(ui: &mut Ui, air: &mut AirGains, preset: &mut Option<Preset>) -> bool {
+    let before = *air;
+    let mut p = preset.unwrap_or(Preset::DEFAULT);
+    let mut moved = false;
+    ui.label("gain");
+    let r = ui
+        .add(
+            egui::Slider::new(&mut p.step, 0..=21)
+                .show_value(true)
+                .clamping(egui::SliderClamping::Always),
+        )
+        .on_hover_text(format!(
+            "libairspy's preset step, 0 (least gain) to 21 (most): LNA {} mixer {} VGA {}{}",
+            air.lna,
+            air.mixer,
+            air.vga,
+            if preset.is_none() {
+                " (set by hand in the SDR window)"
+            } else {
+                ""
+            }
+        ));
+    moved |= r.changed();
+    for (lin, name, tip) in [
+        (
+            true,
+            "Linear",
+            "linearity: less gain early, for strong signals",
+        ),
+        (
+            false,
+            "Sensitive",
+            "sensitivity: more LNA gain, for weak signals",
+        ),
+    ] {
+        let on = preset.is_some() && p.linearity == lin;
+        if ui.selectable_label(on, name).on_hover_text(tip).clicked() {
+            p.linearity = lin;
+            moved = true;
+        }
+    }
+    if preset.is_none() {
+        ui.label(RichText::new("custom").weak());
+    }
+    if moved {
+        *preset = Some(p);
+        *air = p.gains();
+    }
+    *air != before
+}
+
 /// The Airspy's gain controls: the libairspy preset (kind and step) and the
 /// three stages it sets, which can then be changed by hand. True if a stage
 /// changed.

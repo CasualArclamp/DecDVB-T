@@ -2189,7 +2189,7 @@ impl App {
 
                 ui.separator();
                 if self.kind == SourceKind::Airspy {
-                    if sdr::airspy_gain_row(ui, &mut self.air, &mut self.air_preset) {
+                    if sdr::airspy_gain_bar(ui, &mut self.air, &mut self.air_preset) {
                         self.change_gains();
                     }
                 } else {
