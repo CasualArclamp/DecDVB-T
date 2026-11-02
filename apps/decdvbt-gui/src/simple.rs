@@ -9,7 +9,7 @@
 //! Two looks: Native (the expert window's dark panels and amber) and Teletext
 //! (Ceefax colours, a monospaced face, Fastext). The mode and the look are
 //! remembered; the channel list a scan finds is kept in
-//! `%APPDATA%\DecDVB-T\channels.txt`.
+//! `%APPDATA%\DecDVB-T\channels.txt`. Starting a scan deletes the old list.
 //!
 //! Keys (the Red Button application, when it shows, has the arrows and OK):
 //! TV: ▲▼ or PgUp/PgDn change channel, digits type a channel number (taken
@@ -634,6 +634,10 @@ impl App {
         }
         self.tv.stop();
         self.tap = None;
+        // A rescan starts from nothing: the old list is gone at once, and a
+        // scan stopped part-way keeps only what it found.
+        self.simple.found.clear();
+        save_list(&[]);
         self.simple.scan = Some(ChanScan {
             phase: Phase::Sweep,
             back: self.channel,
@@ -653,6 +657,8 @@ impl App {
         if self.band_scan.running() {
             self.toggle_band_scan();
         }
+        save_list(&s.found);
+        self.simple.found = s.found;
         self.simple.log = s.log;
         self.simple.log.push("stopped".into());
         self.tune_channel(s.back);
@@ -758,10 +764,8 @@ impl App {
         let n: usize = s.found.iter().map(|m| m.services.len()).sum();
         s.log
             .push(format!("done: {} multiplexes, {n} services", s.found.len()));
-        if !s.found.is_empty() {
-            save_list(&s.found);
-            self.simple.found = s.found;
-        }
+        save_list(&s.found);
+        self.simple.found = s.found;
         self.simple.log = s.log;
         let back = self.simple.found.first().map_or(s.back, |m| m.ch);
         self.tune_channel(back);
