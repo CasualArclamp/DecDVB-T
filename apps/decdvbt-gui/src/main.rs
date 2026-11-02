@@ -2464,6 +2464,17 @@ impl App {
     }
 
     fn services_panel(&mut self, ui: &mut egui::Ui) {
+        // The whole panel scrolls: in a short window the card alone can fill
+        // it, and the list under it would otherwise be cut off (issue #15).
+        // The list keeps its own scroll area inside this one; egui gives the
+        // wheel to the innermost area under the pointer that can still move.
+        egui::ScrollArea::vertical()
+            .id_salt("services_panel_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.services_panel_inner(ui));
+    }
+
+    fn services_panel_inner(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         let card = self.shown_card();
         card::show(ui, &card);
@@ -2577,6 +2588,15 @@ impl eframe::App for App {
                 }
             });
         egui::Panel::bottom("receiver").show(ui, |ui| self.status_panel(ui));
+        // egui gives each panel its edge of whatever space the panels before it
+        // left. The services panel comes before the detail panel, so it runs
+        // from the band scan down to the status rows and the detail panel sits
+        // beside it: a short window cannot squeeze the list away (issue #15).
+        egui::Panel::right("services")
+            .resizable(true)
+            .default_size(380.0)
+            .min_size(300.0)
+            .show(ui, |ui| self.services_panel(ui));
         match self.bottom {
             Bottom::Channel => {
                 egui::Panel::bottom("channel")
@@ -2617,11 +2637,6 @@ impl eframe::App for App {
             }
             Bottom::Hidden => {}
         }
-        egui::Panel::right("services")
-            .resizable(true)
-            .default_size(380.0)
-            .min_size(300.0)
-            .show(ui, |ui| self.services_panel(ui));
 
         let mut tune = None;
         egui::CentralPanel::default()
