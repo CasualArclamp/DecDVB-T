@@ -1895,3 +1895,45 @@ monospaced, Fastext).
 - Checked: a 64-QAM 2/3 8k 7 MHz signal modulated on E7 decodes with `auto` (0 RS errors)
   and in the GUI (E7, 7 MHz, MER 24 dB); C42 live (Airspy) still decodes at 8 MHz. Not
   checked on air: the aerial here is filtered to UHF.
+
+## Passive radar (2026-11-05)
+
+A **radar** panel (`--bottom radar`): the range–Doppler map of what reflects the
+multiplex's signal, Doppler across, bistatic range up, dB over the noise floor, as FM
+and DAB passive radars draw it. Ported from DecDAB's (same author, same day). One
+receiver: the reference is the signal itself, decided.
+
+- `decdvbt_rx::radar::Profiler`, fed by the DVB-T receiver every symbol while on
+  (`Receiver::set_radar`, `AutoReceiver::set_radar`): each carrier (after the
+  equaliser's common phase and timing slope are taken out) over what was sent on it
+  (the pilots' known values, the TPS sign, each data cell's nearest point decided on
+  the equaliser's own estimate, so a wrong decision stays in its cell), Hann over
+  the carriers, delays summed in fours (131 m bins in 8 MHz) by folding the spectrum
+  onto a quarter-size inverse FFT. Carriers the notch flags and ±12 about the radio's
+  0 Hz are left out.
+- `RadarHistory` / `range_doppler`: ~1 s of profiles (a power of two of symbols),
+  turned and scaled by the direct path, each bin's mean (in strong bins, its mean per
+  symbol of the pilots' 4-symbol cycle) taken out, an FFT per range bin: ±541 Hz in
+  8K 1/32. The floor is each Doppler column's median over range where that is
+  higher, so whatever is the same at every range (a weak tone, DC) is flat.
+- Engine: `Command::Radar(Some(RadarAsk { cpi_s, max_km }))`, maps in
+  `DecoderUpdate::radar`, their cost in the `radar` stage.
+
+**Faults found on the way:** with the carriers taken as read, the timing loop's
+symbol-to-symbol wobble put lines 55 dB over the floor at every Doppler beside the
+direct path (fixed by taking them after the equaliser's slope fit); the HackRF's DC
+skirt drew a line at one Doppler up the whole map (±12 carriers left out); a weak tone
+the notch does not flag drew another (the per-Doppler floor).
+
+**Verified:** `the_radar_finds_a_moving_echo_at_its_range_and_doppler` (modulator →
+receiver → map: a −30 dB echo at 20 µs, +150 Hz, under a carrier and clock offset, is
+found at 6.0 km and +150 Hz). On captures: C26 and the 120 s C23, floor −74…−79 dB
+under the direct path, clutter ridge 0.1–0.8 dB over the floor; on C23 a target
+passing close by at about 2.5 km, its Doppler sweeping +90 → 0 → −68 Hz over 36 s,
+up to 38 dB over the floor. **CPU** (C23, 8K): the profiles 37 µs a symbol, 4 % of a
+core (`--example radar_bench`, from 64 µs: a branch-free AVX2 decision pass, the
+quarter-size transform); the maps 4 % at 100 km. Nothing while the panel is closed.
+
+**Not done:** DVB-T2 (its rotated constellations cannot be decided cell by cell: a
+reference would need the pilots alone or the decoded bits re-modulated); hierarchical
+modes. **Not verified live.**

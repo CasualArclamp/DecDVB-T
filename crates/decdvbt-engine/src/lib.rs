@@ -23,7 +23,8 @@ pub use frontend::{FrontEndReading, FrontEndSettings};
 pub use hub::{CarouselLink, CarouselState, Outputs, TsHub, TsView};
 pub use meter::{CpuGauge, Stage, StageLoad, StageMeter, process_cpu_seconds};
 pub use rx::{
-    Command, DecoderUpdate, DropProbe, Recording, Row, Rx, RxOptions, SounderUpdate, Stats,
+    Command, DecoderUpdate, DropProbe, RadarAsk, Recording, Row, Rx, RxOptions, SounderUpdate,
+    Stats,
 };
 pub use snr::{signal_block, spectral_cn_db};
 pub use spectrum::{RowBuilder, Spectrum};

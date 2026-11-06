@@ -21,6 +21,7 @@ use decdvbt_io::{IqFileWriter, IqSource};
 
 use decdvbt_rx::auto::{AutoReceiver, Standard};
 use decdvbt_rx::delay_doppler::{DelayDoppler, FreqDoppler};
+use decdvbt_rx::radar::{RadarHistory, RangeDoppler};
 use decdvbt_rx::receiver::ReceiverStatus;
 use decdvbt_rx::scope::{Measurements, Scopes};
 use decdvbt_rx::sounder::{Sounder, SounderConfig, Sounding, Status as SounderStatus};
@@ -122,10 +123,24 @@ pub enum Command {
     FrontEnd(FrontEndSettings),
     /// Start recording to this file (cs8), or stop with `None`.
     Record(Option<PathBuf>),
+    /// Passive radar while asked for: range–Doppler maps from a DVB-T lock's
+    /// symbols, over this coherent interval and out to this range; `None`
+    /// stops it (it costs a transform a symbol and the maps, nothing else).
+    Radar(Option<RadarAsk>),
     /// The channel's width (8 MHz until told): nothing in the signal says it,
     /// and it sets the signal's sample rate. The receiver and the sounder start
     /// again for it; 1 MHz looks for DVB-T only, 1.7 MHz for DVB-T2 only.
     Bandwidth(Bandwidth),
+}
+
+/// What the radar is asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadarAsk {
+    /// The coherent interval, seconds (made the nearest power of two of
+    /// symbols).
+    pub cpi_s: f64,
+    /// How far out the maps go, km of bistatic range.
+    pub max_km: f64,
 }
 
 /// What the sounder has made, waiting for the GUI.
@@ -166,6 +181,7 @@ struct DecoderOut {
     measurements: Option<Arc<Measurements>>,
     /// Heat rows not yet taken (the oldest go past [`MAX_HEAT`]).
     heat: Vec<Arc<Measurements>>,
+    radar: Option<Arc<RangeDoppler>>,
 }
 
 /// Heat rows kept for a GUI that is slow to collect them.
@@ -232,6 +248,8 @@ pub struct DecoderUpdate {
     pub measurements: Option<Arc<Measurements>>,
     /// Rows of the channel made since the last call, oldest first.
     pub heat: Vec<Arc<Measurements>>,
+    /// The passive radar's newest map, if a new one has been made.
+    pub radar: Option<Arc<RangeDoppler>>,
 }
 
 struct Shared {
@@ -371,6 +389,7 @@ impl Rx {
             scopes: o.scopes.take(),
             measurements: o.measurements.take(),
             heat: std::mem::take(&mut o.heat),
+            radar: o.radar.take(),
         }
     }
 
@@ -453,6 +472,11 @@ fn run(
     // The display's scopes and measurements, and when each was last made.
     let (mut scopes_on, mut measure_on) = (false, false);
     let mut heat_rate: Option<f64> = None;
+    // The radar: what it is asked for, its profiles of the last interval,
+    // and the profiles just taken from the receiver.
+    let mut radar_ask: Option<RadarAsk> = None;
+    let mut radar: Option<RadarHistory> = None;
+    let mut radar_rows: Vec<Vec<Iq>> = Vec::new();
     let (mut scopes_at, mut measure_at) = (Instant::now(), Instant::now());
     let mut map_at = Instant::now();
     let started = Instant::now();
@@ -470,17 +494,23 @@ fn run(
         }
         Sounder::new(c)
     };
-    let new_decoder =
-        |vfo_hz: f64, centre: f64, rate: f64, heat: Option<f64>, sound: bool, bw: Bandwidth| {
-            let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
-            let mut d = AutoReceiver::with_bandwidth(rate, offset, bw);
-            // A T2 lock's sounder is the receiver's own (DVB-T's cannot read it).
-            d.set_sounding(sound);
-            // A file is held to real time here too.
-            d.set_realtime(true);
-            d.set_heat(heat.unwrap_or(0.0));
-            d
-        };
+    let new_decoder = |vfo_hz: f64,
+                       centre: f64,
+                       rate: f64,
+                       heat: Option<f64>,
+                       sound: bool,
+                       bw: Bandwidth,
+                       radar: bool| {
+        let offset = if centre > 0.0 { vfo_hz - centre } else { 0.0 };
+        let mut d = AutoReceiver::with_bandwidth(rate, offset, bw);
+        d.set_radar(radar);
+        // A T2 lock's sounder is the receiver's own (DVB-T's cannot read it).
+        d.set_sounding(sound);
+        // A file is held to real time here too.
+        d.set_realtime(true);
+        d.set_heat(heat.unwrap_or(0.0));
+        d
+    };
 
     while !sh.stop.load(Ordering::Relaxed) {
         loop {
@@ -502,12 +532,31 @@ fn run(
                             heat_rate,
                             sounder.is_some(),
                             bandwidth,
+                            radar_ask.is_some(),
                         );
                         (d, v)
                     });
                     *sh.decoder.lock().unwrap() = DecoderOut::default();
                     ts_scratch.clear();
                     feeder.reset();
+                }
+                Ok(Command::Radar(ask)) => {
+                    radar_ask = ask;
+                    if ask.is_none() {
+                        radar = None;
+                    }
+                    if let (Some(h), Some(a)) = (&mut radar, ask) {
+                        // A new interval starts the history afresh.
+                        let cpi = RadarHistory::cpi_for(a.cpi_s, h.geometry().slot_s);
+                        if cpi != h.cpi() {
+                            *h = RadarHistory::new(cpi, h.geometry());
+                        }
+                        h.set_max_km(a.max_km);
+                    }
+                    if let Some((d, _)) = &mut decoder {
+                        d.set_radar(ask.is_some());
+                    }
+                    sh.decoder.lock().unwrap().radar = None;
                 }
                 Ok(Command::Scopes(on)) => scopes_on = on,
                 Ok(Command::Measure(on)) => measure_on = on,
@@ -539,6 +588,7 @@ fn run(
                                 heat_rate,
                                 sounder.is_some(),
                                 bandwidth,
+                                radar_ask.is_some(),
                             );
                             ts_scratch.clear();
                             feeder.reset();
@@ -561,6 +611,7 @@ fn run(
                             heat_rate,
                             sounder.is_some(),
                             bandwidth,
+                            radar_ask.is_some(),
                         );
                         *sh.decoder.lock().unwrap() = DecoderOut::default();
                         ts_scratch.clear();
@@ -689,6 +740,25 @@ fn run(
                 d.push(&block, at);
                 d.take_ts(&mut ts_scratch);
             });
+            // The radar's profiles into its history; a map when one is due.
+            if let Some(ask) = radar_ask
+                && let Some((geo, gap)) = d.take_radar(&mut radar_rows)
+            {
+                let h = radar.get_or_insert_with(|| {
+                    RadarHistory::new(RadarHistory::cpi_for(ask.cpi_s, geo.slot_s), geo)
+                });
+                if h.geometry() != geo {
+                    *h = RadarHistory::new(RadarHistory::cpi_for(ask.cpi_s, geo.slot_s), geo);
+                } else if gap {
+                    h.clear();
+                }
+                h.set_max_km(ask.max_km);
+                if h.push_rows(&mut radar_rows)
+                    && let Some(m) = meter.time(Stage::Radar, || h.map())
+                {
+                    sh.decoder.lock().unwrap().radar = Some(Arc::new(m));
+                }
+            }
             if decoder_pub.elapsed() >= pace.publish {
                 decoder_pub = Instant::now();
                 let packets = (ts_scratch.len() / 188) as u64;

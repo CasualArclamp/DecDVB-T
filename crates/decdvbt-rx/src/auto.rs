@@ -223,6 +223,24 @@ impl AutoReceiver {
         }
     }
 
+    /// The passive radar's range profiles while on ([`crate::radar`]): from
+    /// a DVB-T lock only (a DVB-T2 signal's rotated constellations cannot be
+    /// decided cell by cell).
+    pub fn set_radar(&mut self, on: bool) {
+        if let Some(t) = &mut self.t {
+            t.set_radar(on);
+        }
+    }
+
+    /// The radar's profiles since the last call (see
+    /// [`Receiver::take_radar`](crate::receiver::Receiver::take_radar)).
+    pub fn take_radar(
+        &mut self,
+        out: &mut Vec<Vec<decdvbt_core::Iq>>,
+    ) -> Option<(crate::radar::RadarGeometry, bool)> {
+        self.t.as_mut()?.take_radar(out)
+    }
+
     /// The T2 lock's channel sounder, while it is on and T2 has the lock.
     pub fn t2_sounder(&mut self) -> Option<&mut crate::t2::sounding::T2Sounder> {
         match self.standard {

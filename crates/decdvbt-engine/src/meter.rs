@@ -109,16 +109,20 @@ pub enum Stage {
     /// The receiver: every symbol read, equalised and decoded to a transport
     /// stream (when decoding is on).
     Decoder,
+    /// The passive radar's range–Doppler maps (its per-symbol profiles are
+    /// in the decoder's stage).
+    Radar,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 6] = [
+    pub const ALL: [Stage; 7] = [
         Stage::Source,
         Stage::Record,
         Stage::FrontEnd,
         Stage::Spectrum,
         Stage::Sounder,
         Stage::Decoder,
+        Stage::Radar,
     ];
 
     pub fn name(self) -> &'static str {
@@ -129,6 +133,7 @@ impl Stage {
             Stage::Spectrum => "spectrum",
             Stage::Sounder => "sounder",
             Stage::Decoder => "decoder",
+            Stage::Radar => "radar",
         }
     }
 }
@@ -137,12 +142,12 @@ impl Stage {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StageLoad {
     /// Percent of the window, per [`Stage::ALL`] entry.
-    pub percent: [f32; 6],
+    pub percent: [f32; 7],
 }
 
 /// Accumulates the time each stage takes and reports it every second.
 pub struct StageMeter {
-    busy: [Duration; 6],
+    busy: [Duration; 7],
     window_start: Instant,
     pub last: StageLoad,
 }
@@ -150,7 +155,7 @@ pub struct StageMeter {
 impl Default for StageMeter {
     fn default() -> Self {
         StageMeter {
-            busy: [Duration::ZERO; 6],
+            busy: [Duration::ZERO; 7],
             window_start: Instant::now(),
             last: StageLoad::default(),
         }
@@ -175,7 +180,7 @@ impl StageMeter {
         for (p, b) in self.last.percent.iter_mut().zip(&self.busy) {
             *p = (100.0 * b.as_secs_f64() / dt.as_secs_f64()) as f32;
         }
-        self.busy = [Duration::ZERO; 6];
+        self.busy = [Duration::ZERO; 7];
         self.window_start = Instant::now();
         true
     }

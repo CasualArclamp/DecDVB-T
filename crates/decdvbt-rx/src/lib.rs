@@ -22,6 +22,7 @@ pub mod lock;
 pub mod mobile;
 pub mod notch;
 pub mod outer;
+pub mod radar;
 pub mod receiver;
 pub mod scope;
 pub mod sounder;

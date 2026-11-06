@@ -34,6 +34,7 @@ use crate::interp::Interpolator;
 use crate::lock::{ACQ_NATIVE, Failure, lock_on};
 use crate::notch::{CarrierWatch, NotchStat};
 use crate::outer::{OuterDecoder, OuterStats};
+use crate::radar::{Profiler, RadarGeometry};
 use crate::scope::{self, MeasureState, Measurements, Scopes};
 use crate::symbol::{PAD, SymbolReader};
 use crate::tone::{ToneCanceller, ToneStat};
@@ -42,6 +43,9 @@ use crate::window::Window;
 
 /// The wait between attempts to acquire, seconds.
 const RETRY_S: f64 = 0.2;
+/// Carriers either side of the radio's 0 Hz left out of the radar's
+/// profiles: the DC offset's skirt (a HackRF's spans several kilohertz).
+const DC_GUARD: i64 = 12;
 /// Symbols with no coherence in a row that end the lock.
 const LOST_AFTER: u32 = 24;
 const MIN_COHERENCE: f32 = 0.2;
@@ -159,6 +163,8 @@ pub struct Profile {
     pub viterbi: Duration,
     /// Byte sync, byte deinterleaver, Reed–Solomon, descrambler.
     pub outer: Duration,
+    /// The passive radar's range profiles (while asked for).
+    pub radar: Duration,
 }
 
 /// What the receiver knows, for the display and the logs.
@@ -337,6 +343,12 @@ pub struct Receiver {
     /// its time filter off or on instead of leaving them to the signal.
     dev_denoise: Option<bool>,
     dev_mobile: Option<bool>,
+    /// Passive radar: on or off, the range profiles' maker (made for the
+    /// lock's shape at its first profile), and each symbol's carriers
+    /// (before the equaliser divides them).
+    radar_on: bool,
+    radar: Option<Profiler>,
+    radar_raw: Vec<Iq>,
 }
 
 impl Receiver {
@@ -363,7 +375,31 @@ impl Receiver {
             heat: Vec::new(),
             dev_denoise: std::env::var("DECDVBT_DENOISE").ok().map(|v| v == "1"),
             dev_mobile: std::env::var("DECDVBT_MOBILE").ok().map(|v| v == "1"),
+            radar_on: false,
+            radar: None,
+            radar_raw: Vec::new(),
         }
+    }
+
+    /// Make a range profile of every symbol while on, for the passive radar
+    /// ([`crate::radar`]): a copy of the carriers, a decision per cell and an
+    /// inverse FFT a symbol. Made once the TPS has the frame (the data cells
+    /// are decided on its modulation), not for hierarchical modes.
+    pub fn set_radar(&mut self, on: bool) {
+        self.radar_on = on;
+        if !on {
+            self.radar = None;
+            self.radar_raw = Vec::new();
+        }
+    }
+
+    /// The radar's profiles since the last call, appended to `out`, with
+    /// their shape and whether the series broke since; `None` while off or
+    /// before the first profile.
+    pub fn take_radar(&mut self, out: &mut Vec<Vec<Iq>>) -> Option<(RadarGeometry, bool)> {
+        let p = self.radar.as_mut().filter(|_| self.radar_on)?;
+        let gap = p.take(out);
+        Some((p.geometry(), gap))
     }
 
     pub fn status(&self) -> &ReceiverStatus {
@@ -479,6 +515,9 @@ impl Receiver {
 
     /// Back to searching, a while on.
     fn drop_lock(&mut self) {
+        if let Some(p) = &mut self.radar {
+            p.mark_gap();
+        }
         self.win.cancel();
         self.track = None;
         self.status.tracking = false;
@@ -627,6 +666,37 @@ impl Receiver {
             }
         }
         t.eq.process(&mut carriers, t.phase);
+        if self.radar_on {
+            // As read, less the symbol's common phase and timing slope
+            // against the continual pilots' reference (the equaliser takes
+            // them out in place): the timing loop's symbol-to-symbol wobble,
+            // left in, would move every path a little each symbol and
+            // modulate the bins beside the strong ones at all Dopplers.
+            self.radar_raw.clear();
+            self.radar_raw.extend_from_slice(&carriers);
+            // A tone's carriers left out: what is on them is not the signal,
+            // and a steady tone would draw a line at its Doppler across
+            // every range.
+            for &k in t.watch.flagged() {
+                if let Some(c) = self.radar_raw.get_mut(k as usize) {
+                    *c = Iq::new(0.0, 0.0);
+                }
+            }
+            // So are the carriers about the radio's 0 Hz: its DC offset's
+            // skirt is a tone too, fixed at the radio's frequency.
+            let n = t.reader.fft.n() as f64;
+            let kmid = (self.radar_raw.len() / 2) as f64;
+            let k_dc = kmid - (self.cfg.vfo_offset_hz + t.reader.f_total) * n / self.fs_native;
+            let k_dc = k_dc.round() as i64;
+            for k in k_dc - DC_GUARD..=k_dc + DC_GUARD {
+                if let Some(c) = usize::try_from(k)
+                    .ok()
+                    .and_then(|k| self.radar_raw.get_mut(k))
+                {
+                    *c = Iq::new(0.0, 0.0);
+                }
+            }
+        }
         t.watch.add_to_noise(&mut t.eq.noise);
         t.reader.correct(f64::from(t.eq.timing_error()));
         let t2 = Instant::now();
@@ -758,6 +828,42 @@ impl Receiver {
                 t.chain = None;
             }
             _ => {}
+        }
+
+        // The radar's profile of this symbol, once the frame (and so the
+        // modulation the data cells are decided on) is known.
+        if self.radar_on
+            && let (Some(p), true) = (pos, synced)
+            && let Some(info) = self.status.tps
+            && !self.status.hierarchical
+            && t.eq.ready()
+        {
+            let fft = t.reader.fft;
+            let (n, k) = (fft.n(), fft.active_carriers());
+            let slot_s = (n + n / t.guard.divisor()) as f64 / self.fs_native;
+            let fs = self.fs_native;
+            let prof = self
+                .radar
+                .get_or_insert_with(|| Profiler::new(n, k, slot_s, fs));
+            if !prof.fits(n, k, slot_s) {
+                *prof = Profiler::new(n, k, slot_s, fs);
+            }
+            if self.plan.as_ref().is_none_or(|pl| pl.fft != fft) {
+                self.plan = Some(SymbolPlan::new(fft));
+            }
+            if let Some(plan) = &self.plan {
+                let u0 = Instant::now();
+                prof.push(
+                    t.symbols,
+                    &self.radar_raw,
+                    &t.eq.z,
+                    plan,
+                    p.l as usize,
+                    &t.inv,
+                    info.modulation,
+                );
+                self.status.profile.radar += u0.elapsed();
+            }
         }
 
         self.status.tps_synced = synced;
@@ -1222,5 +1328,70 @@ mod tests {
         let (ts, rx) = run("qpsk-1/2-2k-1/8", ch, 1.5);
         let (n, _) = data_packets(&ts);
         assert!(n > 100, "only {n} data packets from {:?}", rx.status());
+    }
+    #[test]
+    fn the_radar_finds_a_moving_echo_at_its_range_and_doppler() {
+        use crate::radar::{RadarHistory, echoes};
+        // A path 20 µs late (6.0 km of bistatic range), 30 dB down,
+        // +150 Hz: an aircraft's echo, under a carrier and clock offset.
+        let ch = Channel {
+            paths: vec![
+                Path::echo(0.0, 0.0),
+                Path {
+                    doppler_hz: 150.0,
+                    ..Path::echo(20.0, -30.0)
+                },
+            ],
+            cfo_hz: 41_000.0,
+            sco_ppm: 5.0,
+            cn_db: Some(30.0),
+            ..Default::default()
+        };
+        let fs = 10e6;
+        let opts = SimOptions {
+            mode: Mode::parse("64qam-2/3-8k-1/32").unwrap(),
+            cell_id: None,
+            ts_file: None,
+            seconds: 1.0,
+            out_rate_hz: Some(fs),
+            level_dbfs: -20.0,
+            channel: ch,
+        };
+        let mut x = Vec::new();
+        generate(&opts, |b| {
+            x.extend_from_slice(b);
+            Ok(())
+        })
+        .unwrap();
+        let mut rx = Receiver::new(ReceiverConfig::new(fs, 0.0));
+        rx.set_radar(true);
+        let (mut ts, mut rows, mut map) = (Vec::new(), Vec::new(), None);
+        let mut hist: Option<RadarHistory> = None;
+        let mut at = 0;
+        while at < x.len() {
+            let n = 100_003.min(x.len() - at);
+            rx.push(&x[at..at + n], at as u64);
+            rx.take_ts(&mut ts);
+            at += n;
+            if let Some((geo, gap)) = rx.take_radar(&mut rows) {
+                let h = hist.get_or_insert_with(|| RadarHistory::new(512, geo));
+                if gap {
+                    h.clear();
+                }
+                h.set_max_km(30.0);
+                if h.push_rows(&mut rows) {
+                    map = h.map();
+                }
+            }
+        }
+        let m = map.expect("a map from half a second of profiles");
+        assert!(m.floor_db < -50.0, "floor {} dB", m.floor_db);
+        let e = echoes(&m, 15.0, 30.0, 20.0, 3);
+        assert!(!e.is_empty(), "no echo");
+        let km = 299_792.458 * 20e-6;
+        assert!(
+            (e[0].range_km - km).abs() < 0.3 && (e[0].doppler_hz - 150.0).abs() < 3.0,
+            "{e:?}"
+        );
     }
 }

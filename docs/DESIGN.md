@@ -211,3 +211,24 @@ Added end to end (modulator, transmitter, receiver, both apps). The decisions:
   T2_delivery_system_descriptor (bandwidth 0101, 1.712 MHz). Below 1.5
   Mbit/s the TX sends CIF (352x288, 64k audio) and its budget allows the
   tables' fixed 39 kbit/s.
+
+## 9. Passive radar (2026-11-05)
+
+- **Reference:** the received DVB-T signal, decided (OFDM reciprocal filter); one
+  receiver, so no direction (interferometry) and no separate surveillance aerial.
+  DVB-T2 is out: its rotated constellations' cells cannot be decided alone.
+- **Range:** the inverse FFT over the active carriers, delays summed in fours: 131 m
+  bins in 8 MHz, 32 before the delay window's start and 1536 after (201 km; less in
+  2K, whose delays repeat after 224 µs). Range 0 is the strongest path.
+- **Doppler:** an FFT over 0.5, 1 or 2 s of symbols (the nearest power of two):
+  ±541 Hz in 8K 1/32 at UHF covers most aircraft (an airliner's bistatic Doppler can
+  exceed it near the baseline; it then aliases).
+- **Clutter and lines:** rows turned and scaled by the direct path; each bin's mean
+  taken out (per pilot-cycle symbol in strong bins); the floor per Doppler column.
+- **Cost** only while the panel shows: the profiles in the decoder's stage (~4 % of
+  a core in 8K), the maps in their own (`radar`, ~4 % at 100 km; they are made only
+  out to the range shown).
+- **The panel:** Doppler ±50/±100/±200/all, range 25–150 km, CPI, colour 0–15 or
+  0–25 dB over the floor, trails (points 12 dB over the floor, fading over 10 or
+  60 s); echoes 16 dB over the floor beyond ±15 Hz and 0.4 km, lettered on the map
+  and listed with range, Doppler and bistatic speed.

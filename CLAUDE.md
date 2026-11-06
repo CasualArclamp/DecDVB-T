@@ -28,6 +28,8 @@ cargo run --release -p decdvbt-cli --example airspy_live -- 618 60 [packed]   # 
 cargo run --release -p decdvbt-cli --example airspy_replay -- dump.raw unpacked   # replay a raw dump (or an IQ file) through the receiver; env TRACE=from,to, OUT=x.cf32
 cargo run --release -p decdvbt-rx --example diag -- x.cs8   # per-symbol equaliser diagnostics (see its header)
 cargo run --release -p decdvbt-rx --example doppler -- x.cs8 9 1.5   # from 9 s for 1.5 s: Doppler spectrum of the pilots, the Rician fit, MER (env MOBILE=0|1 DENOISE=0|1, FIT, FINE)
+cargo run --release -p decdvbt-gui --example radar_probe -- captures/c23_490.000MHz_10Msps_amp120.cs8 out/radar 100   # passive radar from a DVB-T capture: each range–Doppler map as a PNG, echoes, ridge, CPU ([seconds] after the km)
+cargo run --release -p decdvbt-rx --example radar_bench          # the radar's per-symbol profile alone: µs a symbol, % of a core
 cargo run --release -p decdvbt-cli -- modulate --profile ra6 --fd 35 --k-db 6 --cn 26 x.cs8   # a moving vehicle: Rician fading (--k-db) at 35 Hz; decode with env DECDVBT_MOBILE / DECDVBT_DENOISE =0|1 to force the estimator
 cargo run --release -p decdvbt-cli -- decode C30 --amp --lna 32 --vga 8 -o out/c30.ts   # live DVB-T2 (or T) from the HackRF; --progress prints a line a second
 cargo run --release -p decdvbt-cli -- modulate --mode qpsk-1/2-2k-1/8-1mhz --freq 433.25 --cn 20 captures/n1_433.250MHz_2Msps.cs8   # 1 MHz DVB-T (every 8 MHz clock / 8) at 2 MS/s
@@ -50,7 +52,7 @@ cargo run --release -p decdvbt-tx-app -- --selftest              # the safety lo
 cargo run -p decdvbt-tx-app --example make_icon                  # redraws apps/decdvbt-tx/assets/icon.ico and icon-256.png
 cargo run --release -p decdvbt-tx --example txfile -- clip.mp4 out.cs8 --null --paced --seconds 30   # the library alone: per-second status, totals, --save-ts, --stages
 cargo run --release -p decdvbt-tx --example txfile -- --stages --t2 8k-1/16-pp4-16qam-3/4-rot-1.7mhz   # per-stage CPU of a narrow mode (or --mode ...-1mhz)
-# the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|maps|history|none,
+# the GUI's extras (screenshots, demos, tests): --bottom scopes|channel|maps|history|radar|none,
 # --window ts|epg|sdr, --service ID (select), --play ID, --http 127.0.0.1:8001,
 # --simple native|teletext, --screen tv|guide|scan (simple mode; env DECDVBT_SIMPLE_SCAN=1 runs its channel scan;
 # env DECDVBT_SIMPLE_KEYS=wait,g,down,ok,2,2,i,teletext,expert presses remote keys (digits too), one a second once something plays),

@@ -25,6 +25,7 @@ mod heatmaps;
 mod ic_stream;
 mod player;
 mod prefs;
+mod radar_view;
 mod redbutton;
 mod remember;
 mod scopes;
@@ -170,6 +171,8 @@ enum Bottom {
     /// carrier and Doppler, and the data cells' error as a cloud and per
     /// constellation point.
     Maps,
+    /// Passive radar: the range–Doppler map of what reflects the signal.
+    Radar,
     Hidden,
 }
 
@@ -180,6 +183,7 @@ impl Bottom {
             Bottom::Channel => "channel",
             Bottom::Maps => "maps",
             Bottom::Heat => "history",
+            Bottom::Radar => "radar",
             Bottom::Hidden => "none",
         }
     }
@@ -190,6 +194,7 @@ impl Bottom {
             "channel" => Bottom::Channel,
             "maps" => Bottom::Maps,
             "history" | "heat" => Bottom::Heat,
+            "radar" => Bottom::Radar,
             "none" => Bottom::Hidden,
             _ => return None,
         })
@@ -259,9 +264,9 @@ impl Options {
                     o.bottom_given = true;
                 }
                 "--bottom" => {
-                    let v = value("scopes, channel, maps, history or none")?;
+                    let v = value("scopes, channel, maps, history, radar or none")?;
                     o.bottom = Bottom::parse(&v).ok_or(format!(
-                        "--bottom: not scopes, channel, maps, history or none: {v}"
+                        "--bottom: not scopes, channel, maps, history, radar or none: {v}"
                     ))?;
                     o.bottom_given = true;
                 }
@@ -626,6 +631,9 @@ struct App {
     heat: heatmaps::HeatView,
     errors: errormaps::ErrorMaps,
     heat_sent: Option<f64>,
+    radar_view: radar_view::RadarView,
+    /// What the radar was last asked for (`None`: off).
+    radar_sent: Option<decdvbt_engine::RadarAsk>,
     /// What is kept from run to run (none for a screenshot), the radio's
     /// channel and frequency as they were when the source last was the
     /// radio, and the window's size.
@@ -794,6 +802,8 @@ impl App {
             heat: heatmaps::HeatView::default(),
             errors: errormaps::ErrorMaps::default(),
             heat_sent: None,
+            radar_view: radar_view::RadarView::default(),
+            radar_sent: None,
             keeper: None,
             radio: (channel, tune_hz),
             window_size: kept.window.unwrap_or((1400, 860)),
@@ -956,6 +966,8 @@ impl App {
                     self.fps_sent,
                     self.heat_sent,
                 ) = (false, None, None, None);
+                self.radar_sent = None;
+                self.radar_view.reset();
                 self.optimiser = None;
                 self.tuned_at = Instant::now();
                 self.centre_checked = false;
@@ -1535,6 +1547,20 @@ impl App {
         }
     }
 
+    /// The radar runs only while its panel shows; a new interval or range
+    /// starts its maps afresh.
+    fn sync_radar(&mut self) {
+        let Some(s) = &self.session else { return };
+        let want = (self.bottom == Bottom::Radar && self.decode).then(|| self.radar_view.ask());
+        if self.radar_sent != want {
+            s.rx.send(Command::Radar(want));
+            if want.is_none_or(|w| self.radar_sent.is_none_or(|o| o.cpi_s != w.cpi_s)) {
+                self.radar_view.reset();
+            }
+            self.radar_sent = want;
+        }
+    }
+
     /// Rows of the channel while the heat maps are shown.
     fn sync_heat(&mut self) {
         let Some(s) = &self.session else { return };
@@ -1714,6 +1740,9 @@ impl App {
             }
             if self.bottom == Bottom::Heat {
                 self.heat.update(u.heat);
+            }
+            if self.bottom == Bottom::Radar {
+                self.radar_view.update(u.radar);
             }
             let now = Instant::now();
             // A T2 stream arrives a frame (217 ms) at a time, so a longer
@@ -2333,6 +2362,8 @@ impl App {
             ui.selectable_value(&mut self.bottom, Bottom::Channel, "channel");
             ui.selectable_value(&mut self.bottom, Bottom::Maps, "maps");
             ui.selectable_value(&mut self.bottom, Bottom::Heat, "history");
+            ui.selectable_value(&mut self.bottom, Bottom::Radar, "radar")
+                .on_hover_text("passive radar: what reflects the multiplex's signal, by range and Doppler (DVB-T)");
             ui.selectable_value(&mut self.bottom, Bottom::Hidden, "none");
             if self.show_channel() {
                 egui::ComboBox::from_id_salt("doppler")
@@ -2540,6 +2571,7 @@ impl eframe::App for App {
         self.sync_sdr();
         self.sync_fps();
         self.sync_heat();
+        self.sync_radar();
         self.poll_stream();
         self.sync_outputs();
         self.auto_centre();
@@ -2634,6 +2666,26 @@ impl eframe::App for App {
                     let rate = t2_rate.unwrap_or(self.heat_sent.unwrap_or(20.0) as f32);
                     self.heat.show(ui, rate);
                 });
+            }
+            Bottom::Radar => {
+                let lock = if !self.decode {
+                    Err("decoding is off")
+                } else if self.standard == Standard::Dvbt2 {
+                    Err(
+                        "DVB-T only: a DVB-T2 signal's rotated constellations cannot be decided cell by cell, so there is no reference to work from",
+                    )
+                } else if !self.dec.decoding {
+                    Err("waiting for a DVB-T lock")
+                } else {
+                    Ok(())
+                };
+                let rf_hz = self.vfo_hz;
+                egui::Panel::bottom("radar")
+                    .resizable(false)
+                    .show(ui, |ui| {
+                        ui.set_min_height(CHANNEL_PANEL_H + 40.0);
+                        self.radar_view.show(ui, lock, rf_hz);
+                    });
             }
             Bottom::Hidden => {}
         }
