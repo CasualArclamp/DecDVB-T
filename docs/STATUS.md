@@ -1954,5 +1954,18 @@ modes. **Not verified live.**
   the top bar; link, 8-bit option and the radio's own description in the SDR
   window). 64/7 MS/s for 6–8 MHz channels, 2.5 MS/s with the 1.75 MHz filter
   for narrow ones.
-- Verified against an in-memory IIOD server and over loopback TCP; not yet
-  on a real Pluto (none here). The error paths with no Pluto were checked.
+- Verified against an in-memory IIOD server and over loopback TCP, then on a
+  real Pluto (Rev.B, AD9364, ADI firmware v0.39, 16-bit), over USB and over
+  its USB network: 0.5 (×8 decimator), 1, 2.5 and 5 MS/s delivered exactly; a
+  broadcast FM carrier stays at 100.0001 MHz across centres and rates; AGC
+  works. At 64/7 MS/s 16-bit the link carries ~7.4 MS/s on USB and ~6.0 on
+  the network, as ADI measures.
+- Found on the hardware: iiod sends no short packet after a write of whole
+  512-byte packets, so a bulk IN request can wait forever for the end of a
+  reply. The control pipe now reads one packet per request, the reader never
+  waits for the last READBUF at shutdown, and a closing pipe is closed on the
+  radio (vendor request 2); before, the next open found the interface still
+  claimed.
+- IIOD reports no overrun, so the reader counts the shortfall of samples
+  against the time gone (`link_lost`, part of `lost()`, the drops the apps
+  show) and logs once when the link cannot carry the rate.

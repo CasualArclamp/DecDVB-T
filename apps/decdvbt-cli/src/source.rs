@@ -231,7 +231,7 @@ fn open_radio(
                 },
             })?;
             let ctl = s.control();
-            Ok((Box::new(s), Some(Box::new(move || ctl.overflows()))))
+            Ok((Box::new(s), Some(Box::new(move || ctl.lost()))))
         }
         #[cfg(not(feature = "pluto"))]
         Radio::Pluto => {
