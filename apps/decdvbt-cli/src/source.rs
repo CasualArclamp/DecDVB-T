@@ -1,7 +1,7 @@
 // made by CasualArclamp
 //! Opening what the commands read: an IQ file (the centre and rate taken from
 //! its name) or, for a UHF channel (or `hackrf` with a frequency), the HackRF
-//! or the Airspy R2 (`--radio`).
+//! the Airspy R2 / HydraSDR or the ADALM-PLUTO / Pluto+ (`--radio`).
 
 use std::path::PathBuf;
 
@@ -51,6 +51,10 @@ pub enum Radio {
     /// Airspy R2 or HydraSDR RFOne (the same protocol; 10 MS/s only).
     #[value(alias = "hydrasdr")]
     Airspy,
+    /// ADALM-PLUTO or Pluto+, over USB or the network (64/7 MS/s for 6-8
+    /// MHz channels, 2.5 MS/s for 1 and 1.7 MHz).
+    #[value(alias = "plutoplus")]
+    Pluto,
 }
 
 /// The radio choice and the Airspy's own settings, shared by the commands
@@ -79,6 +83,30 @@ pub struct RadioArgs {
     /// if the port drops buffers.
     #[arg(long)]
     pub airspy_packed: bool,
+    /// Where the Pluto is: `auto` (USB, else 192.168.2.1), `usb`,
+    /// `ip:ADDRESS` (a Pluto+ on Ethernet).
+    #[arg(long, default_value = "auto", value_name = "URI")]
+    pub pluto_uri: String,
+    /// Pluto receive gain, dB (about -3 to 71), or `agc`.
+    #[arg(long, default_value = "50", value_name = "DB|agc")]
+    pub pluto_gain: String,
+    /// Stream 16-bit IQ even when the firmware (Tezuka) offers 8-bit.
+    #[arg(long)]
+    pub pluto_16bit: bool,
+}
+
+#[cfg(feature = "pluto")]
+impl RadioArgs {
+    fn pluto_gain(&self) -> Result<decdvbt_io::PlutoGain> {
+        use decdvbt_io::PlutoGain;
+        if self.pluto_gain.eq_ignore_ascii_case("agc") {
+            return Ok(PlutoGain::Agc);
+        }
+        let db: f64 = self.pluto_gain.parse().map_err(|_| {
+            anyhow::anyhow!("--pluto-gain takes dB or agc, not {:?}", self.pluto_gain)
+        })?;
+        Ok(PlutoGain::Manual(db))
+    }
 }
 
 #[cfg(feature = "airspy")]
@@ -179,6 +207,37 @@ fn open_radio(
             let _ = (center, rate_msps, narrow, gains);
             anyhow::bail!("built without the airspy feature")
         }
+        #[cfg(feature = "pluto")]
+        Radio::Pluto => {
+            use decdvbt_io::{EightBit, PlutoSettings, PlutoSource};
+            // The OFDM clock of an 8 MHz channel (64/7 MS/s) carries 6-8 MHz
+            // channels with the least load on the link; narrow ones need far
+            // less, and the AD9361's filter then narrows to 1.75 MHz.
+            let (rate, bw) = if narrow {
+                (2.5e6, Some(1.75e6))
+            } else {
+                (64e6 / 7.0, None)
+            };
+            let s = PlutoSource::open(PlutoSettings {
+                uri: radio.pluto_uri.parse().map_err(anyhow::Error::msg)?,
+                center_hz: center,
+                sample_rate: rate,
+                bandwidth: bw,
+                gain: radio.pluto_gain()?,
+                eight_bit: if radio.pluto_16bit {
+                    EightBit::Off
+                } else {
+                    EightBit::Auto
+                },
+            })?;
+            let ctl = s.control();
+            Ok((Box::new(s), Some(Box::new(move || ctl.overflows()))))
+        }
+        #[cfg(not(feature = "pluto"))]
+        Radio::Pluto => {
+            let _ = (center, rate_msps, narrow, gains);
+            anyhow::bail!("built without the pluto feature")
+        }
     }
 }
 
@@ -202,7 +261,7 @@ pub fn open(
         Some(c) => {
             anyhow::ensure!(
                 radio.radio == Radio::Hackrf || !source.eq_ignore_ascii_case("hackrf"),
-                "`hackrf` names the HackRF: give a channel (C26) for --radio airspy"
+                "`hackrf` names the HackRF: give a channel (C26) for --radio airspy or pluto"
             );
             Ok(open_radio(c, 10.0, Some(tuning.bandwidth.narrow()), gains, radio)?.0)
         }

@@ -14,6 +14,8 @@ pub mod airspy;
 pub mod hackrf;
 #[cfg(feature = "hackrf")]
 pub mod hackrf_tx;
+#[cfg(feature = "pluto")]
+pub mod pluto;
 
 pub use file::{IqFileReader, IqFileWriter, NameHint, format_from_path, name_hint};
 pub use wav::{CaptureInfo, WavIq, probe_capture};
@@ -26,6 +28,10 @@ pub use airspy::{
 pub use hackrf::{HackRfControl, HackRfGains, HackRfSettings, HackRfSource};
 #[cfg(feature = "hackrf")]
 pub use hackrf_tx::{HackRfTx, HackRfTxSettings};
+#[cfg(feature = "pluto")]
+pub use pluto::{
+    EightBit, PlutoControl, PlutoGain, PlutoInfo, PlutoSettings, PlutoSource, PlutoUri,
+};
 
 use decdvbt_core::{Iq, Result};
 

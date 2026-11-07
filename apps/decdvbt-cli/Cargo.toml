@@ -13,9 +13,10 @@ name = "decdvbt"
 path = "src/main.rs"
 
 [features]
-default = ["hackrf", "airspy"]
+default = ["hackrf", "airspy", "pluto"]
 hackrf = ["decdvbt-io/hackrf"]
 airspy = ["decdvbt-io/airspy"]
+pluto = ["decdvbt-io/pluto"]
 
 [dependencies]
 decdvbt-core = { path = "../../crates/decdvbt-core" }

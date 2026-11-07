@@ -1,7 +1,7 @@
 # made by CasualArclamp
 [package]
 name = "decdvbt-io"
-description = "DecDVB-T I/O: IQ file replay/record and the HackRF and Airspy R2 front ends"
+description = "DecDVB-T I/O: IQ file replay/record and the HackRF, Airspy R2 / HydraSDR and ADALM-PLUTO front ends"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,6 +17,9 @@ hackrf = ["dep:seify-hackrfone"]
 # Live Airspy R2 front end, in pure Rust over nusb as well (no libairspy, no
 # libusb, no DLLs). The radio must use the WinUSB driver on Windows.
 airspy = ["dep:nusb", "dep:futures-lite"]
+# Live ADALM-PLUTO / Pluto+ front end: its IIOD protocol in pure Rust over USB
+# (nusb, WinUSB) or TCP. No libiio, no DLLs.
+pluto = ["dep:nusb", "dep:futures-lite"]
 
 [dependencies]
 decdvbt-core = { path = "../decdvbt-core" }
