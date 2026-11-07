@@ -13,7 +13,7 @@ use eframe::egui::{
 
 use crate::gain_opt::{Optimiser, Point};
 use crate::prefs;
-use crate::source::{AirGains, Gains, Preset};
+use crate::source::{AirGains, Gains, PlutoUi, Preset};
 
 /// Baseband filter bandwidths the radio has that are worth offering, MHz.
 pub const FILTERS_MHZ: [f32; 14] = [
@@ -132,6 +132,25 @@ pub fn airspy_gain_bar(ui: &mut Ui, air: &mut AirGains, preset: &mut Option<Pres
     *air != before
 }
 
+/// The Pluto's gain: dB, or its AGC (in the top bar with its label, in the
+/// SDR window's grid without). True if it changed.
+pub fn pluto_gain_bar(ui: &mut Ui, p: &mut PlutoUi, label: bool) -> bool {
+    let before = p.clone();
+    if label {
+        ui.label("gain");
+    }
+    ui.add_enabled(
+        !p.agc,
+        egui::Slider::new(&mut p.gain_db, PlutoUi::GAIN_DB)
+            .suffix(" dB")
+            .clamping(egui::SliderClamping::Always),
+    )
+    .on_hover_text("The AD9361's receive gain (manual)");
+    ui.checkbox(&mut p.agc, "AGC")
+        .on_hover_text("The AD9361's slow-attack AGC instead of a set gain");
+    *p != before
+}
+
 /// The Airspy's gain controls: the libairspy preset (kind and step) and the
 /// three stages it sets, which can then be changed by hand. True if a stage
 /// changed.
@@ -197,6 +216,10 @@ pub struct SdrView<'a> {
     pub air_preset: &'a mut Option<Preset>,
     pub air_packed: &'a mut bool,
     pub airspy: bool,
+    /// The Pluto's settings, when it is the radio.
+    pub pluto: Option<&'a mut PlutoUi>,
+    /// What the running radio said about itself.
+    pub radio_info: Option<&'a str>,
     pub live: bool,
     pub front_end: FrontEndReading,
     pub optimiser: Option<&'a Optimiser>,
@@ -209,7 +232,8 @@ pub struct SdrView<'a> {
 #[derive(Default)]
 pub struct SdrAsks {
     pub gains_changed: bool,
-    /// The stream has to be started again (the Airspy's transfer format).
+    /// The stream has to be started again (the Airspy's transfer format,
+    /// the Pluto's link or sample width).
     pub restart: bool,
     pub optimise: bool,
     pub cancel: bool,
@@ -237,6 +261,8 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
         air_preset,
         air_packed,
         airspy,
+        mut pluto,
+        radio_info,
         live,
         front_end,
         optimiser,
@@ -269,7 +295,56 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
             ui.label(RichText::new("The radio's settings apply to a live Airspy.").weak());
         }
     }
-    if !airspy {
+    if let Some(p) = pluto.as_deref_mut() {
+        ui.label(RichText::new("ADALM-PLUTO / Pluto+").strong());
+        egui::Grid::new("sdr_pluto")
+            .num_columns(2)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("link");
+                let r = ui
+                    .add(egui::TextEdit::singleline(&mut p.uri).desired_width(150.0))
+                    .on_hover_text(
+                        "auto: USB if a Pluto is plugged in, else 192.168.2.1 (its USB network)\n\
+                         usb: direct USB (needs ADI's Pluto USB driver, WinUSB)\n\
+                         ip:ADDRESS: the network, e.g. a Pluto+ on Ethernet",
+                    );
+                if r.lost_focus() && live {
+                    asks.restart = true;
+                }
+                ui.end_row();
+                ui.label("gain");
+                ui.horizontal(|ui| {
+                    asks.gains_changed |= pluto_gain_bar(ui, p, false);
+                });
+                ui.end_row();
+                ui.label("samples");
+                if ui
+                    .checkbox(&mut p.eight_bit, "8-bit IQ when the firmware has it")
+                    .on_hover_text(
+                        "F5OEO's Tezuka firmware can send 8-bit IQ, half the load on the link: \
+                         64/7 MS/s then fits a plain Pluto's USB. Other firmware sends 16-bit. \
+                         Restarts the stream.",
+                    )
+                    .changed()
+                    && live
+                {
+                    asks.restart = true;
+                }
+                ui.end_row();
+            });
+        if let Some(i) = radio_info {
+            ui.label(RichText::new(i).small().weak());
+        }
+        ui.label(
+            RichText::new(
+                "Receive only: the transmit LO is powered down. The gain optimiser is for the HackRF and the Airspy.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+    if !airspy && pluto.is_none() {
         ui.add_enabled_ui(live, |ui| {
             ui.label(RichText::new("Gain").strong());
             egui::Grid::new("sdr_gain")
@@ -338,8 +413,9 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
 
     ui.add_space(6.0);
     // The baseband filter and clock trim are the HackRF's.
-    ui.add_enabled_ui(live && !airspy, |ui| {
-        ui.label(RichText::new(if airspy { "Radio (HackRF only)" } else { "Radio" }).strong());
+    let hackrf = !airspy && pluto.is_none();
+    ui.add_enabled_ui(live && hackrf, |ui| {
+        ui.label(RichText::new(if hackrf { "Radio" } else { "Radio (HackRF only)" }).strong());
         egui::Grid::new("sdr_radio").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
             ui.label("baseband filter");
             let label = settings.filter_mhz.map_or("auto".to_string(), |f| format!("{f} MHz"));

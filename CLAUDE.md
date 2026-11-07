@@ -23,6 +23,8 @@ cargo run --release -p decdvbt-mheg --example redbutton -- out/live_c30.ts --sid
 cargo run --release -p decdvbt-mheg --example redbutton -- out/x.ts --sid SID --ic --nv out/nv.bin --seconds 30   # a Freeview internet channel's app over the interaction channel (real servers; prints the fetches and the stream it asks for)
 cargo run --release -p decdvbt-cli -- capture C23 --amp --lna 32 --vga 8 --record x.cs8  # the RF amp must be on for DVB-T
 cargo run --release -p decdvbt-cli -- decode C23 --radio airspy -o out/c23.ts   # Airspy R2 (10 MS/s only; --airspy-preset sensitivity:10|linearity:N, --airspy-lna/-mixer/-vga, --airspy-packed)
+cargo run --release -p decdvbt-cli -- decode C23 --radio pluto --pluto-uri auto --pluto-gain 50 -o out/c23.ts   # ADALM-PLUTO / Pluto+ (usb, ip:ADDRESS; --pluto-gain agc; --pluto-16bit); receive only
+PLUTO_URI=ip:192.168.2.1 cargo test -p decdvbt-io --features pluto live_pluto -- --ignored --nocapture   # Pluto live: link, firmware, 8/16-bit, MS/s delivered
 cargo run --release -p decdvbt-io --features airspy --example airspy_convert_bench   # the Airspy real-to-IQ converter: ns per sample
 cargo run --release -p decdvbt-cli --example airspy_live -- 618 60 [packed]   # Airspy soak: per second, samples, drops/blanked blocks, read gaps, RS losses (env DECDVBT_AIRSPY_RAW=dump.raw keeps the raw USB transfers)
 cargo run --release -p decdvbt-cli --example airspy_replay -- dump.raw unpacked   # replay a raw dump (or an IQ file) through the receiver; env TRACE=from,to, OUT=x.cf32

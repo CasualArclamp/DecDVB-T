@@ -1937,3 +1937,22 @@ quarter-size transform); the maps 4 % at 100 km. Nothing while the panel is clos
 **Not done:** DVB-T2 (its rotated constellations cannot be decided cell by cell: a
 reference would need the pilots alone or the decoded bits re-modulated); hierarchical
 modes. **Not verified live.**
+
+## ADALM-PLUTO / Pluto+ (2026-11-08)
+
+- `decdvbt-io::pluto`: the Pluto's IIOD text protocol (libiio 0.26's, which
+  ADI v0.39 and Tezuka firmware serve; libiio v1's binary protocol is not on
+  any Pluto firmware yet) in pure Rust, over USB (nusb on the FunctionFS
+  "IIO" interface: pipe 0 attributes, pipe 1 samples) or TCP 30431.
+- Tezuka's 8-bit IQ is used when the firmware has it (voltage0 alone, I8/Q8
+  per word): ~13 MS/s over a plain Pluto's USB instead of ~6.8, so 64/7 MS/s
+  DVB-T fits. Two READBUFs in flight; the kernel buffer count set for
+  ~0.25 s; rates under 2.083 MS/s through the FPGA's ×8 decimator.
+- Receive only: the TX LO is powered down at open; the DDS device is never
+  opened (a test checks the command log).
+- CLI `--radio pluto`; GUI source "ADALM-PLUTO / Pluto+" (gain dB or AGC in
+  the top bar; link, 8-bit option and the radio's own description in the SDR
+  window). 64/7 MS/s for 6–8 MHz channels, 2.5 MS/s with the 1.75 MHz filter
+  for narrow ones.
+- Verified against an in-memory IIOD server and over loopback TCP; not yet
+  on a real Pluto (none here). The error paths with no Pluto were checked.

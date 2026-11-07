@@ -115,9 +115,61 @@ impl Preset {
     }
 }
 
+/// The ADALM-PLUTO / Pluto+ as the GUI keeps it: where it is, its gain and
+/// whether 8-bit IQ is used when the firmware (Tezuka) has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlutoUi {
+    /// `auto`, `usb` or `ip:ADDRESS`.
+    pub uri: String,
+    /// Manual gain, dB.
+    pub gain_db: i32,
+    /// The AD9361's slow-attack AGC instead of `gain_db`.
+    pub agc: bool,
+    pub eight_bit: bool,
+}
+
+impl Default for PlutoUi {
+    fn default() -> Self {
+        PlutoUi {
+            uri: "auto".into(),
+            gain_db: 50,
+            agc: false,
+            eight_bit: true,
+        }
+    }
+}
+
+impl PlutoUi {
+    /// The AD9361's gain range (about −3 to 71 dB, less at the band edges).
+    pub const GAIN_DB: std::ops::RangeInclusive<i32> = -3..=71;
+
+    /// The rate the Pluto runs at for a channel: the 8 MHz mode's OFDM clock
+    /// (64/7 MS/s) for 6–8 MHz channels, the least the link must carry;
+    /// 2.5 MS/s for the narrow ones.
+    pub fn rate_hz(narrow: bool) -> f64 {
+        if narrow { 2.5e6 } else { 64e6 / 7.0 }
+    }
+
+    #[cfg(feature = "pluto")]
+    fn gain(&self) -> decdvbt_io::PlutoGain {
+        if self.agc {
+            decdvbt_io::PlutoGain::Agc
+        } else {
+            decdvbt_io::PlutoGain::Manual(f64::from(self.gain_db))
+        }
+    }
+}
+
 /// What to open.
 #[derive(Debug, Clone)]
 pub enum Spec {
+    #[cfg_attr(not(feature = "pluto"), allow(dead_code))]
+    Pluto {
+        center_hz: f64,
+        /// A 1 or 1.7 MHz channel (2.5 MS/s and the 1.75 MHz filter).
+        narrow: bool,
+        ui: PlutoUi,
+    },
     #[cfg_attr(not(feature = "airspy"), allow(dead_code))]
     Airspy {
         center_hz: f64,
@@ -144,7 +196,11 @@ type AirGainSetter = Setter<AirGains>;
 pub struct Session {
     pub rx: Rx,
     pub live: bool,
+    /// What the radio said about itself, for the status line (the Pluto's
+    /// link, firmware and sample width).
+    pub info: Option<String>,
     set_gains: Option<GainSetter>,
+    set_pluto: Option<Setter<PlutoUi>>,
     set_air_gains: Option<AirGainSetter>,
     set_filter: Option<Setter<Option<f32>>>,
     set_ppm: Option<Setter<f32>>,
@@ -153,6 +209,56 @@ pub struct Session {
 impl Session {
     pub fn open(spec: &Spec) -> Result<Session, String> {
         match spec {
+            #[cfg(feature = "pluto")]
+            Spec::Pluto {
+                center_hz,
+                narrow,
+                ui,
+            } => {
+                use decdvbt_io::{EightBit, PlutoSettings, PlutoSource};
+                let src = PlutoSource::open(PlutoSettings {
+                    uri: ui.uri.parse()?,
+                    center_hz: *center_hz,
+                    sample_rate: PlutoUi::rate_hz(*narrow),
+                    bandwidth: narrow.then_some(1.75e6),
+                    gain: ui.gain(),
+                    eight_bit: if ui.eight_bit {
+                        EightBit::Auto
+                    } else {
+                        EightBit::Off
+                    },
+                })
+                .map_err(|e| e.to_string())?;
+                let ctl = src.control();
+                let i = ctl.info().clone();
+                let info = format!(
+                    "Pluto on {}: {} {}, {}-bit IQ",
+                    i.link,
+                    i.model,
+                    i.firmware,
+                    if i.eight_bit { 8 } else { 16 }
+                );
+                let probe = ctl.clone();
+                let rx = Rx::start(
+                    Box::new(src),
+                    RxOptions::default(),
+                    Some(Box::new(move || probe.overflows())),
+                );
+                Ok(Session {
+                    rx,
+                    live: true,
+                    info: Some(info),
+                    set_gains: None,
+                    set_air_gains: None,
+                    set_pluto: Some(Box::new(move |u: PlutoUi| {
+                        ctl.set_gain(u.gain()).map_err(|e| e.to_string())
+                    })),
+                    set_filter: None,
+                    set_ppm: None,
+                })
+            }
+            #[cfg(not(feature = "pluto"))]
+            Spec::Pluto { .. } => Err("built without the pluto feature".into()),
             #[cfg(feature = "airspy")]
             Spec::Airspy {
                 center_hz,
@@ -181,7 +287,9 @@ impl Session {
                 Ok(Session {
                     rx,
                     live: true,
+                    info: None,
                     set_gains: None,
+                    set_pluto: None,
                     set_air_gains: Some(Box::new(move |g| {
                         ctl.set_gains(AirspyGains {
                             lna: g.lna,
@@ -226,6 +334,8 @@ impl Session {
                 Ok(Session {
                     rx,
                     live: true,
+                    info: None,
+                    set_pluto: None,
                     set_air_gains: None,
                     set_gains: Some(Box::new(move |g| {
                         ctl.set_gains(decdvbt_io::HackRfGains {
@@ -260,6 +370,8 @@ impl Session {
                 Ok(Session {
                     rx: Rx::start(src, RxOptions::default(), None),
                     live: false,
+                    info: None,
+                    set_pluto: None,
                     set_gains: None,
                     set_air_gains: None,
                     set_filter: None,
@@ -277,6 +389,11 @@ impl Session {
     /// The HackRF's frequency error, ppm; no-op for a file.
     pub fn set_ppm(&self, ppm: f32) -> Result<(), String> {
         self.set_ppm.as_ref().map_or(Ok(()), |f| f(ppm))
+    }
+
+    /// Change the Pluto's gain or AGC (no-op for any other source).
+    pub fn set_pluto(&self, u: &PlutoUi) -> Result<(), String> {
+        self.set_pluto.as_ref().map_or(Ok(()), |f| f(u.clone()))
     }
 
     /// Change the Airspy's gains (no-op for any other source).

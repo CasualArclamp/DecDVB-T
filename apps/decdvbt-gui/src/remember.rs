@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::prefs;
-use crate::source::{AirGains, Gains, Preset};
+use crate::source::{AirGains, Gains, PlutoUi, Preset};
 
 /// How long a change has to hold still before it is written.
 const SETTLE: Duration = Duration::from_millis(800);
@@ -30,6 +30,9 @@ pub struct Snapshot {
     pub file_source: bool,
     /// The radio is the Airspy R2 (else the HackRF, when not a file).
     pub airspy: bool,
+    /// The radio is the ADALM-PLUTO / Pluto+, and its settings.
+    pub pluto: bool,
+    pub pluto_ui: PlutoUi,
     pub rate_khz: i64,
     pub gains: Gains,
     /// The Airspy's stages, the libairspy preset they were set from (`None`:
@@ -62,6 +65,8 @@ impl Snapshot {
                     "file"
                 } else if self.airspy {
                     "airspy"
+                } else if self.pluto {
+                    "pluto"
                 } else {
                     "hackrf"
                 },
@@ -78,6 +83,10 @@ impl Snapshot {
                 &self.air_preset.map_or(String::new(), Preset::key),
             ),
             ("air_packed", b(self.air_packed)),
+            ("pluto_uri", &self.pluto_ui.uri),
+            ("pluto_gain", &self.pluto_ui.gain_db.to_string()),
+            ("pluto_agc", b(self.pluto_ui.agc)),
+            ("pluto_8bit", b(self.pluto_ui.eight_bit)),
             ("file", &self.file),
             ("file_centre_hz", &self.file_centre_hz.to_string()),
             ("file_rate_khz", &self.file_rate_khz.to_string()),
@@ -98,6 +107,8 @@ pub struct Saved {
     pub tune_hz: Option<f64>,
     pub file_source: bool,
     pub airspy: bool,
+    pub pluto: bool,
+    pub pluto_ui: PlutoUi,
     pub rate_msps: Option<f64>,
     pub gains: Option<Gains>,
     pub air: Option<AirGains>,
@@ -154,6 +165,20 @@ impl Saved {
             tune_hz: prefs::number("tune_hz").filter(|h: &f64| *h >= 1e6),
             file_source: prefs::get("source").is_some_and(|v| v == "file"),
             airspy: prefs::get("source").is_some_and(|v| v == "airspy"),
+            pluto: prefs::get("source").is_some_and(|v| v == "pluto"),
+            pluto_ui: {
+                let d = PlutoUi::default();
+                PlutoUi {
+                    uri: prefs::get("pluto_uri")
+                        .filter(|u| !u.trim().is_empty() && !u.contains(char::is_whitespace))
+                        .unwrap_or(d.uri),
+                    gain_db: prefs::number::<i32>("pluto_gain")
+                        .filter(|g| PlutoUi::GAIN_DB.contains(g))
+                        .unwrap_or(d.gain_db),
+                    agc: flag("pluto_agc").unwrap_or(d.agc),
+                    eight_bit: flag("pluto_8bit").unwrap_or(d.eight_bit),
+                }
+            },
             rate_msps: prefs::number::<i64>("rate_khz").map(|k| k as f64 / 1e3),
             gains,
             air,
@@ -234,6 +259,8 @@ mod tests {
             tune_hz: 514_000_000,
             file_source: false,
             airspy: false,
+            pluto: false,
+            pluto_ui: PlutoUi::default(),
             rate_khz: 10_000,
             gains: Gains {
                 amp: true,

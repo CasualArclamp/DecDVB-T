@@ -57,7 +57,7 @@ use decdvbt_rx::sounder::Geometry;
 use decdvbt_rx::t2::receiver::{T2Status, s1_name};
 use decdvbt_ts::{Epg, TsTap};
 use eframe::egui::{self, Color32, RichText};
-use source::{AirGains, Gains, Preset, Session, Spec};
+use source::{AirGains, Gains, PlutoUi, Preset, Session, Spec};
 use waterfall::{History, RingImage};
 
 const AMBER: Color32 = Color32::from_rgb(255, 176, 40);
@@ -145,7 +145,7 @@ struct Options {
     record: bool,
     /// Run the gain optimiser once the receiver has locked (a test aid).
     optimise: bool,
-    /// The radio to use (`--radio hackrf|airspy`), else the one last used.
+    /// The radio to use (`--radio hackrf|airspy|pluto`), else the one last used.
     radio: Option<SourceKind>,
     /// Which view settings the command line gave: what it did not is what
     /// was kept from the last run (but a screenshot, which has to come out
@@ -276,10 +276,11 @@ impl Options {
                 "--record" => o.record = true,
                 "--optimise" => o.optimise = true,
                 "--radio" => {
-                    o.radio = Some(match value("hackrf or airspy")?.as_str() {
+                    o.radio = Some(match value("hackrf, airspy or pluto")?.as_str() {
                         "hackrf" => SourceKind::HackRf,
-                        "airspy" => SourceKind::Airspy,
-                        v => return Err(format!("--radio is hackrf or airspy, not {v}")),
+                        "airspy" | "hydrasdr" => SourceKind::Airspy,
+                        "pluto" | "plutoplus" => SourceKind::Pluto,
+                        v => return Err(format!("--radio is hackrf, airspy or pluto, not {v}")),
                     });
                 }
                 "--subs" => o.subs = true,
@@ -469,6 +470,9 @@ enum SourceKind {
     HackRf,
     /// The Airspy R2 (10 MS/s only; its own gain stages).
     Airspy,
+    /// The ADALM-PLUTO / Pluto+ (64/7 MS/s, or 2.5 for narrow channels; one
+    /// gain in dB or its AGC).
+    Pluto,
     File,
 }
 
@@ -563,6 +567,8 @@ struct App {
     air: AirGains,
     air_preset: Option<Preset>,
     air_packed: bool,
+    /// The Pluto's link, gain and sample width.
+    pluto: PlutoUi,
     /// A file source: its path, centre (MHz) and rate (MS/s), editable
     /// because a raw file has no header.
     file: Option<PathBuf>,
@@ -602,6 +608,8 @@ struct App {
     /// in the prefs include the HackRF's own clock error, which the Airspy
     /// does not share.
     air_offsets: HashMap<u8, f64>,
+    /// The same for the Pluto (this run only, like the Airspy's).
+    pluto_offsets: HashMap<u8, f64>,
     tuned_at: Instant,
     centre_checked: bool,
     centre_tries: u8,
@@ -674,6 +682,8 @@ impl App {
             k
         } else if kept.airspy {
             SourceKind::Airspy
+        } else if kept.pluto {
+            SourceKind::Pluto
         } else {
             SourceKind::HackRf
         };
@@ -707,6 +717,7 @@ impl App {
                 Some(Preset::DEFAULT)
             },
             air_packed: kept.air_packed.unwrap_or(false),
+            pluto: kept.pluto_ui.clone(),
             file,
             file_centre_mhz: kept.file_centre_mhz.unwrap_or(0.0),
             file_rate_msps: kept.file_rate_msps.unwrap_or(10.0),
@@ -785,6 +796,7 @@ impl App {
             dial_edit: None,
             offsets,
             air_offsets: HashMap::new(),
+            pluto_offsets: HashMap::new(),
             tuned_at: Instant::now(),
             centre_checked: false,
             centre_tries: 0,
@@ -843,6 +855,8 @@ impl App {
             tune_hz: tune_hz.round() as i64,
             file_source: self.kind == SourceKind::File,
             airspy: self.kind == SourceKind::Airspy,
+            pluto: self.kind == SourceKind::Pluto,
+            pluto_ui: self.pluto.clone(),
             rate_khz: (self.rate_msps * 1e3).round() as i64,
             gains: self.gains,
             air: self.air,
@@ -911,6 +925,18 @@ impl App {
                 };
                 self.begin(spec, Some(fc));
             }
+            SourceKind::Pluto => {
+                let fc = self.tune_hz;
+                if fc <= 0.0 {
+                    return;
+                }
+                let spec = Spec::Pluto {
+                    center_hz: fc,
+                    narrow: self.bandwidth.narrow(),
+                    ui: self.pluto.clone(),
+                };
+                self.begin(spec, Some(fc));
+            }
             SourceKind::File => {
                 let Some(path) = self.file.clone() else {
                     self.open_file_dialog();
@@ -972,6 +998,9 @@ impl App {
                 self.tuned_at = Instant::now();
                 self.centre_checked = false;
                 self.centre_tries = 0;
+                if let Some(i) = self.session.as_ref().and_then(|s| s.info.clone()) {
+                    self.note = i;
+                }
             }
             Err(e) => self.note = e,
         }
@@ -1066,6 +1095,10 @@ impl App {
         if bw == self.bandwidth {
             return;
         }
+        // The Pluto's rate and filter follow the width's narrowness.
+        let pluto_restart = self.kind == SourceKind::Pluto
+            && self.session.is_some()
+            && bw.narrow() != self.bandwidth.narrow();
         self.bandwidth = bw;
         self.reset_stream();
         self.dec = ReceiverStatus::default();
@@ -1076,6 +1109,9 @@ impl App {
             if self.session.is_some() && self.kind == SourceKind::HackRf {
                 self.start();
             }
+        }
+        if pluto_restart {
+            self.start();
         }
     }
 
@@ -1351,10 +1387,10 @@ impl App {
 
     /// The learned carrier offsets of the radio in use.
     fn cur_offsets(&self) -> &HashMap<u8, f64> {
-        if self.kind == SourceKind::Airspy {
-            &self.air_offsets
-        } else {
-            &self.offsets
+        match self.kind {
+            SourceKind::Airspy => &self.air_offsets,
+            SourceKind::Pluto => &self.pluto_offsets,
+            _ => &self.offsets,
         }
     }
 
@@ -1483,6 +1519,8 @@ impl App {
         let ch = self.channel;
         if self.kind == SourceKind::Airspy {
             self.air_offsets.insert(ch, off);
+        } else if self.kind == SourceKind::Pluto {
+            self.pluto_offsets.insert(ch, off);
         } else {
             self.offsets.insert(ch, off);
             prefs::set(&format!("offset_C{ch}"), &format!("{off:.0}"));
@@ -1585,6 +1623,12 @@ impl App {
             self.note = "Optimising the gain needs a live radio".into();
             return;
         }
+        if self.kind == SourceKind::Pluto {
+            self.note = "The optimiser steps the HackRF's and the Airspy's stages; \
+                         on the Pluto set the gain, or use its AGC"
+                .into();
+            return;
+        }
         self.opt_result = None;
         self.optimiser = Some(if self.kind == SourceKind::Airspy {
             // libairspy's sensitivity ladder, every other rung and the top
@@ -1671,6 +1715,7 @@ impl App {
         let Some(s) = &self.session else { return };
         let r = match self.kind {
             SourceKind::Airspy => s.set_air_gains(self.air),
+            SourceKind::Pluto => s.set_pluto(&self.pluto),
             _ => s.set_gains(self.gains),
         };
         if let Err(e) = r {
@@ -2145,12 +2190,14 @@ impl App {
                 .selected_text(match self.kind {
                     SourceKind::HackRf => "HackRF",
                     SourceKind::Airspy => "Airspy R2 / HydraSDR",
+                    SourceKind::Pluto => "Pluto / Pluto+",
                     SourceKind::File => "IQ file",
                 })
                 .width(90.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.kind, SourceKind::HackRf, "HackRF");
                     ui.selectable_value(&mut self.kind, SourceKind::Airspy, "Airspy R2 / HydraSDR");
+                    ui.selectable_value(&mut self.kind, SourceKind::Pluto, "ADALM-PLUTO / Pluto+");
                     ui.selectable_value(&mut self.kind, SourceKind::File, "IQ file");
                 });
             if before != self.kind && running {
@@ -2226,6 +2273,15 @@ impl App {
                     // The R2 has one rate here (its ADC runs at 20 MS/s and
                     // the host makes 10 MS/s IQ).
                     ui.label("10 MS/s");
+                } else if self.kind == SourceKind::Pluto {
+                    ui.label(format!(
+                        "{:.3} MS/s",
+                        PlutoUi::rate_hz(self.bandwidth.narrow()) / 1e6
+                    ))
+                    .on_hover_text(
+                        "The 8 MHz mode's OFDM clock (64/7 MS/s) for 6-8 MHz channels, \
+                         the least the link must carry; 2.5 MS/s for 1 and 1.7 MHz",
+                    );
                 } else {
                     let before = self.rate_msps;
                     egui::ComboBox::from_id_salt("rate")
@@ -2244,6 +2300,10 @@ impl App {
                 ui.separator();
                 if self.kind == SourceKind::Airspy {
                     if sdr::airspy_gain_bar(ui, &mut self.air, &mut self.air_preset) {
+                        self.change_gains();
+                    }
+                } else if self.kind == SourceKind::Pluto {
+                    if sdr::pluto_gain_bar(ui, &mut self.pluto, true) {
                         self.change_gains();
                     }
                 } else {
@@ -2726,14 +2786,16 @@ impl eframe::App for App {
                     air_preset: &mut self.air_preset,
                     air_packed: &mut self.air_packed,
                     airspy: self.kind == SourceKind::Airspy,
+                    pluto: (self.kind == SourceKind::Pluto).then_some(&mut self.pluto),
+                    radio_info: self.session.as_ref().and_then(|s| s.info.as_deref()),
                     live,
                     front_end: self.stats.front_end,
                     optimiser: self.optimiser.as_ref(),
                     last_result: self.opt_result.as_deref(),
-                    offsets: if self.kind == SourceKind::Airspy {
-                        &self.air_offsets
-                    } else {
-                        &self.offsets
+                    offsets: match self.kind {
+                        SourceKind::Airspy => &self.air_offsets,
+                        SourceKind::Pluto => &self.pluto_offsets,
+                        _ => &self.offsets,
                     },
                 },
             );
@@ -2761,6 +2823,7 @@ impl eframe::App for App {
                 self.gains = Gains::default();
                 self.air = AirGains::default();
                 self.air_preset = Some(Preset::DEFAULT);
+                self.pluto = PlutoUi::default();
                 self.change_gains();
             }
         }

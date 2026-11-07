@@ -119,6 +119,19 @@ hydrasdr` (the same as `airspy`). The driver recognises it from its firmware
 and sends its 64-bit tuning word; the Airspy's gain presets and options apply
 unchanged. Tested live on an RFOne at 10 MS/s (stream and retuning).
 
+**ADALM-PLUTO or Pluto+?** Pick **ADALM-PLUTO / Pluto+**, or `--radio pluto`.
+The driver speaks the Pluto's own IIOD protocol in pure Rust (no libiio, no
+DLL) over USB or the network: `--pluto-uri auto` (the default) uses USB when
+ADI's Pluto USB driver (WinUSB) is installed and otherwise the Pluto's USB
+network at 192.168.2.1; `ip:ADDRESS` reaches a Pluto+ on Ethernet. It runs at
+64/7 MS/s (the 8 MHz mode's own clock, the least the link has to carry), or
+2.5 MS/s for 1 and 1.7 MHz channels; gain in dB (`--pluto-gain 50`) or the
+AD9361's AGC (`--pluto-gain agc`). A plain Pluto's USB carries only about
+6.8 MS/s of 16-bit IQ, so for DVB-T use F5OEO's **Tezuka** firmware, whose
+8-bit IQ the driver picks up by itself (half the load), or a Pluto+ on
+Ethernet. Receive only: the transmit LO is powered down. Not yet tried on a
+real Pluto (tested against a stand-in IIOD server).
+
 No radio? The GUI and the CLI also read IQ recordings (8-bit complex `.cs8`
 and others), and the CLI's `modulate` makes DVB-T and DVB-T2 test signals to
 play with.
