@@ -48,7 +48,8 @@ impl Default for Tuning {
 pub enum Radio {
     #[default]
     Hackrf,
-    /// Airspy R2 (10 MS/s only).
+    /// Airspy R2 or HydraSDR RFOne (the same protocol; 10 MS/s only).
+    #[value(alias = "hydrasdr")]
     Airspy,
 }
 

@@ -33,6 +33,38 @@ pub const REQ_SET_PACKING: u8 = 26;
 /// `(port << 5) | pin` = 45. Port 1 pin 13 is the antenna bias tee.
 pub const GPIO_BIAS_TEE_INDEX: u16 = (1 << 5) | 13;
 
+/// Which radio is on the other end. The HydraSDR RFOne (hydrasdr.com, an
+/// Airspy R2 descendant with an R828D tuner) can enumerate with the R2's own
+/// USB ID (1D50:60A1) and board id 0; libhydrasdr (`hydrasdr.c`,
+/// `verify_and_claim_device`, MIT) tells it apart by its firmware version
+/// string, which starts "HydraSDR RF" ("HydraSDR RFOne v1.0.0-rc2
+/// 2024-09-15" on a real one). Its vendor protocol is the R2's, request for
+/// request (the bias tee too: its enable is GPIO1[13] on both boards, rfone_fw
+/// `common/core.h` `PIN_EN_BIAST`), except for [`set_freq`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Model {
+    #[default]
+    AirspyR2,
+    HydraSdr,
+}
+
+impl Model {
+    pub fn from_firmware(version: &str) -> Model {
+        if version.to_ascii_lowercase().starts_with("hydrasdr") {
+            Model::HydraSdr
+        } else {
+            Model::AirspyR2
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Model::AirspyR2 => "Airspy R2",
+            Model::HydraSdr => "HydraSDR RFOne",
+        }
+    }
+}
+
 /// The tuner's range, Hz (libairspy: `AIRSPY_FREQ_MIN/MAX` 24 MHz – 1.75 GHz in
 /// the R2's firmware; 1.8 GHz is the upper bound the R820T takes).
 pub const FREQ_MIN_HZ: u64 = 24_000_000;
@@ -114,20 +146,23 @@ pub fn set_sample_rate(index: u16) -> Command {
     Command::set(REQ_SET_SAMPLERATE, index)
 }
 
-/// `SET_FREQ`: the centre frequency as a little-endian u32 of Hz.
-pub fn set_freq(hz: u64) -> Result<Command> {
+/// `SET_FREQ`: the centre frequency in Hz, little-endian: a u32 on the
+/// Airspy (libairspy `airspy_set_freq`), a u64 on the HydraSDR (its firmware,
+/// rfone_fw `usb_req.c`, reads a `uint64_t freq_hz`, and libhydrasdr sends 8
+/// bytes). The HydraSDR's range is the R2's, 24–1800 MHz (libhydrasdr
+/// `RFONE_MIN_FREQ_HZ`/`RFONE_MAX_FREQ_HZ`).
+pub fn set_freq(model: Model, hz: u64) -> Result<Command> {
     if !(FREQ_MIN_HZ..=FREQ_MAX_HZ).contains(&hz) {
         return Err(Error::Other(format!(
             "Airspy: {:.3} MHz is outside the tuner's 24–1800 MHz",
             hz as f64 / 1e6
         )));
     }
-    Ok(Command::out(
-        REQ_SET_FREQ,
-        0,
-        0,
-        (hz as u32).to_le_bytes().to_vec(),
-    ))
+    let data = match model {
+        Model::AirspyR2 => (hz as u32).to_le_bytes().to_vec(),
+        Model::HydraSdr => hz.to_le_bytes().to_vec(),
+    };
+    Ok(Command::out(REQ_SET_FREQ, 0, 0, data))
 }
 
 /// Gain requests clamp to the stage's range rather than fail.
@@ -222,6 +257,7 @@ pub enum Step {
 /// What to program. `gains` are already clamped by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartParams {
+    pub model: Model,
     pub center_hz: u64,
     pub rate_index: u16,
     pub lna: u8,
@@ -240,7 +276,7 @@ pub fn start_sequence(p: &StartParams) -> Result<Vec<Step>> {
         Control(set_packing(p.packed)),
         ClearHalt,
         Control(set_sample_rate(p.rate_index)),
-        Control(set_freq(p.center_hz)?),
+        Control(set_freq(p.model, p.center_hz)?),
         Control(set_lna_agc(false)),
         Control(set_mixer_agc(false)),
         Control(set_lna_gain(p.lna)),
@@ -259,13 +295,36 @@ mod tests {
 
     #[test]
     fn frequency_is_a_little_endian_u32() {
-        let c = set_freq(546_000_000).unwrap();
+        let c = set_freq(Model::AirspyR2, 546_000_000).unwrap();
         assert_eq!(c.dir, Dir::Out);
         assert_eq!((c.request, c.value, c.index), (13, 0, 0));
         assert_eq!(c.data, 546_000_000u32.to_le_bytes());
-        assert!(set_freq(23_999_999).is_err());
-        assert!(set_freq(1_800_000_001).is_err());
-        assert!(set_freq(24_000_000).is_ok());
+        for m in [Model::AirspyR2, Model::HydraSdr] {
+            assert!(set_freq(m, 23_999_999).is_err());
+            assert!(set_freq(m, 1_800_000_001).is_err());
+            assert!(set_freq(m, 24_000_000).is_ok());
+        }
+    }
+
+    #[test]
+    fn hydrasdr_frequency_is_a_little_endian_u64() {
+        let c = set_freq(Model::HydraSdr, 546_000_000).unwrap();
+        assert_eq!((c.dir, c.request, c.value, c.index), (Dir::Out, 13, 0, 0));
+        assert_eq!(c.data, 546_000_000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn model_from_the_firmware_string() {
+        // As a real RFOne and a real R2 report it.
+        assert_eq!(
+            Model::from_firmware("HydraSDR RFOne v1.0.0-rc2 2024-09-15"),
+            Model::HydraSdr
+        );
+        assert_eq!(
+            Model::from_firmware("AirSpy NOS v1.0.0-rc10-6-g4008185 2020-05-08"),
+            Model::AirspyR2
+        );
+        assert_eq!(Model::from_firmware(""), Model::AirspyR2);
     }
 
     #[test]
@@ -345,6 +404,7 @@ mod tests {
                 for g in [0u8, 7, 15, 255] {
                     let seq = start_sequence(&StartParams {
                         center_hz: hz,
+                        model: Model::AirspyR2,
                         rate_index: 0,
                         lna: g,
                         mixer: g,
@@ -372,6 +432,7 @@ mod tests {
     fn start_sequence_order() {
         let seq = start_sequence(&StartParams {
             center_hz: 514_000_000,
+            model: Model::AirspyR2,
             rate_index: 0,
             lna: 14,
             mixer: 12,

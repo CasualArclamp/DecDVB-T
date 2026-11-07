@@ -113,6 +113,12 @@ the HackRF's, and the radio's real 20 MS/s stream is turned into IQ on the
 host (about 4 % of a core). The Airspy front end is new and has not yet been
 tried on the radio; see `docs/STATUS.md` for what is still to be checked.
 
+**HydraSDR RFOne?** It is an Airspy R2 descendant with the same USB protocol,
+so it runs on the same driver: pick **Airspy R2 / HydraSDR**, or `--radio
+hydrasdr` (the same as `airspy`). The driver recognises it from its firmware
+and sends its 64-bit tuning word; the Airspy's gain presets and options apply
+unchanged. Tested live on an RFOne at 10 MS/s (stream and retuning).
+
 No radio? The GUI and the CLI also read IQ recordings (8-bit complex `.cs8`
 and others), and the CLI's `modulate` makes DVB-T and DVB-T2 test signals to
 play with.

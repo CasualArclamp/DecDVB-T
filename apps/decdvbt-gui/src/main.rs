@@ -2144,13 +2144,13 @@ impl App {
             egui::ComboBox::from_id_salt("source")
                 .selected_text(match self.kind {
                     SourceKind::HackRf => "HackRF",
-                    SourceKind::Airspy => "Airspy R2",
+                    SourceKind::Airspy => "Airspy R2 / HydraSDR",
                     SourceKind::File => "IQ file",
                 })
                 .width(90.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.kind, SourceKind::HackRf, "HackRF");
-                    ui.selectable_value(&mut self.kind, SourceKind::Airspy, "Airspy R2");
+                    ui.selectable_value(&mut self.kind, SourceKind::Airspy, "Airspy R2 / HydraSDR");
                     ui.selectable_value(&mut self.kind, SourceKind::File, "IQ file");
                 });
             if before != self.kind && running {
