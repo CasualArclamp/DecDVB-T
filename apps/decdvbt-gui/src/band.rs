@@ -140,7 +140,8 @@ pub fn show(ui: &mut egui::Ui, inp: &BandInput) -> Option<Action> {
         if x1 <= plot_l || x0 >= plot_r || x1 - x0 < 4.0 {
             continue;
         }
-        let uk = n <= 48 && n != 38;
+        let uk = decdvbt_core::channel::plan() != decdvbt_core::channel::Plan::Eu
+            || (n <= 48 && n != 38);
         let is_sel = selected == Some(n);
         let alpha = if is_sel {
             26

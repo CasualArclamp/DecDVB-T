@@ -395,7 +395,7 @@ fn window_icon() -> Option<egui::IconData> {
 
 /// The offsets learned for the channels, from the prefs.
 fn load_offsets() -> HashMap<u8, f64> {
-    (21..=69u8)
+    (5..=69u8)
         .filter_map(|c| {
             let o: f64 = prefs::get(&format!("offset_C{c}"))?.parse().ok()?;
             Some((c, o))
@@ -1375,14 +1375,41 @@ impl App {
     }
 
     fn step_channel(&mut self, up: bool) {
+        // The list is in frequency order (not number order: AU 9A sits
+        // between 9 and 10), so step by place in it.
         let list: Vec<u8> = all_channels().collect();
-        let at = list.iter().position(|&c| c >= self.channel).unwrap_or(0);
+        let here = centre_hz(self.channel).unwrap_or(0.0);
+        let freq = |c: u8| centre_hz(c).unwrap_or(0.0);
         let next = if up {
-            list[(at + usize::from(list[at] == self.channel)).min(list.len() - 1)]
+            list.iter().copied().find(|&c| freq(c) > here + 1.0)
         } else {
-            list[at.saturating_sub(1)]
+            list.iter().rev().copied().find(|&c| freq(c) < here - 1.0)
         };
-        self.tune_channel(next);
+        if let Some(n) = next.or(list.first().copied()) {
+            self.tune_channel(n);
+        }
+    }
+
+    /// Switch the country's channel plan: remember it, and move to the
+    /// channel of the new plan nearest the frequency in use.
+    fn set_country(&mut self, plan: decdvbt_core::channel::Plan) {
+        decdvbt_core::channel::set_plan(plan);
+        prefs::set("country", plan.code());
+        if centre_hz(self.channel).is_none() {
+            let here = self.vfo_hz.unwrap_or(self.tune_hz);
+            let nearest = all_channels().min_by(|&a, &b| {
+                let d = |c: u8| (centre_hz(c).unwrap_or(0.0) - here).abs();
+                d(a).total_cmp(&d(b))
+            });
+            if let Some(n) = nearest {
+                if self.kind.live() {
+                    self.tune_channel(n);
+                } else {
+                    self.channel = n;
+                }
+            }
+        }
+        self.channel_text = channel_label(self.channel);
     }
 
     /// The learned carrier offsets of the radio in use.
@@ -2229,6 +2256,21 @@ impl App {
             self.set_bandwidth(bw);
 
             if self.kind.live() {
+                ui.label("country");
+                let cur = decdvbt_core::channel::plan();
+                let mut pick = cur;
+                egui::ComboBox::from_id_salt("country")
+                    .selected_text(cur.code().to_uppercase())
+                    .show_ui(ui, |ui| {
+                        for p in decdvbt_core::channel::Plan::ALL {
+                            ui.selectable_value(&mut pick, p, p.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text("The channel plan: Europe E5–E12 + C21–C69, UK C21–C48, Australia 6–12 + C28–C51");
+                if pick != cur {
+                    self.set_country(pick);
+                }
                 ui.label("channel");
                 if ui.small_button("◀").clicked() {
                     self.step_channel(false);
@@ -2239,7 +2281,7 @@ impl App {
                             .desired_width(56.0)
                             .hint_text("C26 / MHz"),
                     )
-                    .on_hover_text("A UHF channel (C26), or any frequency in MHz (433.25)");
+                    .on_hover_text("A channel of the chosen country (C26, E5, V6, V9A), or any frequency in MHz (433.25)");
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let text = self.channel_text.trim().to_string();
                     match (parse_channel(&text), text.parse::<f64>()) {
@@ -2249,7 +2291,7 @@ impl App {
                         }
                         _ => {
                             self.note =
-                                format!("not a UHF channel (21–69) or a frequency in MHz: {text}")
+                                format!("not a channel of this country's plan or a frequency in MHz: {text}")
                         }
                     }
                     self.channel_text = match self.vfo_hz {
@@ -2813,7 +2855,7 @@ impl eframe::App for App {
                 self.cancel_optimiser();
             }
             if asks.clear_offsets {
-                for c in 21..=69u8 {
+                for c in 5..=69u8 {
                     prefs::set(&format!("offset_C{c}"), "");
                 }
                 self.offsets.clear();

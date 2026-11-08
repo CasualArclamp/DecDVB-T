@@ -1769,10 +1769,14 @@ impl App {
                 Some(Phase::Lock { cands, at, .. }) => Some(cands[*at]),
                 _ => None,
             };
-            for (k, n) in (21u8..=48).enumerate() {
+            // One block a channel of the country's plan, squeezed to fit the
+            // row when the plan is long (Europe has 57).
+            let chans: Vec<u8> = decdvbt_core::channel::all_channels().collect();
+            let pitch = (((rect.width() - 60.0) / chans.len().max(1) as f32).min(34.0)).max(6.0);
+            for (k, &n) in chans.iter().enumerate() {
                 let r = Rect::from_min_size(
-                    pos2(rect.left() + 30.0 + k as f32 * 34.0, y),
-                    vec2(28.0, 28.0),
+                    pos2(rect.left() + 30.0 + k as f32 * pitch, y),
+                    vec2((pitch - 6.0).max(4.0), 28.0),
                 );
                 let c = if lock_at == Some(n) {
                     TT_YELLOW
@@ -1786,13 +1790,15 @@ impl App {
                     Color32::from_gray(34)
                 };
                 p.rect_filled(r, 0.0, c);
-                p.text(
-                    pos2(r.center().x, r.bottom() + 4.0),
-                    Align2::CENTER_TOP,
-                    n.to_string(),
-                    FontId::monospace(13.0),
-                    Color32::from_gray(170),
-                );
+                if pitch >= 26.0 {
+                    p.text(
+                        pos2(r.center().x, r.bottom() + 4.0),
+                        Align2::CENTER_TOP,
+                        n.to_string(),
+                        FontId::monospace(13.0),
+                        Color32::from_gray(170),
+                    );
+                }
             }
             y += 64.0;
             p.text(

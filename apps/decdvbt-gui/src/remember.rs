@@ -160,8 +160,15 @@ impl Saved {
                 h.clamp(MIN_WINDOW.1, MAX_WINDOW),
             ))
         });
+        // The country comes first: whether a saved channel is valid depends on it.
+        if let Some(plan) =
+            prefs::get("country").and_then(|v| decdvbt_core::channel::Plan::parse(&v))
+        {
+            decdvbt_core::channel::set_plan(plan);
+        }
         Saved {
-            channel: prefs::number("channel").filter(|c| (21..=69).contains(c)),
+            channel: prefs::number("channel")
+                .filter(|&c| decdvbt_core::channel::centre_hz(c).is_some()),
             tune_hz: prefs::number("tune_hz").filter(|h: &f64| *h >= 1e6),
             file_source: prefs::get("source").is_some_and(|v| v == "file"),
             airspy: prefs::get("source").is_some_and(|v| v == "airspy"),

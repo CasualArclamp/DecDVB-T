@@ -37,13 +37,16 @@ use decdvbt_io::{IqFileReader, IqSource, format_from_path, name_hint};
 #[derive(Parser)]
 #[command(name = "decdvbt", version, about = "DVB-T / DVB-T2 receiver")]
 struct Cli {
+    /// Country whose channel plan names the channels: eu (default), uk or au.
+    #[arg(long, global = true, default_value = "eu", value_parser = parse_country)]
+    country: decdvbt_core::channel::Plan,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// List the UK UHF channels and their centre frequencies.
+    /// List the country's channels (--country eu|uk|au) and their centre frequencies.
     Channels,
     /// One channel's centre frequency ("C34", "34"), or the channel holding a
     /// frequency in MHz ("578").
@@ -104,8 +107,15 @@ enum Command {
     },
 }
 
+fn parse_country(s: &str) -> Result<decdvbt_core::channel::Plan, String> {
+    decdvbt_core::channel::Plan::parse(s)
+        .ok_or_else(|| format!("unknown country {s:?} (eu, uk, au)"))
+}
+
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    decdvbt_core::channel::set_plan(cli.country);
+    match cli.command {
         Command::Channels => {
             for n in all_channels() {
                 println!(
