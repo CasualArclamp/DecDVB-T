@@ -7,9 +7,12 @@
 //! from [`VirtualRadio`], so a test with no radio runs the code the radio
 //! runs, including underrun accounting.
 //!
-//! **This file holds the only call that opens the HackRF** (`open_hackrf`), and
-//! it needs an [`ArmedProof`] by value (see `arm.rs`; a test checks no other
-//! file contains the call).
+//! **This file holds the only calls that open a radio for transmit**
+//! (`open_hackrf`, `open_pluto`), and each needs an [`ArmedProof`] by value
+//! (see `arm.rs`; a test checks no other file contains the calls).
+//!
+//! The Pluto's transmit thread (`decdvbt-io/src/pluto/tx.rs`) calls the same
+//! [`pull`] for each kernel buffer it sends.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -21,7 +24,7 @@ use std::time::{Duration, Instant};
 use decdvbt_core::{Error, Result};
 
 use crate::arm::ArmedProof;
-use crate::config::{HackRfTxConfig, TxConfig, TxSink};
+use crate::config::{HackRfTxConfig, PlutoTxConfig, TxConfig, TxSink};
 use crate::ring::IqRing;
 
 /// When this environment variable is set (to anything) the radio cannot be
@@ -114,9 +117,9 @@ impl VirtualRadio {
                 let limit = seconds.map(|s| (s * f64::from(sample_rate_hz) * 2.0) as u64);
                 (*paced, Some(BufWriter::with_capacity(1 << 20, f)), limit)
             }
-            TxSink::HackRf(_) => {
+            TxSink::HackRf(_) | TxSink::Pluto(_) => {
                 return Err(Error::Other(
-                    "the virtual radio cannot take a HackRF sink".into(),
+                    "the virtual radio cannot take a radio sink".into(),
                 ));
             }
         };
@@ -240,6 +243,8 @@ pub enum Radio {
     Virtual(VirtualRadio),
     #[cfg(feature = "hackrf")]
     HackRf(decdvbt_io::HackRfTx),
+    #[cfg(feature = "pluto")]
+    Pluto(decdvbt_io::PlutoTx),
 }
 
 impl Radio {
@@ -250,6 +255,28 @@ impl Radio {
             Radio::Virtual(_) => Ok(()),
             #[cfg(feature = "hackrf")]
             Radio::HackRf(r) => r.set_txvga(db),
+            #[cfg(feature = "pluto")]
+            Radio::Pluto(_) => Ok(()),
+        }
+    }
+
+    /// TX attenuation while transmitting (only the Pluto has one).
+    pub fn set_attenuation(&self, db: f32) -> Result<()> {
+        let _ = db;
+        match self {
+            #[cfg(feature = "pluto")]
+            Radio::Pluto(r) => r.set_attenuation(f64::from(db)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Blocks the Pluto's link was late with (the DAC sent gaps); 0 for the
+    /// others, whose own clock pulls the samples.
+    pub fn link_short(&self) -> u64 {
+        match self {
+            #[cfg(feature = "pluto")]
+            Radio::Pluto(r) => r.counters.link_short.load(Ordering::Relaxed),
+            _ => 0,
         }
     }
 
@@ -259,6 +286,8 @@ impl Radio {
             Radio::Virtual(_) => shared.stats.stopped.load(Ordering::Acquire),
             #[cfg(feature = "hackrf")]
             Radio::HackRf(r) => r.counters.stopped.load(Ordering::Acquire),
+            #[cfg(feature = "pluto")]
+            Radio::Pluto(r) => r.counters.stopped.load(Ordering::Acquire),
         }
     }
 
@@ -268,6 +297,8 @@ impl Radio {
             Radio::Virtual(_) => shared.stats.error.lock().unwrap().clone(),
             #[cfg(feature = "hackrf")]
             Radio::HackRf(r) => r.counters.error.lock().unwrap().clone(),
+            #[cfg(feature = "pluto")]
+            Radio::Pluto(r) => r.counters.error.lock().unwrap().clone(),
         }
     }
 
@@ -277,6 +308,8 @@ impl Radio {
             Radio::Virtual(_) => shared.stats.bytes_out.load(Ordering::Relaxed),
             #[cfg(feature = "hackrf")]
             Radio::HackRf(r) => r.counters.bytes.load(Ordering::Relaxed),
+            #[cfg(feature = "pluto")]
+            Radio::Pluto(r) => r.counters.bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -322,6 +355,47 @@ pub fn open_hackrf(
     Err(decdvbt_core::Error::Other(
         "built without the hackrf feature".into(),
     ))
+}
+
+/// Open the Pluto and start transmitting from `shared`'s ring. **The only
+/// place the Pluto is opened for transmit.** The attenuation is the config's
+/// (89.75 dB unless the user lowered it); the TX LO comes up only once the
+/// first block is in the DAC's buffer.
+#[cfg(feature = "pluto")]
+pub fn open_pluto(
+    proof: ArmedProof,
+    cfg: &TxConfig,
+    pluto: &PlutoTxConfig,
+    shared: Arc<RadioShared>,
+) -> Result<Radio> {
+    let _used_up = proof;
+    if cfg!(test) || std::env::var_os(NO_RADIO_ENV).is_some() {
+        return Err(Error::Other(format!(
+            "the radio is disabled ({NO_RADIO_ENV} is set, or this is a test build)"
+        )));
+    }
+    let uri: decdvbt_io::PlutoUri = pluto.uri.parse().map_err(Error::Other)?;
+    let settings = decdvbt_io::PlutoTxSettings {
+        uri,
+        center_hz: cfg.centre_hz,
+        sample_rate: f64::from(cfg.sample_rate_hz()),
+        bandwidth: pluto.bandwidth_hz.map(f64::from),
+        attenuation_db: f64::from(pluto.attenuation_db),
+    };
+    let tx = decdvbt_io::PlutoTx::start(settings, move |out| pull(&shared, out))?;
+    Ok(Radio::Pluto(tx))
+}
+
+/// Without the `pluto` feature there is no Pluto to open.
+#[cfg(not(feature = "pluto"))]
+pub fn open_pluto(
+    proof: ArmedProof,
+    cfg: &TxConfig,
+    pluto: &PlutoTxConfig,
+    shared: Arc<RadioShared>,
+) -> Result<Radio> {
+    let _ = (proof, cfg, pluto, shared);
+    Err(Error::Other("built without the pluto feature".into()))
 }
 
 #[cfg(test)]
@@ -425,6 +499,19 @@ mod tests {
         let cfg = TxConfig::new("x.mp4".into());
         let s = shared(1, 4);
         let e = open_hackrf(proof, &cfg, &HackRfTxConfig::default(), s)
+            .err()
+            .expect("must refuse");
+        assert!(e.to_string().contains("disabled") || e.to_string().contains("without"));
+    }
+
+    #[test]
+    fn the_pluto_is_refused_in_tests_even_with_a_proof() {
+        let mut arm = crate::arm::Arm::new();
+        arm.arm(crate::arm::LicenceAck::accept(crate::arm::LICENCE_WARNING).unwrap());
+        let proof = arm.take().unwrap();
+        let cfg = TxConfig::new("x.mp4".into());
+        let s = shared(1, 4);
+        let e = open_pluto(proof, &cfg, &PlutoTxConfig::default(), s)
             .err()
             .expect("must refuse");
         assert!(e.to_string().contains("disabled") || e.to_string().contains("without"));

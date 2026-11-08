@@ -14,8 +14,9 @@ name = "decdvbt-tx"
 path = "src/main.rs"
 
 [features]
-default = ["hackrf"]
+default = ["hackrf", "pluto"]
 hackrf = ["decdvbt-tx/hackrf"]
+pluto = ["decdvbt-tx/pluto"]
 
 [dependencies]
 decdvbt-core = { path = "../../crates/decdvbt-core" }

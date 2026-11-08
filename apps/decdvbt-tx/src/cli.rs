@@ -113,10 +113,11 @@ impl Options {
                         s if s.starts_with("iq:") && s.len() > 3 => {
                             SinkArg::IqFile(PathBuf::from(&s[3..]))
                         }
-                        "hackrf" => {
-                            return Err("there is no --sink hackrf: choose the HackRF output \
-                                        in the window and use ARM, then TRANSMIT"
-                                .into());
+                        "hackrf" | "pluto" => {
+                            return Err(format!(
+                                "there is no --sink {t}: choose the radio output in the \
+                                 window and use ARM, then TRANSMIT"
+                            ));
                         }
                         other => return Err(format!("not a sink: {other} (null or iq:PATH)")),
                     });

@@ -29,6 +29,8 @@ pub use hackrf::{HackRfControl, HackRfGains, HackRfSettings, HackRfSource};
 #[cfg(feature = "hackrf")]
 pub use hackrf_tx::{HackRfTx, HackRfTxSettings};
 #[cfg(feature = "pluto")]
+pub use pluto::tx::{PlutoTx, PlutoTxCounters, PlutoTxSettings};
+#[cfg(feature = "pluto")]
 pub use pluto::{
     EightBit, PlutoControl, PlutoGain, PlutoInfo, PlutoSettings, PlutoSource, PlutoUri,
 };

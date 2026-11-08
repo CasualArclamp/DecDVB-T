@@ -53,12 +53,39 @@ pub enum TxSink {
     },
     /// The HackRF One. Reachable only through [`crate::arm::Arm`].
     HackRf(HackRfTxConfig),
+    /// An ADALM-PLUTO / Pluto+. Reachable only through [`crate::arm::Arm`].
+    Pluto(PlutoTxConfig),
 }
 
 impl TxSink {
     /// Whether this sink radiates.
     pub fn is_radio(&self) -> bool {
-        matches!(self, TxSink::HackRf(_))
+        matches!(self, TxSink::HackRf(_) | TxSink::Pluto(_))
+    }
+}
+
+/// The Pluto's transmit settings. The defaults are the safe ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlutoTxConfig {
+    /// `auto`, `usb` or `ip:ADDRESS` (as the receiver's `--pluto-uri`).
+    pub uri: String,
+    /// TX attenuation, 0 (full power, about +7 dBm) to 89.75 dB. Starts at
+    /// 89.75.
+    pub attenuation_db: f32,
+    /// The TX analogue filter, Hz; `None` follows the sample rate.
+    pub bandwidth_hz: Option<u32>,
+}
+
+/// The Pluto's most attenuation, dB.
+pub const PLUTO_ATTEN_MAX_DB: f32 = 89.75;
+
+impl Default for PlutoTxConfig {
+    fn default() -> Self {
+        PlutoTxConfig {
+            uri: "auto".into(),
+            attenuation_db: PLUTO_ATTEN_MAX_DB,
+            bandwidth_hz: None,
+        }
     }
 }
 
@@ -299,7 +326,7 @@ impl TxConfig {
         let hz = self.sample_rate_hz();
         if !(2_000_000..=20_000_000).contains(&hz) {
             return Err(Error::Other(format!(
-                "sample rate {hz} Hz is outside the HackRF's 2 to 20 MS/s"
+                "sample rate {hz} Hz is outside the radios' 2 to 20 MS/s"
             )));
         }
         if (hz as f64) < self.native_rate_hz() * 0.999 {
@@ -309,6 +336,16 @@ impl TxConfig {
         }
         if !(1_000_000.0..=6_000_000_000.0).contains(&self.centre_hz) {
             return Err(Error::Other("centre is outside 1 MHz to 6 GHz".into()));
+        }
+        if let TxSink::Pluto(p) = &self.sink {
+            // The AD9361's synthesiser (an AD9363 Pluto that was not unlocked
+            // refuses outside 325-3800 MHz when it is opened).
+            if !(70_000_000.0..=6_000_000_000.0).contains(&self.centre_hz) {
+                return Err(Error::Other("the Pluto tunes 70 MHz to 6 GHz".into()));
+            }
+            if !(0.0..=PLUTO_ATTEN_MAX_DB).contains(&p.attenuation_db) {
+                return Err(Error::Other("Pluto attenuation is 0 to 89.75 dB".into()));
+            }
         }
         if !(-30.0..=-6.0).contains(&self.level_dbfs) {
             return Err(Error::Other("level must be -30 to -6 dBFS".into()));

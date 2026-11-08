@@ -1969,3 +1969,23 @@ modes. **Not verified live.**
 - IIOD reports no overrun, so the reader counts the shortfall of samples
   against the time gone (`link_lost`, part of `lost()`, the drops the apps
   show) and logs once when the link cannot carry the rate.
+
+## Pluto transmit (2026-11-08)
+
+- `decdvbt-io/src/pluto/tx.rs`: `PlutoTx`, IIOD `WRITEBUF` (libiio 0.25:
+  `0` when iiod is ready, the bytes, then the count) to
+  `cf-ad9361-dds-core-lpc` voltage0/1, cs8 shifted to the DAC's top bits,
+  one 1/30 s kernel buffer a write, 4 queued. Below 2.083 MS/s the FPGA's ×8
+  interpolator. Attenuation 0–89.75 dB (`out voltage0 hardwaregain`).
+- Safety: the TX LO comes up only after the first block is in the buffer;
+  dropping the session powers it down and puts the attenuation at 89.75 dB
+  (under the lock the writer's own LO writes take, so it is never undone).
+  If a receive-only open on the same Pluto powers the LO down mid-session,
+  the writer puts it back within a second (full duplex over the network).
+- The link: written blocks against the time gone (`link_short`); shown in
+  red in the TX window. 64/7 MS/s 16-bit is above a plain Pluto's USB.
+- TX app: output "ADALM-PLUTO / Pluto+ (radio)", link field, attenuation
+  slider (89.75 dB at every start, live steps of at most 6 dB), banner with
+  the attenuation. Behind the same arm; `open_pluto` is the only opener and
+  refuses in tests and under `DECDVBT_TX_NO_RADIO`.
+- Tested against the fake IIOD server only; never keyed here.

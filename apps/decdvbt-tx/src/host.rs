@@ -44,6 +44,8 @@ pub enum Cmd {
     /// Stop everything and forget the session.
     Stop,
     SetVga(u16),
+    /// The Pluto's attenuation, dB.
+    SetAtten(f32),
     Quit,
 }
 
@@ -284,6 +286,15 @@ fn handle(cmd: Cmd, session: &mut Option<TxSession>, shared: &Mutex<Shared>) {
                 match guarded(|| s.set_txvga(db)) {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => problem(shared, format!("TX VGA: {e}"), false),
+                    Err(e) => problem(shared, e, false),
+                }
+            }
+        }
+        Cmd::SetAtten(db) => {
+            if let Some(s) = session.as_mut() {
+                match guarded(|| s.set_attenuation(db)) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => problem(shared, format!("Pluto attenuation: {e}"), false),
                     Err(e) => problem(shared, e, false),
                 }
             }

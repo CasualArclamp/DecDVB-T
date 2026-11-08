@@ -17,8 +17,9 @@ use decdvbt_tx::modes::{
     t2_mode_table, t2_rate,
 };
 use decdvbt_tx::{
-    AudioCodec, EncoderChoice, HackRfTxConfig, LICENCE_WARNING, LicenceAck, ServiceInfo, TxConfig,
-    TxRate, TxSink, TxState, TxStatus, VideoCodec, VideoSettings, mode_table,
+    AudioCodec, EncoderChoice, HackRfTxConfig, LICENCE_WARNING, LicenceAck, PlutoTxConfig,
+    ServiceInfo, TxConfig, TxRate, TxSink, TxState, TxStatus, VideoCodec, VideoSettings,
+    mode_table,
 };
 use eframe::egui::{self, Color32, RichText, vec2};
 
@@ -48,6 +49,7 @@ enum SinkKind {
     Test,
     IqFile,
     HackRf,
+    Pluto,
 }
 
 impl SinkKind {
@@ -56,6 +58,7 @@ impl SinkKind {
             SinkKind::Test => "Test only (no output)",
             SinkKind::IqFile => "IQ file",
             SinkKind::HackRf => "HackRF (radio)",
+            SinkKind::Pluto => "ADALM-PLUTO / Pluto+ (radio)",
         }
     }
 }
@@ -102,6 +105,11 @@ pub struct App {
     txvga: u16,
     vga_sent: u16,
     amp: bool,
+    /// The Pluto: its link (`auto`, `usb`, `ip:ADDRESS`), and the attenuation
+    /// the slider asks for and the last value sent.
+    pluto_uri: String,
+    atten: f32,
+    atten_sent: f32,
 
     /// The session as last published (or an idle one).
     status: TxStatus,
@@ -198,6 +206,9 @@ impl App {
             iq_seconds: String::new(),
             txvga: 0,
             vga_sent: 0,
+            pluto_uri: "auto".into(),
+            atten: safety::ATTEN_MAX,
+            atten_sent: safety::ATTEN_MAX,
             amp: false,
             status: TxStatus::idle(&TxConfig::new("none.mp4".into()), &decdvbt_tx::Arm::new()),
             session: false,
@@ -253,7 +264,7 @@ impl App {
     // ---- state helpers -------------------------------------------------
 
     fn sink_is_radio(&self) -> bool {
-        self.sink == SinkKind::HackRf
+        matches!(self.sink, SinkKind::HackRf | SinkKind::Pluto)
     }
 
     /// The form is locked: a session exists (or a demo pretends one).
@@ -336,13 +347,28 @@ impl App {
                 // the radio's narrowest (1.75 MHz) for 1 and 1.7 MHz.
                 baseband_filter_hz: Some(baseband_filter_hz(self.bandwidth())),
             }),
+            SinkKind::Pluto => TxSink::Pluto(PlutoTxConfig {
+                uri: self.pluto_uri.trim().to_string(),
+                attenuation_db: self.atten,
+                // The AD9361's TX filter follows the channel too.
+                bandwidth_hz: Some(baseband_filter_hz(self.bandwidth())),
+            }),
         };
         Some(c)
     }
 
     fn set_error(&mut self, text: String, from_radio_start: bool) {
-        let hint = (from_radio_start && self.sink_is_radio() && !text.contains("not armed"))
-            .then(|| "Close DecDVB-T (or whatever holds the HackRF) and try again.".to_string());
+        let hint =
+            (from_radio_start && self.sink_is_radio() && !text.contains("not armed")).then(|| {
+                if self.sink == SinkKind::Pluto {
+                    "Is the Pluto plugged in, with ADI's USB driver (or reachable at \
+                     192.168.2.1)? Over USB only one program can use it: close DecDVB-T's \
+                     Pluto source, or use ip:192.168.2.1 in both."
+                        .to_string()
+                } else {
+                    "Close DecDVB-T (or whatever holds the HackRF) and try again.".to_string()
+                }
+            });
         self.error = Some(ErrorStrip { text, hint });
     }
 
@@ -391,6 +417,7 @@ impl App {
         self.trend.clear();
         self.read_ack = false;
         self.vga_sent = self.txvga;
+        self.atten_sent = self.atten;
         self.session_cfg = Some(cfg.clone());
         self.session = true;
         self.waiting = Some(Instant::now());
@@ -571,6 +598,9 @@ impl App {
         self.was_armed = self.status.armed;
         if self.status.state != TxState::Transmitting {
             self.vga_sent = self.status.txvga_db;
+            if self.sink == SinkKind::Pluto {
+                self.atten_sent = self.status.atten_db;
+            }
         }
     }
 
@@ -600,6 +630,16 @@ impl App {
             let next = safety::vga_step(self.vga_sent, self.txvga);
             h.send(Cmd::SetVga(next));
             self.vga_sent = next;
+            ctx.request_repaint_after(Duration::from_millis(60));
+        }
+        if self.sink == SinkKind::Pluto
+            && self.status.state == TxState::Transmitting
+            && self.atten_sent != self.atten
+            && let Some(h) = &self.host
+        {
+            let next = safety::atten_step(self.atten_sent, self.atten);
+            h.send(Cmd::SetAtten(next));
+            self.atten_sent = next;
             ctx.request_repaint_after(Duration::from_millis(60));
         }
     }
@@ -950,7 +990,11 @@ impl App {
             .session_cfg
             .as_ref()
             .map_or(self.set.centre_hz, |c| c.centre_hz);
-        let Some(text) = safety::banner(&self.status, centre) else {
+        let pluto = self
+            .session_cfg
+            .as_ref()
+            .is_some_and(|c| matches!(c.sink, TxSink::Pluto(_)));
+        let Some(text) = safety::banner(&self.status, centre, pluto) else {
             return;
         };
         egui::Frame::new()
@@ -1291,6 +1335,49 @@ impl App {
         // The amp is set before Prepare; the VGA is also live while transmitting.
         let idle = !self.locked();
         let live = radio && st == TxState::Transmitting && !self.stopping;
+        if self.sink == SinkKind::Pluto {
+            ui.horizontal(|ui| {
+                ui.label("Attenuation");
+                let r = ui.add_enabled(
+                    idle || live,
+                    egui::Slider::new(&mut self.atten, safety::ATTEN_MAX..=0.0)
+                        .step_by(0.25)
+                        .suffix(" dB"),
+                );
+                r.on_hover_text(
+                    "89.75 dB at every start. Set before Prepare, or live while transmitting \
+                     (it moves in steps of at most 6 dB). 0 dB is the Pluto's full power, \
+                     about +7 dBm",
+                );
+            });
+            if live && self.atten != self.status.atten_db {
+                ui.label(
+                    RichText::new(format!(
+                        "   now {:.2} dB, moving to {:.2}",
+                        self.atten_sent, self.atten
+                    ))
+                    .color(AMBER),
+                );
+            }
+            if self.status.link_short > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "   the link was late {} blocks: the Pluto sent gaps. Use a lower \
+                         rate, or a Pluto+ on Ethernet",
+                        self.status.link_short
+                    ))
+                    .color(RED),
+                );
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Level {:.0} dBFS (Advanced...)",
+                    self.set.level_dbfs
+                ))
+                .weak(),
+            );
+            return;
+        }
         ui.add_enabled_ui(radio, |ui| {
             ui.horizontal(|ui| {
                 ui.label("TX VGA");
@@ -1318,7 +1405,7 @@ impl App {
             }
         });
         if !radio {
-            ui.label(RichText::new("(the HackRF output is not selected)").weak());
+            ui.label(RichText::new("(no radio output is selected)").weak());
         }
         ui.label(
             RichText::new(format!(
@@ -1500,7 +1587,7 @@ impl App {
                 let paced = match &self.session_cfg {
                     Some(c) => match &c.sink {
                         TxSink::Null { paced } | TxSink::IqFile { paced, .. } => *paced,
-                        TxSink::HackRf(_) => true,
+                        TxSink::HackRf(_) | TxSink::Pluto(_) => true,
                     },
                     None => true,
                 };
@@ -1640,7 +1727,12 @@ impl App {
                 egui::ComboBox::from_id_salt("sink")
                     .selected_text(self.sink.label())
                     .show_ui(ui, |ui| {
-                        for k in [SinkKind::Test, SinkKind::IqFile, SinkKind::HackRf] {
+                        for k in [
+                            SinkKind::Test,
+                            SinkKind::IqFile,
+                            SinkKind::HackRf,
+                            SinkKind::Pluto,
+                        ] {
                             ui.selectable_value(&mut self.sink, k, k.label());
                         }
                     });
@@ -1683,6 +1775,22 @@ impl App {
                     ui.label(
                         RichText::new("HackRF: this radiates when TRANSMIT is pressed")
                             .color(AMBER),
+                    );
+                }
+                SinkKind::Pluto => {
+                    ui.label("link");
+                    ui.add_enabled(
+                        !locked,
+                        egui::TextEdit::singleline(&mut self.pluto_uri)
+                            .desired_width(130.0)
+                            .hint_text("auto"),
+                    )
+                    .on_hover_text(
+                        "auto (USB with ADI's driver, else 192.168.2.1), usb, or ip:ADDRESS \
+                         (a Pluto+ on Ethernet)",
+                    );
+                    ui.label(
+                        RichText::new("Pluto: this radiates when TRANSMIT is pressed").color(AMBER),
                     );
                 }
             }
@@ -1935,5 +2043,25 @@ mod tests {
         assert!(!app.read_ack);
         assert!(!app.status.armed);
         assert_eq!((app.txvga, app.amp), (0, false));
+        assert_eq!(app.atten, 89.75);
+    }
+
+    #[test]
+    fn the_pluto_output_starts_at_the_most_attenuation() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(Options::default(), &ctx);
+        app.file = Some(PathBuf::from("C:/v/clip.mp4"));
+        app.sink = SinkKind::Pluto;
+        assert!(app.sink_is_radio());
+        let c = app.build_config().unwrap();
+        match c.sink {
+            TxSink::Pluto(p) => {
+                assert_eq!(p.attenuation_db, 89.75);
+                assert_eq!(p.uri, "auto");
+                assert_eq!(p.bandwidth_hz, Some(8_000_000));
+            }
+            _ => panic!("expected the Pluto sink"),
+        }
+        assert!(!app.status.armed && !app.status.radiating);
     }
 }

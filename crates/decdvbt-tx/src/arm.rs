@@ -8,7 +8,7 @@
 //!    exact warning text the user was shown.
 //! 2. An arm lapses after [`ARM_TIMEOUT`], and is used up by one transmission:
 //!    [`Arm::take`] hands out an [`ArmedProof`] and disarms.
-//! 3. `radio::open_hackrf` needs an `ArmedProof` by value. Its field is private
+//! 3. `radio::open_hackrf` and `radio::open_pluto` need an `ArmedProof` by value. Its field is private
 //!    to this module, so no other code can make one.
 //! 4. Nothing here is persisted or read from arguments or the environment.
 //!
@@ -152,11 +152,14 @@ mod tests {
             ("ts_source.rs", include_str!("ts_source.rs")),
         ];
         // Built from pieces so this test's own text does not match.
-        let needle = ["HackRfTx", "::start"].concat();
+        let needles = [
+            ["HackRfTx", "::start"].concat(),
+            ["PlutoTx", "::start"].concat(),
+        ];
         let proof = ["ArmedProof", "(())"].concat();
         for (name, text) in files {
             assert!(
-                !text.contains(&needle) || name == "arm.rs",
+                needles.iter().all(|n| !text.contains(n.as_str())) || name == "arm.rs",
                 "{name} opens the radio"
             );
             if name != "arm.rs" {

@@ -38,6 +38,17 @@ pub fn can_transmit(status: &TxStatus, armed: bool, sink_is_radio: bool) -> bool
     status.state == TxState::Ready && (armed || !sink_is_radio)
 }
 
+/// The Pluto's most attenuation, dB.
+pub const ATTEN_MAX: f32 = decdvbt_tx::PLUTO_ATTEN_MAX_DB;
+
+/// One step of the Pluto's attenuation from `current` toward `target`, at
+/// most [`VGA_STEP_MAX`] dB (as the TX VGA).
+pub fn atten_step(current: f32, target: f32) -> f32 {
+    let (current, target) = (current.clamp(0.0, ATTEN_MAX), target.clamp(0.0, ATTEN_MAX));
+    let max = f32::from(VGA_STEP_MAX);
+    current + (target - current).clamp(-max, max)
+}
+
 /// One step of the TX VGA from `current` toward `target` (both clamped to the
 /// range), at most [`VGA_STEP_MAX`] dB.
 pub fn vga_step(current: u16, target: u16) -> u16 {
@@ -51,8 +62,15 @@ pub fn vga_step(current: u16, target: u16) -> u16 {
 
 /// The big red banner: only while the radio is keyed (`status.radiating`, the
 /// library's flag, and nothing else).
-pub fn banner(status: &TxStatus, centre_hz: f64) -> Option<String> {
+pub fn banner(status: &TxStatus, centre_hz: f64, pluto: bool) -> Option<String> {
     status.radiating.then(|| {
+        if pluto {
+            return format!(
+                "TRANSMITTING - {:.3} MHz - Pluto attenuation {:.2} dB",
+                centre_hz / 1e6,
+                status.atten_db
+            );
+        }
         format!(
             "TRANSMITTING - {:.3} MHz - TX VGA {} dB - amp {}",
             centre_hz / 1e6,
@@ -181,22 +199,22 @@ mod tests {
     fn the_banner_is_the_radiating_flag_and_nothing_else() {
         let mut s = status(TxState::Transmitting);
         // Transmitting to a test sink: no banner.
-        assert_eq!(banner(&s, 546e6), None);
+        assert_eq!(banner(&s, 546e6, false), None);
         assert_eq!(window_title(&s), "DecDVB-T TX");
         s.radiating = true;
         s.txvga_db = 12;
         s.amp = false;
         assert_eq!(
-            banner(&s, 546e6).as_deref(),
+            banner(&s, 546e6, false).as_deref(),
             Some("TRANSMITTING - 546.000 MHz - TX VGA 12 dB - amp off")
         );
         assert_eq!(window_title(&s), "TRANSMITTING - DecDVB-T TX");
         s.amp = true;
-        assert!(banner(&s, 546e6).unwrap().ends_with("amp on"));
+        assert!(banner(&s, 546e6, false).unwrap().ends_with("amp on"));
         // Even Ready or Failed with the flag up would show it: the flag is
         // the library's statement that the radio is keyed.
         s.state = TxState::Failed;
-        assert!(banner(&s, 546e6).is_some());
+        assert!(banner(&s, 546e6, false).is_some());
     }
 
     #[test]
@@ -228,5 +246,23 @@ mod tests {
         s.armed = true;
         s.arm_seconds_left = Some(46.2);
         assert_eq!(arm_text(&s), "ARMED, lapses in 47 s");
+    }
+
+    #[test]
+    fn the_pluto_banner_and_attenuation_steps() {
+        let mut s = TxStatus::idle(
+            &decdvbt_tx::TxConfig::new("x.mp4".into()),
+            &decdvbt_tx::Arm::new(),
+        );
+        s.radiating = true;
+        s.atten_db = 40.0;
+        assert_eq!(
+            banner(&s, 2400.25e6, true).as_deref(),
+            Some("TRANSMITTING - 2400.250 MHz - Pluto attenuation 40.00 dB")
+        );
+        // Less attenuation (more power) by at most 6 dB a step.
+        assert_eq!(atten_step(89.75, 0.0), 83.75);
+        assert_eq!(atten_step(10.0, 89.75), 16.0);
+        assert_eq!(atten_step(3.0, 0.0), 0.0);
     }
 }

@@ -50,8 +50,8 @@ pub mod ts_source;
 
 pub use arm::{Arm, ArmedProof, LICENCE_WARNING, LicenceAck};
 pub use config::{
-    AudioCodec, EncoderChoice, HackRfTxConfig, ServiceInfo, TxConfig, TxRate, TxSink, VideoCodec,
-    VideoSettings,
+    AudioCodec, EncoderChoice, HackRfTxConfig, PLUTO_ATTEN_MAX_DB, PlutoTxConfig, ServiceInfo,
+    TxConfig, TxRate, TxSink, VideoCodec, VideoSettings,
 };
 pub use modes::{ModeRow, VideoProfile, mode_table, mux_rate_bps};
 pub use preview::PreviewRow;

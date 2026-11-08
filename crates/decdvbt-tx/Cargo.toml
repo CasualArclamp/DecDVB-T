@@ -12,8 +12,10 @@ rust-version.workspace = true
 # The HackRF driver is pure Rust (no SDK, no DLLs). Without it every type here
 # still compiles; opening the radio then fails with a clear error, and the IQ
 # file and null sinks work as ever.
-default = ["hackrf"]
+default = ["hackrf", "pluto"]
 hackrf = ["decdvbt-io/hackrf"]
+# The ADALM-PLUTO / Pluto+ (IIOD over USB or TCP, pure Rust).
+pluto = ["decdvbt-io/pluto"]
 
 [dependencies]
 decdvbt-core = { path = "../decdvbt-core" }

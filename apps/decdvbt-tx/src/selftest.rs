@@ -75,6 +75,21 @@ pub fn run() -> i32 {
         let h = HackRfTxConfig::default();
         h.txvga_db == 0 && !h.amp
     });
+    check("the Pluto starts at its most attenuation and steps 6 dB", {
+        decdvbt_tx::PlutoTxConfig::default().attenuation_db == 89.75
+            && safety::atten_step(89.75, 0.0) == 83.75
+    });
+    check("the library refuses an unarmed Pluto session", {
+        let mut c = TxConfig::new("x.mp4".into());
+        c.sink = TxSink::Pluto(Default::default());
+        match TxSession::new(c) {
+            Ok(mut s) => s
+                .transmit()
+                .err()
+                .is_some_and(|e| e.to_string().contains("not armed")),
+            Err(_) => false,
+        }
+    });
     check("the library refuses an unarmed radio session", {
         let mut c = TxConfig::new("x.mp4".into());
         c.sink = TxSink::HackRf(HackRfTxConfig::default());

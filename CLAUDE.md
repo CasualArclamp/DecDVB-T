@@ -46,7 +46,9 @@ cargo run --release -p decdvbt-gui -- captures/c23_490.000MHz_10Msps_amp.cs8 --d
 cargo run -p decdvbt-gui --example make_icon                      # redraws apps/decdvbt-gui/assets/icon.ico and icon-256.png (preview in out/)
 cargo run --release -p decdvbt-gui --example retune_soak -- C23 C26 C28 --rounds 20   # HackRF: tune between channels like the GUI, time each lock
 cargo run --release -p decdvbt-rx --example splice -- A.cs8 B.cs8 24            # offline: the old channel's samples then the new one's; ACQSCAN=1 for first-attempt acquisition
-# the transmitter (docs/TX_DESIGN.md). Scripts and tests set DECDVBT_TX_NO_RADIO=1 (the library then refuses to open the HackRF); only a person pressing TRANSMIT transmits
+# the transmitter (docs/TX_DESIGN.md). Scripts and tests set DECDVBT_TX_NO_RADIO=1 (the library then refuses to open the HackRF or Pluto); only a person pressing TRANSMIT transmits
+# Pluto TX: the "ADALM-PLUTO / Pluto+ (radio)" output (link auto|usb|ip:ADDR, attenuation 89.75 dB at every start); its driver is decdvbt-io/src/pluto/tx.rs, tested against the fake IIOD server only:
+cargo test -p decdvbt-io --features pluto tx_
 cargo run --release -p decdvbt-tx-app                            # the TX window (own prefs: %APPDATA%\DecDVB-T-TX\prefs.txt, not the receiver's)
 cargo run --release -p decdvbt-tx-app -- clip.mp4 --sink null --start --run-secs 30   # a real session into nothing: prints CPU, counters, window cost (also --sink iq:PATH)
 cargo run --release -p decdvbt-tx-app -- --demo --state transmitting --screenshot out/tx.png   # a made-up status; states idle|preparing|ready|armed|transmitting|running|stuffing|trouble|failed|finished; --modes opens the mode list
@@ -96,7 +98,7 @@ package folder even before the PATH is refreshed).
   on timing.
 - Heavy test sweeps belong on CI, not on this machine.
 - **The transmitter never runs by itself** (docs/TX_DESIGN.md §6): no test,
-  example, demo or script opens the HackRF for transmit (they use the `Null` and
+  example, demo or script opens the HackRF or the Pluto for transmit (they use the `Null` and
   `IqFile` sinks and `DECDVBT_TX_NO_RADIO=1`), and `decdvbt-tx` keeps its own
   settings in `%APPDATA%\DecDVB-T-TX\prefs.txt` (never the receiver's `prefs.txt`;
   never the arm, TX VGA, amp or output). Its test hooks (`--demo`, `--screenshot`,

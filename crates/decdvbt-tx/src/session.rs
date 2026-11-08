@@ -13,7 +13,7 @@
 //! - `prepare()` starts ffmpeg and the modulator thread but never the radio:
 //!   it is safe with any sink. The rings fill to their prefill level
 //!   (0.5 s of TS, a full IQ ring) before the state becomes `Ready`.
-//! - `transmit()` starts the radio. For a `HackRf` sink it needs a live arm
+//! - `transmit()` starts the radio. For a `HackRf` or `Pluto` sink it needs a live arm
 //!   (consumed by the call); for `Null` and `IqFile` it needs none.
 //! - `stop()` (and `Drop`) stops everything and drops the radio, which puts the
 //!   HackRF into its off state. After a stop the arm is gone.
@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use decdvbt_core::{Error, Result};
 
 use crate::arm::{Arm, LicenceAck};
-use crate::config::{HackRfTxConfig, TxConfig, TxSink, VideoCodec};
+use crate::config::{HackRfTxConfig, PlutoTxConfig, TxConfig, TxSink, VideoCodec};
 use crate::cpu::CpuGauge;
 use crate::feeder::{Feeder, FeederShared};
 use crate::ffmpeg::{self, Chain, VideoInfo};
@@ -107,6 +107,11 @@ pub struct TxStatus {
     pub sample_rate_hz: u32,
     pub txvga_db: u16,
     pub amp: bool,
+    /// The Pluto's TX attenuation, dB (0 for the other sinks).
+    pub atten_db: f32,
+    /// Blocks the Pluto's link was late with, so the DAC sent gaps: must
+    /// stay 0 (a rate above what its USB carries).
+    pub link_short: u64,
     /// Seconds of signal given to the radio.
     pub sent_s: f64,
     /// Seconds of programme ffmpeg has encoded.
@@ -154,6 +159,10 @@ impl TxStatus {
             TxSink::HackRf(h) => (h.txvga_db, h.amp),
             _ => (0, false),
         };
+        let atten_db = match &cfg.sink {
+            TxSink::Pluto(p) => p.attenuation_db,
+            _ => 0.0,
+        };
         TxStatus {
             state: TxState::Idle,
             error: None,
@@ -163,6 +172,8 @@ impl TxStatus {
             sample_rate_hz: cfg.sample_rate_hz(),
             txvga_db,
             amp,
+            atten_db,
+            link_short: 0,
             sent_s: 0.0,
             programme_s: 0.0,
             ts_rate_bps: cfg.ts_rate_bps(),
@@ -600,6 +611,8 @@ pub struct TxSession {
     pipeline: Option<Pipeline>,
     /// The TX VGA now (it can change while transmitting).
     live_txvga: u16,
+    /// The Pluto's attenuation now (likewise).
+    live_atten: f32,
     cpu: CpuGauge,
     ts_dump: Option<PathBuf>,
 }
@@ -612,11 +625,16 @@ impl TxSession {
             TxSink::HackRf(h) => h.txvga_db,
             _ => 0,
         };
+        let live_atten = match &config.sink {
+            TxSink::Pluto(p) => p.attenuation_db,
+            _ => crate::config::PLUTO_ATTEN_MAX_DB,
+        };
         Ok(TxSession {
             config,
             arm: Arm::new(),
             pipeline: None,
             live_txvga,
+            live_atten,
             cpu: CpuGauge::new(),
             ts_dump: None,
         })
@@ -739,6 +757,16 @@ impl TxSession {
                 };
                 radio::open_hackrf(proof, &self.config, &h, shared)?
             }
+            TxSink::Pluto(pc) => {
+                let Some(proof) = proof else {
+                    return Err(Error::Other("not armed".into()));
+                };
+                let pc = PlutoTxConfig {
+                    attenuation_db: self.live_atten,
+                    ..pc.clone()
+                };
+                radio::open_pluto(proof, &self.config, &pc, shared)?
+            }
             sink => Radio::Virtual(VirtualRadio::start(
                 shared,
                 sink,
@@ -772,6 +800,19 @@ impl TxSession {
         Ok(())
     }
 
+    /// The Pluto's TX attenuation while transmitting (Pluto sink; 0 to
+    /// 89.75 dB). Before the radio is open this sets where it will start.
+    pub fn set_attenuation(&mut self, db: f32) -> Result<()> {
+        let db = db.clamp(0.0, crate::config::PLUTO_ATTEN_MAX_DB);
+        if let Some(p) = &self.pipeline
+            && let Some(r) = p.core.radio.lock().unwrap().as_ref()
+        {
+            r.set_attenuation(db)?;
+        }
+        self.live_atten = db;
+        Ok(())
+    }
+
     /// A snapshot.
     pub fn status(&mut self) -> TxStatus {
         let Some(p) = &mut self.pipeline else {
@@ -791,11 +832,12 @@ impl TxSession {
             );
         }
 
-        let (radio_open, bytes_out) = {
+        let (radio_open, bytes_out, link_short) = {
             let g = core.radio.lock().unwrap();
             (
                 g.is_some(),
                 g.as_ref().map(|r| r.bytes_out(&core.radio_shared)),
+                g.as_ref().map_or(0, |r| r.link_short()),
             )
         };
         // After the radio is gone (finished) the virtual radio's count stays.
@@ -832,6 +874,10 @@ impl TxSession {
             TxSink::HackRf(h) => (self.live_txvga, h.amp),
             _ => (0, false),
         };
+        let atten_db = match &self.config.sink {
+            TxSink::Pluto(_) => self.live_atten,
+            _ => 0.0,
+        };
         TxStatus {
             state,
             error: core.error.lock().unwrap().clone(),
@@ -841,6 +887,8 @@ impl TxSession {
             sample_rate_hz: self.config.sample_rate_hz(),
             txvga_db,
             amp,
+            atten_db,
+            link_short,
             sent_s: bytes_out as f64 / 2.0 / rate_hz,
             programme_s: programme_us as f64 * 1e-6,
             ts_rate_bps: self.config.ts_rate_bps(),
@@ -940,6 +988,16 @@ mod tests {
         // And it can be prepared again.
         s.prepare().unwrap();
         s.stop();
+    }
+
+    #[test]
+    fn a_pluto_session_cannot_transmit_unarmed() {
+        let mut cfg = TxConfig::new("x.mp4".into());
+        cfg.sink = TxSink::Pluto(Default::default());
+        let mut s = TxSession::new(cfg).unwrap();
+        let e = s.transmit().unwrap_err();
+        assert!(e.to_string().contains("not armed"));
+        assert_eq!(s.status().atten_db, 89.75, "starts at the most attenuation");
     }
 
     #[test]
