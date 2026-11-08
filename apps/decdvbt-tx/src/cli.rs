@@ -20,14 +20,18 @@ use decdvbt_core::channel::{parse_channel, uhf_centre_hz};
 use decdvbt_core::dvbt::Mode;
 
 use crate::demo::DemoState;
+use crate::settings::SourceKind;
 use decdvbt_tx::modes::T2Config;
 
 pub const USAGE: &str = concat!(
-    "usage: decdvbt-tx [FILE] [--mode 64qam-2/3-8k-1/32] [--channel C30]\n",
+    "usage: decdvbt-tx [FILE] [--source camera[:NAME]|test|file:PATH|ts:PATH|udp:ADDR]\n",
+    "                  [--codec h264|h265|h266|av1|mpeg2] [--mode 64qam-2/3-8k-1/32] [--channel C30]\n",
     "                  [--t2 8k-1/16-16qam-3/4] [--freq-mhz 433.25]\n",
     "                  [--sink null|iq:PATH [--start] [--run-secs N]]\n",
     "                  [--demo [--state STATE]] [--screenshot OUT.png [--after SECS]]\n",
     "                  [--size WxH] [--modes] [--selftest] [--version]\n",
+    "  --source S     what to send (default: as last time); a bare FILE is file:FILE\n",
+    "  --codec C      the video codec\n",
     "  --start        prepare, then transmit by itself: only with --sink null or iq:PATH\n",
     "  --run-secs N   with --start: stop after N seconds of signal (default 30), print\n",
     "                 the counters and exit\n",
@@ -51,6 +55,9 @@ pub enum SinkArg {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Options {
     pub file: Option<PathBuf>,
+    /// `--source`: the kind, and its name, path or address.
+    pub source: Option<(SourceKind, String)>,
+    pub codec: Option<decdvbt_tx::VideoCodec>,
     pub mode: Option<Mode>,
     /// `--t2`: send DVB-T2 at 1.7 MHz in this mode.
     pub t2: Option<T2Config>,
@@ -122,6 +129,29 @@ impl Options {
                         other => return Err(format!("not a sink: {other} (null or iq:PATH)")),
                     });
                 }
+                "--source" => {
+                    let t = value("camera[:NAME], test, file:PATH, ts:PATH or udp:ADDR")?;
+                    let (kind, rest) = match t.split_once(':') {
+                        Some((k, r)) => (k, r.to_string()),
+                        None => (t.as_str(), String::new()),
+                    };
+                    let k = SourceKind::from_key(kind).ok_or(format!(
+                        "not a source: {t} (camera, test, file:, ts:, udp:)"
+                    ))?;
+                    if matches!(k, SourceKind::File | SourceKind::TsFile | SourceKind::Udp)
+                        && rest.is_empty()
+                    {
+                        return Err(format!("--source {kind}: needs a value after the colon"));
+                    }
+                    o.source = Some((k, rest));
+                }
+                "--codec" => {
+                    let t = value("h264, h265, h266, av1 or mpeg2")?;
+                    o.codec = Some(
+                        decdvbt_tx::VideoCodec::from_key(&t)
+                            .ok_or(format!("not a codec: {t} (h264, h265, h266, av1, mpeg2)"))?,
+                    );
+                }
                 "--start" => o.start = true,
                 "--run-secs" => {
                     let s: f64 = value("seconds")?
@@ -177,8 +207,11 @@ impl Options {
         if o.start && o.demo {
             return Err("--start and --demo do not go together".into());
         }
-        if o.start && o.file.is_none() {
-            return Err("--start needs a FILE".into());
+        if o.start && o.file.is_none() && o.source.is_none() {
+            return Err("--start needs a FILE or a --source".into());
+        }
+        if o.file.is_some() && o.source.is_some() {
+            return Err("a FILE and --source do not go together (use --source file:FILE)".into());
         }
         if o.state.is_some() && !o.demo {
             return Err("--state needs --demo".into());
@@ -247,6 +280,22 @@ mod tests {
         assert_eq!(o.run_secs, Some(10.0));
         let o = parse("clip.mp4 --sink iq:out/x.cs8 --start").unwrap();
         assert_eq!(o.sink, Some(SinkArg::IqFile("out/x.cs8".into())));
+    }
+
+    #[test]
+    fn sources_and_codecs() {
+        let o = parse("--source test --codec h265").unwrap();
+        assert_eq!(o.source, Some((SourceKind::Test, String::new())));
+        assert_eq!(o.codec, Some(decdvbt_tx::VideoCodec::H265));
+        let o = parse("--source camera:USB2.0 --codec av1").unwrap();
+        assert_eq!(o.source, Some((SourceKind::Camera, "USB2.0".into())));
+        let o = parse("--source ts:out/x.ts --sink null --start").unwrap();
+        assert_eq!(o.source, Some((SourceKind::TsFile, "out/x.ts".into())));
+        assert!(parse("--source udp").is_err());
+        assert!(parse("--source fax").is_err());
+        assert!(parse("--codec vp9").is_err());
+        assert!(parse("--sink null --start --source test").is_ok());
+        assert!(parse("a.mp4 --source test").is_err());
     }
 
     #[test]

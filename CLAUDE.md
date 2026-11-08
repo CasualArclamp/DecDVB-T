@@ -51,6 +51,7 @@ cargo run --release -p decdvbt-rx --example splice -- A.cs8 B.cs8 24            
 cargo test -p decdvbt-io --features pluto tx_
 cargo run --release -p decdvbt-tx-app                            # the TX window (own prefs: %APPDATA%\DecDVB-T-TX\prefs.txt, not the receiver's)
 cargo run --release -p decdvbt-tx-app -- clip.mp4 --sink null --start --run-secs 30   # a real session into nothing: prints CPU, counters, window cost (also --sink iq:PATH)
+cargo run --release -p decdvbt-tx-app -- --source test --codec h265 --sink null --start --run-secs 10 --screenshot out/tx.png --after 8   # sources: camera[:NAME]|test|file:PATH|ts:PATH|udp:ADDR; codecs h264|h265|h266|av1|mpeg2 (as DecSAT TX)
 cargo run --release -p decdvbt-tx-app -- --demo --state transmitting --screenshot out/tx.png   # a made-up status; states idle|preparing|ready|armed|transmitting|running|stuffing|trouble|failed|finished; --modes opens the mode list
 cargo run --release -p decdvbt-tx-app -- --selftest              # the safety logic of the built exe, no window
 cargo run -p decdvbt-tx-app --example make_icon                  # redraws apps/decdvbt-tx/assets/icon.ico and icon-256.png

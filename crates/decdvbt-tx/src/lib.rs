@@ -37,9 +37,11 @@
 pub mod arm;
 pub mod config;
 pub mod cpu;
+pub mod encode;
 pub mod feeder;
 pub mod ffmpeg;
 pub mod iq;
+pub mod mkv;
 pub mod modes;
 pub mod preview;
 pub mod radio;
@@ -51,7 +53,7 @@ pub mod ts_source;
 pub use arm::{Arm, ArmedProof, LICENCE_WARNING, LicenceAck};
 pub use config::{
     AudioCodec, EncoderChoice, HackRfTxConfig, PLUTO_ATTEN_MAX_DB, PlutoTxConfig, ServiceInfo,
-    TxConfig, TxRate, TxSink, VideoCodec, VideoSettings,
+    Source, TxConfig, TxRate, TxSink, VideoCodec, VideoSettings,
 };
 pub use modes::{ModeRow, VideoProfile, mode_table, mux_rate_bps};
 pub use preview::PreviewRow;

@@ -280,5 +280,12 @@ pub fn rate_of(mode: &Mode) -> f64 {
 
 /// Whether the machine has an encoder chain of this kind.
 pub fn nvenc_works(ff: &Path) -> bool {
-    decdvbt_tx::ffmpeg::detect_chain(ff, decdvbt_tx::config::EncoderChoice::Nvenc, None).is_ok()
+    decdvbt_tx::ffmpeg::detect_chain(
+        ff,
+        decdvbt_tx::config::EncoderChoice::Nvenc,
+        decdvbt_tx::config::VideoCodec::H264,
+        None,
+        true,
+    )
+    .is_ok()
 }

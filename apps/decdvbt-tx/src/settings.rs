@@ -15,6 +15,58 @@ use decdvbt_core::dvbt::{Mode, Modulation};
 use decdvbt_tx::modes::{Qam, T2_FFTS, T2_QAMS, T2_RATES, T2Config, t2_guards, t2_mode, t2_rate};
 use decdvbt_tx::{AudioCodec, EncoderChoice, TxRate, VideoCodec};
 
+/// What the programme is made from (the window's SOURCE tabs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Camera,
+    File,
+    TsFile,
+    Udp,
+    Test,
+}
+
+impl SourceKind {
+    pub const ALL: [SourceKind; 5] = [
+        SourceKind::Camera,
+        SourceKind::File,
+        SourceKind::TsFile,
+        SourceKind::Udp,
+        SourceKind::Test,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceKind::Camera => "Camera",
+            SourceKind::File => "Video file",
+            SourceKind::TsFile => "TS file",
+            SourceKind::Udp => "UDP",
+            SourceKind::Test => "Test",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            SourceKind::Camera => "camera",
+            SourceKind::File => "file",
+            SourceKind::TsFile => "ts",
+            SourceKind::Udp => "udp",
+            SourceKind::Test => "test",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<SourceKind> {
+        Self::ALL.into_iter().find(|k| k.key() == s)
+    }
+
+    /// Encoded by ffmpeg (so the encoder settings matter).
+    pub fn encodes(self) -> bool {
+        matches!(
+            self,
+            SourceKind::Camera | SourceKind::File | SourceKind::Test
+        )
+    }
+}
+
 use crate::prefs;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +80,15 @@ pub struct Settings {
     pub use_t2: bool,
     pub centre_hz: f64,
     pub loop_input: bool,
+    pub source: SourceKind,
+    pub camera: String,
+    pub mic: Option<String>,
+    /// UDP listen address for the UDP source.
+    pub udp: String,
+    /// The service name, the call sign.
+    pub callsign: String,
+    /// Draw it on the picture.
+    pub overlay: bool,
     pub level_dbfs: f32,
     pub encoder: EncoderChoice,
     pub video_codec: VideoCodec,
@@ -48,6 +109,12 @@ impl Default for Settings {
             use_t2: false,
             centre_hz: 546_000_000.0,
             loop_input: true,
+            source: SourceKind::Camera,
+            camera: String::new(),
+            mic: None,
+            udp: "127.0.0.1:1234".into(),
+            callsign: String::new(),
+            overlay: false,
             level_dbfs: -12.0,
             encoder: EncoderChoice::Auto,
             video_codec: VideoCodec::H264,
@@ -137,16 +204,24 @@ fn parse_rate(s: &str) -> Option<TxRate> {
 pub fn encoder_text(e: EncoderChoice) -> &'static str {
     match e {
         EncoderChoice::Auto => "auto",
+        EncoderChoice::Cpu => "cpu",
         EncoderChoice::Nvenc => "nvenc",
-        EncoderChoice::X264 => "x264",
+        EncoderChoice::Amf => "amf",
+        EncoderChoice::Qsv => "qsv",
     }
 }
 
 fn parse_encoder(s: &str) -> Option<EncoderChoice> {
+    // "x264" is what an older version wrote for the CPU.
+    if s == "x264" {
+        return Some(EncoderChoice::Cpu);
+    }
     [
         EncoderChoice::Auto,
+        EncoderChoice::Cpu,
         EncoderChoice::Nvenc,
-        EncoderChoice::X264,
+        EncoderChoice::Amf,
+        EncoderChoice::Qsv,
     ]
     .into_iter()
     .find(|e| encoder_text(*e) == s)
@@ -157,26 +232,27 @@ pub fn audio_text(a: AudioCodec) -> &'static str {
         AudioCodec::AacLatm => "aac-latm",
         AudioCodec::AacAdts => "aac-adts",
         AudioCodec::Mp2 => "mp2",
+        AudioCodec::None => "none",
     }
 }
 
 fn parse_audio(s: &str) -> Option<AudioCodec> {
-    [AudioCodec::AacLatm, AudioCodec::AacAdts, AudioCodec::Mp2]
+    [
+        AudioCodec::AacLatm,
+        AudioCodec::AacAdts,
+        AudioCodec::Mp2,
+        AudioCodec::None,
+    ]
         .into_iter()
         .find(|a| audio_text(*a) == s)
 }
 
 pub fn video_text(v: VideoCodec) -> &'static str {
-    match v {
-        VideoCodec::H264 => "h264",
-        VideoCodec::Mpeg2 => "mpeg2",
-    }
+    v.key()
 }
 
 fn parse_video(s: &str) -> Option<VideoCodec> {
-    [VideoCodec::H264, VideoCodec::Mpeg2]
-        .into_iter()
-        .find(|v| video_text(*v) == s)
+    VideoCodec::from_key(s)
 }
 
 fn flag(text: &str, key: &str, default: bool) -> bool {
@@ -213,6 +289,14 @@ impl Settings {
                 .filter(|f| (1e6..=6e9).contains(f))
                 .unwrap_or(d.centre_hz),
             loop_input: flag(text, "loop", d.loop_input),
+            source: get("source")
+                .and_then(|s| SourceKind::from_key(&s))
+                .unwrap_or(d.source),
+            camera: get("camera").unwrap_or(d.camera),
+            mic: get("mic").filter(|s| !s.is_empty()),
+            udp: get("udp").filter(|s| !s.is_empty()).unwrap_or(d.udp),
+            callsign: get("callsign").unwrap_or(d.callsign),
+            overlay: flag(text, "overlay", d.overlay),
             level_dbfs: get("level")
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|l| (-30.0..=-6.0).contains(l))
@@ -252,6 +336,12 @@ impl Settings {
             ("standard", if self.use_t2 { "t2" } else { "dvbt" }.into()),
             ("centre_hz", format!("{:.0}", self.centre_hz)),
             ("loop", on(self.loop_input)),
+            ("source", self.source.key().into()),
+            ("camera", self.camera.clone()),
+            ("mic", self.mic.clone().unwrap_or_default()),
+            ("udp", self.udp.clone()),
+            ("callsign", self.callsign.clone()),
+            ("overlay", on(self.overlay)),
             ("level", format!("{:.1}", self.level_dbfs)),
             ("encoder", encoder_text(self.encoder).into()),
             ("video", video_text(self.video_codec).into()),
@@ -299,9 +389,15 @@ mod tests {
             use_t2: true,
             centre_hz: 618_000_000.0,
             loop_input: false,
+            source: SourceKind::Udp,
+            camera: "Integrated Camera".into(),
+            mic: Some("Microphone Array".into()),
+            udp: "239.0.0.1:5000".into(),
+            callsign: "N0CALL".into(),
+            overlay: true,
             level_dbfs: -9.5,
-            encoder: EncoderChoice::X264,
-            video_codec: VideoCodec::Mpeg2,
+            encoder: EncoderChoice::Qsv,
+            video_codec: VideoCodec::Av1,
             audio_codec: AudioCodec::Mp2,
             ffmpeg_path: Some(PathBuf::from("D:/tools/ffmpeg.exe")),
             preview: false,
@@ -313,7 +409,7 @@ mod tests {
     #[test]
     fn damaged_values_fall_back_to_the_defaults() {
         let s = Settings::from_text(
-            "window=10x10\nmode=nonsense\ncentre_hz=3\nlevel=5\nrate=12\nencoder=gpu\n",
+            "window=10x10\nmode=nonsense\ncentre_hz=3\nlevel=5\nrate=12\nencoder=gpu\nsource=fax\n",
         );
         assert_eq!(s, Settings::default());
     }

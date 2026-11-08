@@ -116,7 +116,7 @@ fn parse() -> Args {
                 a.chain = match value().as_str() {
                     "auto" => EncoderChoice::Auto,
                     "nvenc" => EncoderChoice::Nvenc,
-                    "x264" => EncoderChoice::X264,
+                    "x264" => EncoderChoice::Cpu,
                     _ => usage(),
                 }
             }

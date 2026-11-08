@@ -112,15 +112,6 @@ pub fn disarm_on_blur(unfocused_for: Option<Duration>) -> bool {
     unfocused_for.is_some_and(|d| d > BLUR_DISARM)
 }
 
-/// What the ARM button's neighbour says: how long the arm lasts.
-pub fn arm_text(status: &TxStatus) -> String {
-    match (status.armed, status.arm_seconds_left) {
-        (true, Some(s)) => format!("ARMED, lapses in {:.0} s", s.ceil().max(0.0)),
-        (true, None) => "ARMED".into(),
-        _ => "disarmed".into(),
-    }
-}
-
 /// Why a control is greyed out, for its tooltip.
 pub const STOP_FIRST: &str = "Stop first";
 
@@ -237,15 +228,6 @@ mod tests {
         assert!(!disarm_on_blur(None));
         assert!(!disarm_on_blur(Some(Duration::from_secs(4))));
         assert!(disarm_on_blur(Some(Duration::from_millis(5001))));
-    }
-
-    #[test]
-    fn the_arm_text_counts_down() {
-        let mut s = status(TxState::Ready);
-        assert_eq!(arm_text(&s), "disarmed");
-        s.armed = true;
-        s.arm_seconds_left = Some(46.2);
-        assert_eq!(arm_text(&s), "ARMED, lapses in 47 s");
     }
 
     #[test]

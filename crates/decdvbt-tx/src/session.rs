@@ -40,9 +40,9 @@ use std::time::{Duration, Instant};
 use decdvbt_core::{Error, Result};
 
 use crate::arm::{Arm, LicenceAck};
-use crate::config::{HackRfTxConfig, PlutoTxConfig, TxConfig, TxSink, VideoCodec};
+use crate::config::{HackRfTxConfig, PlutoTxConfig, Source, TxConfig, TxSink, VideoCodec};
 use crate::cpu::CpuGauge;
-use crate::feeder::{Feeder, FeederShared};
+use crate::feeder::{Feeder, FeederShared, NO_LEVEL, PreviewFrame};
 use crate::ffmpeg::{self, Chain, VideoInfo};
 use crate::iq::{IqGenerator, IqStats};
 use crate::modes::VideoProfile;
@@ -150,6 +150,9 @@ pub struct TxStatus {
     pub clipped: u64,
     /// The last lines ffmpeg said that were not progress.
     pub ffmpeg_log: Vec<String>,
+    /// The encoder's input sound level (peak, dBFS), for a camera or the
+    /// test tone.
+    pub audio_dbfs: Option<f32>,
 }
 
 impl TxStatus {
@@ -193,6 +196,7 @@ impl TxStatus {
             peak_dbfs: f32::NEG_INFINITY,
             clipped: 0,
             ffmpeg_log: Vec::new(),
+            audio_dbfs: None,
         }
     }
 }
@@ -375,14 +379,32 @@ fn produce(core: &Arc<Core>, cfg: &TxConfig, dump: Option<&Path>) -> Result<()> 
                 .into(),
         )
     })?;
-    let info = ffmpeg::probe(&ffmpeg_path, &cfg.input)?;
-    *core.info.lock().unwrap() = info.clone();
-    let chain = if cfg.video.video_codec == VideoCodec::Mpeg2 {
-        Chain::Mpeg2
+    let info = if matches!(cfg.source, Source::File) {
+        ffmpeg::probe(&ffmpeg_path, &cfg.input)?
     } else {
-        ffmpeg::detect_chain(&ffmpeg_path, cfg.video.encoder, info.as_ref())?
+        None
     };
-    *core.chain.lock().unwrap() = chain.label().to_string();
+    *core.info.lock().unwrap() = info.clone();
+    let chain = if cfg.source.encodes() {
+        // The CUDA chain keeps the frames on the card: a file only, and no
+        // call-sign overlay (drawtext needs them in memory).
+        let cuda_ok = matches!(cfg.source, Source::File) && !cfg.overlay;
+        ffmpeg::detect_chain(
+            &ffmpeg_path,
+            cfg.video.encoder,
+            cfg.video.video_codec,
+            info.as_ref(),
+            cuda_ok,
+        )?
+    } else {
+        // A transport stream is copied: no encoder to choose.
+        Chain::X264
+    };
+    *core.chain.lock().unwrap() = if cfg.source.encodes() {
+        chain.label()
+    } else {
+        "stream copy".to_string()
+    };
     if core.stop.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -393,17 +415,33 @@ fn produce(core: &Arc<Core>, cfg: &TxConfig, dump: Option<&Path>) -> Result<()> 
         profile.width = w;
         profile.height = h;
     }
-    let args = ffmpeg::command_line(
+    // The picture preview: ffmpeg connects to a socket of ours and sends the
+    // input small. Not for the card's own frames or a copied stream.
+    let preview_listener = if cfg.preview && cfg.source.encodes() && chain != Chain::NvencCuda {
+        Some(
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .map_err(|e| Error::Other(format!("preview socket: {e}")))?,
+        )
+    } else {
+        None
+    };
+    let preview_url = preview_listener
+        .as_ref()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| format!("tcp://{a}"));
+    let args = ffmpeg::command_line_with(
         cfg,
         info.as_ref(),
         chain,
         &profile,
         ffmpeg::muxer_has_nit(&ffmpeg_path),
+        preview_url.as_deref(),
     );
     tracing::debug!("ffmpeg {}", args.join(" "));
     // ffmpeg first: it takes 0.3 to 0.9 s to deliver, the modulator's
     // warm-up runs meanwhile.
-    let mut feeder = Feeder::spawn(ffmpeg_path, args, core.ts_ring.clone())?;
+    let mut feeder =
+        Feeder::spawn_with_preview(ffmpeg_path, args, core.ts_ring.clone(), preview_listener)?;
     *core.feeder.lock().unwrap() = Some(feeder.shared.clone());
 
     let pps = cfg.ts_rate_bps() / (188.0 * 8.0);
@@ -416,10 +454,10 @@ fn produce(core: &Arc<Core>, cfg: &TxConfig, dump: Option<&Path>) -> Result<()> 
             utc_offset_s: local_utc_offset_s(),
         },
         ffmpeg::service_type(
-            if chain == Chain::Mpeg2 {
-                VideoCodec::Mpeg2
-            } else {
-                VideoCodec::H264
+            match chain {
+                Chain::Mpeg2 => VideoCodec::Mpeg2,
+                Chain::Encoder(c, _) => c,
+                _ => VideoCodec::H264,
             },
             &profile,
         ),
@@ -859,16 +897,20 @@ impl TxSession {
             TxState::Preparing
         };
 
-        let (feeder_log, programme_us, speed_x100, dts) = match core.feeder.lock().unwrap().as_ref()
-        {
-            Some(f) => (
-                f.log.lock().unwrap().clone(),
-                f.out_time_us.load(Ordering::Relaxed),
-                f.speed_x100.load(Ordering::Relaxed),
-                f.dts_pcr_warnings.load(Ordering::Relaxed),
-            ),
-            None => (Vec::new(), 0, 0, 0),
-        };
+        let (feeder_log, programme_us, speed_x100, dts, audio_dbfs) =
+            match core.feeder.lock().unwrap().as_ref() {
+                Some(f) => {
+                    let bits = f.audio_dbfs_bits.load(Ordering::Relaxed);
+                    (
+                        f.log.lock().unwrap().clone(),
+                        f.out_time_us.load(Ordering::Relaxed),
+                        f.speed_x100.load(Ordering::Relaxed),
+                        f.dts_pcr_warnings.load(Ordering::Relaxed),
+                        (bits != NO_LEVEL).then(|| f32::from_bits(bits)),
+                    )
+                }
+                None => (Vec::new(), 0, 0, 0, None),
+            };
         let (rms, peak) = core.iq_stats.level();
         let (txvga_db, amp) = match &self.config.sink {
             TxSink::HackRf(h) => (self.live_txvga, h.amp),
@@ -912,7 +954,16 @@ impl TxSession {
             },
             clipped: core.iq_stats.clipped.load(Ordering::Relaxed),
             ffmpeg_log: feeder_log,
+            audio_dbfs,
         }
+    }
+
+    /// The newest picture of the encoder's input, if newer than `serial`.
+    pub fn preview_picture_since(&self, serial: u64) -> Option<PreviewFrame> {
+        let p = self.pipeline.as_ref()?;
+        let f = p.core.feeder.lock().unwrap();
+        let g = f.as_ref()?.preview.lock().unwrap();
+        g.as_ref().filter(|fr| fr.serial > serial).cloned()
     }
 
     /// Spectrum rows made since the last call (at most 64), oldest first.

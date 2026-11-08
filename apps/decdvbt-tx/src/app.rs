@@ -8,6 +8,7 @@
 //! `safety.rs`.
 
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use decdvbt_core::channel::{UHF_FIRST, UHF_LAST, uhf_centre_hz, uhf_channel_at};
@@ -16,27 +17,24 @@ use decdvbt_tx::modes::{
     T2_FFTS, T2_QAMS, T2_RATES, T2Config, baseband_filter_hz, qam_name, t2_guards, t2_mode,
     t2_mode_table, t2_rate,
 };
+use decdvbt_tx::encode::{self, CameraMode, Devices, Engine};
 use decdvbt_tx::{
     AudioCodec, EncoderChoice, HackRfTxConfig, LICENCE_WARNING, LicenceAck, PlutoTxConfig,
-    ServiceInfo, TxConfig, TxRate, TxSink, TxState, TxStatus, VideoCodec, VideoSettings,
-    mode_table,
+    ServiceInfo, Source, TxConfig, TxRate, TxSink, TxState, TxStatus, VideoCodec, VideoProfile,
+    VideoSettings, mode_table,
 };
 use eframe::egui::{self, Color32, RichText, vec2};
 
 use crate::cli::{Options, SinkArg};
 use crate::demo::{self, DemoState};
 use crate::host::{Cmd, Host};
-use crate::meters::{self, Level, MetersView, Trend};
+use crate::meters;
 use crate::modeinfo;
 use crate::safety::{self, STOP_FIRST, VGA_MAX};
-use crate::settings::Settings;
-use crate::signal_view::{self, Readout, SignalInput};
+use crate::settings::{Settings, SourceKind};
 use crate::source::{self, FileInfo, ProbeJob, Probed};
-use crate::waterfall::{History, RingImage};
 use crate::{AMBER, GREEN, RED, freq_display};
 
-/// The red behind the TRANSMITTING banner and the STOP button.
-const DEEP_RED: Color32 = Color32::from_rgb(176, 28, 28);
 /// A session that has not shown its first status after this long is given up.
 const PREPARE_GRACE: Duration = Duration::from_secs(20);
 /// Settings are written at most this often.
@@ -70,6 +68,14 @@ struct ErrorStrip {
     hint: Option<String>,
 }
 
+/// What the background probe finds: ffmpeg, the cameras and microphones,
+/// each camera's modes, which encoders work.
+struct DevProbe {
+    devices: Devices,
+    modes: Vec<(String, Vec<CameraMode>)>,
+    working: Vec<(VideoCodec, Engine)>,
+}
+
 /// The `--start` hook's progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Auto {
@@ -96,6 +102,13 @@ pub struct App {
     file: Option<PathBuf>,
     file_info: Option<FileInfo>,
     probe: Option<ProbeJob>,
+    /// The capture mode chosen; `None`: picked for the picture.
+    cam_mode: Option<CameraMode>,
+    /// Found in the background: devices, modes, working encoders.
+    dev: Option<Receiver<DevProbe>>,
+    found: Option<DevProbe>,
+    /// The input picture, and the serial of the one shown.
+    cam_tex: Option<egui::TextureHandle>,
 
     sink: SinkKind,
     paced: bool,
@@ -131,13 +144,9 @@ pub struct App {
     error: Option<ErrorStrip>,
     seen_status_error: Option<String>,
 
-    trend: Trend,
-    history: History,
-    ring: RingImage,
     smooth: Vec<f32>,
     /// The last row's span, Hz.
     span_hz: f64,
-    wf_rows: usize,
 
     show_modes: bool,
     title: &'static str,
@@ -178,6 +187,22 @@ impl App {
         if let Some(c) = opts.centre_hz {
             set.centre_hz = c;
         }
+        if let Some(c) = opts.codec {
+            set.video_codec = c;
+        }
+        if let Some((kind, rest)) = &opts.source {
+            set.source = *kind;
+            match kind {
+                SourceKind::Camera if !rest.is_empty() => set.camera = rest.clone(),
+                SourceKind::Udp => set.udp = rest.clone(),
+                _ => {}
+            }
+        }
+        if reproducible || opts.start {
+            // A placeholder call sign (no one's), for test runs and pictures.
+            set.callsign = "N0CALL".into();
+            set.overlay = true;
+        }
         // A start is always on the test output unless `--sink` says another
         // test output; the radio is never the start-up choice.
         let (sink, iq_path) = match &opts.sink {
@@ -200,6 +225,10 @@ impl App {
             file: None,
             file_info: None,
             probe: None,
+            cam_mode: None,
+            dev: None,
+            found: None,
+            cam_tex: None,
             sink,
             paced: true,
             iq_path,
@@ -221,12 +250,8 @@ impl App {
             unfocused_since: None,
             error: None,
             seen_status_error: None,
-            trend: Trend::default(),
-            history: History::default(),
-            ring: RingImage::default(),
             smooth: Vec::new(),
             span_hz: 0.0,
-            wf_rows: 0,
             show_modes: opts.show_modes,
             title: "DecDVB-T TX",
             auto: if opts.start {
@@ -244,16 +269,105 @@ impl App {
             opts,
         };
         app.status = app.idle_status();
+        if let Some((SourceKind::File | SourceKind::TsFile, path)) = app.opts.source.clone() {
+            app.file = Some(PathBuf::from(path));
+        }
+        if let Some(f) = app.opts.file.clone() {
+            app.set.source = SourceKind::File;
+            app.file = Some(f);
+        }
+        // (A test would run ffmpeg for every codec for nothing.)
+        if app.demo.is_none() && !app.opts.selftest && !cfg!(test) {
+            app.start_dev_probe(ctx);
+        }
         if let Some(d) = demo {
             // The demo pretends a file was opened.
             app.file = Some(PathBuf::from("promo clip.mp4"));
             app.file_info = Some(FileInfo::Done(Probed::Info(demo::video_info())));
             app.session = d.has_session();
-        } else if let Some(f) = app.opts.file.clone() {
+        } else if app.set.source == SourceKind::File
+            && let Some(f) = app.file.clone()
+        {
             // The file fills in the form and nothing else.
             app.open_file(f, ctx);
         }
         app
+    }
+
+    /// Find the cameras and microphones, their modes and which encoders work,
+    /// off the window's thread (a few seconds of ffmpeg runs).
+    fn start_dev_probe(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let ffmpeg = self.set.ffmpeg_path.clone();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("tx-devices".into())
+            .spawn(move || {
+                let found = match decdvbt_tx::ffmpeg::find_ffmpeg(ffmpeg.as_deref()) {
+                    Some(exe) => {
+                        let devices = encode::list_devices(&exe);
+                        let modes = devices
+                            .cameras
+                            .iter()
+                            .map(|c| (c.clone(), encode::camera_modes(&exe, c)))
+                            .collect();
+                        DevProbe {
+                            devices,
+                            modes,
+                            working: encode::working_encoders(&exe),
+                        }
+                    }
+                    None => DevProbe {
+                        devices: Devices::default(),
+                        modes: Vec::new(),
+                        working: Vec::new(),
+                    },
+                };
+                let _ = tx.send(found);
+                ctx.request_repaint_after(Duration::from_millis(1));
+            })
+            .ok();
+        self.dev = Some(rx);
+    }
+
+    fn poll_dev_probe(&mut self) {
+        let Some(rx) = &self.dev else { return };
+        let Ok(p) = rx.try_recv() else { return };
+        self.dev = None;
+        if !p.devices.cameras.contains(&self.set.camera) {
+            self.set.camera = p.devices.cameras.first().cloned().unwrap_or_default();
+        }
+        if self
+            .set
+            .mic
+            .as_ref()
+            .is_none_or(|m| !p.devices.microphones.contains(m))
+        {
+            self.set.mic = p.devices.microphones.first().cloned();
+        }
+        self.found = Some(p);
+    }
+
+    /// The source has what it needs to start.
+    fn source_ready(&self) -> bool {
+        match self.set.source {
+            SourceKind::Camera => !self.set.camera.is_empty(),
+            SourceKind::File | SourceKind::TsFile => self.file.is_some(),
+            SourceKind::Udp => self.set.udp.parse::<std::net::SocketAddr>().is_ok(),
+            SourceKind::Test => true,
+        }
+    }
+
+    /// What is missing, for the PREPARE button's hover text.
+    fn source_missing(&self) -> &'static str {
+        match self.set.source {
+            SourceKind::Camera if self.dev.is_some() => "Looking for cameras...",
+            SourceKind::Camera => "No camera found",
+            SourceKind::File => "Choose a video file first",
+            SourceKind::TsFile => "Choose a transport stream file first",
+            SourceKind::Udp => "Listen on an address:port, like 127.0.0.1:1234",
+            SourceKind::Test => "",
+        }
     }
 
     /// The process exit code the run asks for.
@@ -288,6 +402,8 @@ impl App {
 
     fn idle_cfg(&self) -> TxConfig {
         let mut c = TxConfig::new(self.file.clone().unwrap_or_else(|| "none.mp4".into()));
+        c.video.video_codec = self.set.video_codec;
+        c.video.audio_codec = self.set.audio_codec;
         c.mode = self.set.mode;
         c.t2 = self.tx_t2();
         c.centre_hz = self.set.centre_hz;
@@ -299,10 +415,44 @@ impl App {
         TxStatus::idle(&self.idle_cfg(), &decdvbt_tx::Arm::new())
     }
 
-    /// The config for the session, from the form. `None` without a file.
-    fn build_config(&self) -> Option<TxConfig> {
-        let file = self.file.clone()?;
+    /// The source the form describes.
+    fn build_source(&self) -> Result<Source, String> {
+        Ok(match self.set.source {
+            SourceKind::Camera => {
+                if self.set.camera.is_empty() {
+                    return Err("no camera found".into());
+                }
+                Source::Camera {
+                    video: self.set.camera.clone(),
+                    audio: self.set.mic.clone(),
+                    mode: self.cam_mode.clone().or_else(|| self.auto_mode()),
+                }
+            }
+            SourceKind::File => Source::File,
+            SourceKind::TsFile => Source::TsFile,
+            SourceKind::Udp => Source::Udp(
+                self.set
+                    .udp
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("{}: not an address:port", self.set.udp))?,
+            ),
+            SourceKind::Test => Source::Test,
+        })
+    }
+
+    /// The config for the session, from the form.
+    fn build_config(&self) -> Result<TxConfig, String> {
+        let source = self.build_source()?;
+        let file = match self.set.source {
+            SourceKind::File | SourceKind::TsFile => {
+                self.file.clone().ok_or_else(|| self.source_missing().to_string())?
+            }
+            _ => PathBuf::new(),
+        };
         let mut c = TxConfig::new(file.clone());
+        c.source = source;
+        c.overlay = self.set.overlay;
         c.loop_input = self.set.loop_input;
         c.mode = self.set.mode;
         c.t2 = self.tx_t2();
@@ -315,8 +465,15 @@ impl App {
             audio_codec: self.set.audio_codec,
             ..VideoSettings::default()
         };
+        let call = self.set.callsign.trim();
         c.service = ServiceInfo {
-            name: source::service_name(&file),
+            name: if !call.is_empty() {
+                call.to_string()
+            } else if self.set.source == SourceKind::File {
+                source::service_name(&file)
+            } else {
+                ServiceInfo::default().name
+            },
             ..ServiceInfo::default()
         };
         c.ffmpeg_path = self.set.ffmpeg_path.clone();
@@ -354,7 +511,7 @@ impl App {
                 bandwidth_hz: Some(baseband_filter_hz(self.bandwidth())),
             }),
         };
-        Some(c)
+        Ok(c)
     }
 
     fn set_error(&mut self, text: String, from_radio_start: bool) {
@@ -384,18 +541,35 @@ impl App {
         }
         self.error = None;
         self.file = Some(path.clone());
-        self.file_info = Some(FileInfo::Probing);
-        self.probe = Some(ProbeJob::start(
-            path,
-            self.set.ffmpeg_path.clone(),
-            ctx.clone(),
-        ));
+        self.file_info = None;
+        self.probe = None;
+        // A transport stream is sent as it is: nothing to read from it.
+        if self.set.source == SourceKind::File {
+            self.file_info = Some(FileInfo::Probing);
+            self.probe = Some(ProbeJob::start(
+                path,
+                self.set.ffmpeg_path.clone(),
+                ctx.clone(),
+            ));
+        }
     }
 
     fn browse(&mut self, ctx: &egui::Context) {
+        let ts = self.set.source == SourceKind::TsFile;
         let mut d = rfd::FileDialog::new()
-            .set_title("Choose a video file")
-            .add_filter("Video", &source::VIDEO_EXTENSIONS)
+            .set_title(if ts {
+                "Choose a transport stream"
+            } else {
+                "Choose a video file"
+            })
+            .add_filter(
+                if ts { "Transport stream" } else { "Video" },
+                if ts {
+                    &["ts", "m2ts", "mts"][..]
+                } else {
+                    &source::VIDEO_EXTENSIONS[..]
+                },
+            )
             .add_filter("All files", &["*"]);
         if let Some(f) = self.set.folder.as_ref().filter(|f| f.is_dir()) {
             d = d.set_directory(f);
@@ -406,15 +580,17 @@ impl App {
     }
 
     fn prepare(&mut self) {
-        let Some(cfg) = self.build_config() else {
-            return;
+        let cfg = match self.build_config() {
+            Ok(c) => c,
+            Err(e) => {
+                self.set_error(e, false);
+                return;
+            }
         };
         let Some(host) = &self.host else { return };
         self.error = None;
         self.seen_status_error = None;
-        self.history.reset();
         self.smooth.clear();
-        self.trend.clear();
         self.read_ack = false;
         self.vga_sent = self.txvga;
         self.atten_sent = self.atten;
@@ -469,6 +645,17 @@ impl App {
         if let Some(p) = dropped
             && self.demo.is_none()
         {
+            // A transport stream is a TS source, anything else a video file.
+            let ts = p
+                .extension()
+                .is_some_and(|e| ["ts", "m2ts", "mts"].iter().any(|x| e.eq_ignore_ascii_case(x)));
+            if !self.locked() {
+                self.set.source = if ts {
+                    SourceKind::TsFile
+                } else {
+                    SourceKind::File
+                };
+            }
             self.open_file(p, ctx);
         }
     }
@@ -507,6 +694,23 @@ impl App {
             _ => {}
         }
         self.file_info = Some(FileInfo::Done(result));
+    }
+
+    /// The newest input picture from the session, as a texture.
+    fn update_picture(&mut self, ctx: &egui::Context) {
+        let Some(f) = self.host.as_ref().and_then(|h| h.take_picture()) else {
+            return;
+        };
+        let img = egui::ColorImage::from_rgba_unmultiplied(
+            [f.width as usize, f.height as usize],
+            &f.rgba,
+        );
+        match &mut self.cam_tex {
+            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+            None => {
+                self.cam_tex = Some(ctx.load_texture("camera", img, egui::TextureOptions::LINEAR));
+            }
+        }
     }
 
     fn poll_host(&mut self) {
@@ -573,23 +777,18 @@ impl App {
     fn push_row(&mut self, bins: Vec<f32>, rate_hz: f64) {
         self.span_hz = rate_hz;
         self.rows_seen += 1;
-        // The trace is smoothed a little so it does not flicker; the waterfall
-        // keeps every row as it arrived.
+        // The trace is smoothed a little so it does not flicker.
         if self.smooth.len() != bins.len() {
-            self.smooth = bins.clone();
+            self.smooth = bins;
         } else {
             for (s, b) in self.smooth.iter_mut().zip(&bins) {
                 *s += 0.4 * (b - *s);
             }
         }
-        self.history.push(bins);
     }
 
-    /// Things that follow from the status: the trend, the ack tick, the VGA.
+    /// Things that follow from the status: the ack tick, the VGA.
     fn finish_status_effects(&mut self) {
-        let t = self.started.elapsed().as_secs_f64();
-        self.trend
-            .push(t, self.status.ts_stuffed, self.status.clipped);
         // An arm that ended (used, lapsed, dropped) takes the tick with it:
         // every arm starts from a fresh, deliberate tick.
         if self.was_armed && !self.status.armed {
@@ -658,15 +857,12 @@ impl App {
         if state == DemoState::Transmitting {
             self.txvga = self.status.txvga_db;
         }
-        // Rows: 20 a second, and a full waterfall at the start.
-        if self.wf_rows == 0 || matches!(state, DemoState::Idle | DemoState::Failed) {
+        // Spectrum rows: 20 a second.
+        if matches!(state, DemoState::Idle | DemoState::Failed) {
             return;
         }
-        if self.history.is_empty() {
-            self.demo_rows = 0;
-        }
         let want = if self.demo_rows == 0 {
-            self.history.capacity() as u64
+            1
         } else {
             ((t * 20.0) as u64).saturating_sub(self.demo_rows).min(60)
         };
@@ -700,7 +896,10 @@ impl App {
                 }
             }
             Auto::WaitProbe => {
-                if matches!(self.file_info, Some(FileInfo::Done(_))) {
+                let file_done = self.set.source != SourceKind::File
+                    || matches!(self.file_info, Some(FileInfo::Done(_)));
+                // The encoders are known once the device probe has finished.
+                if file_done && self.dev.is_none() {
                     self.prepare();
                     self.auto = Auto::WaitReady(Instant::now());
                 }
@@ -873,59 +1072,6 @@ impl App {
         }
     }
 
-    fn state_strip(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let (text, colour) = self.state_view();
-            ui.label(RichText::new(text).size(20.0).strong().color(colour));
-            if self.status.state == TxState::Preparing && !self.stopping {
-                ui.add(
-                    egui::ProgressBar::new(meters::prepare_progress(&self.status))
-                        .desired_width(160.0)
-                        .fill(AMBER),
-                );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.main_action(ui);
-            });
-        });
-        ui.add_space(2.0);
-    }
-
-    /// Prepare / Cancel / Reset: the action that is not "transmit".
-    fn main_action(&mut self, ui: &mut egui::Ui) {
-        let st = self.status.state;
-        if self.stopping {
-            return;
-        }
-        if !self.locked() {
-            let ok = safety::can_prepare(self.session, self.file.is_some());
-            let b = egui::Button::new(RichText::new("Prepare").size(16.0).strong())
-                .min_size(vec2(120.0, 28.0));
-            let r = ui.add_enabled(ok, b);
-            let r = if self.file.is_none() {
-                r.on_disabled_hover_text("Choose a video file first")
-            } else {
-                r.on_hover_text("Start ffmpeg and the modulator; the radio stays off")
-            };
-            if r.clicked() {
-                self.prepare();
-            }
-            return;
-        }
-        let label = match st {
-            TxState::Preparing | TxState::Ready => "Cancel",
-            TxState::Finished | TxState::Failed => "Reset",
-            _ => return,
-        };
-        if ui
-            .add(egui::Button::new(RichText::new(label).size(16.0)).min_size(vec2(120.0, 28.0)))
-            .clicked()
-        {
-            self.stop();
-        }
-    }
-
     fn error_strip(&mut self, ui: &mut egui::Ui) {
         let Some(e) = &self.error else { return };
         let (text, hint) = (e.text.clone(), e.hint.clone());
@@ -983,109 +1129,6 @@ impl App {
             self.set.ffmpeg_path = Some(p);
             self.error = None;
         }
-    }
-
-    fn banner(&self, ui: &mut egui::Ui) {
-        let centre = self
-            .session_cfg
-            .as_ref()
-            .map_or(self.set.centre_hz, |c| c.centre_hz);
-        let pluto = self
-            .session_cfg
-            .as_ref()
-            .is_some_and(|c| matches!(c.sink, TxSink::Pluto(_)));
-        let Some(text) = safety::banner(&self.status, centre, pluto) else {
-            return;
-        };
-        egui::Frame::new()
-            .fill(DEEP_RED)
-            .inner_margin(egui::Margin::same(8))
-            .show(ui, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new(text)
-                            .size(24.0)
-                            .strong()
-                            .color(Color32::WHITE),
-                    );
-                });
-            });
-    }
-
-    fn section(ui: &mut egui::Ui, title: &str) {
-        ui.add_space(8.0);
-        ui.label(RichText::new(title).strong().color(Color32::from_gray(150)));
-        ui.separator();
-    }
-
-    fn left_panel(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                self.source_section(ui);
-                self.mode_section(ui);
-                self.channel_section(ui);
-                self.radio_section(ui);
-                self.advanced_section(ui);
-            });
-    }
-
-    fn source_section(&mut self, ui: &mut egui::Ui) {
-        Self::section(ui, "SOURCE");
-        let locked = self.locked();
-        ui.horizontal(|ui| {
-            let r = ui.add_enabled(!locked, egui::Button::new("Browse..."));
-            let r = if locked {
-                r.on_disabled_hover_text(STOP_FIRST)
-            } else {
-                r
-            };
-            if r.clicked() {
-                self.browse(ui.ctx());
-            }
-            let name = self
-                .file
-                .as_ref()
-                .map_or("(no file)".to_string(), |p| source::file_label(p));
-            ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
-        });
-        ui.label(RichText::new("(drop a file anywhere)").weak());
-        match &self.file_info {
-            Some(FileInfo::Probing) => {
-                ui.label(RichText::new("reading the file...").weak());
-            }
-            Some(FileInfo::Done(Probed::Info(i))) => {
-                let (a, b) = source::describe(i);
-                ui.label(a);
-                if !b.is_empty() {
-                    ui.label(RichText::new(b).weak());
-                }
-                if i.interlaced || i.bit_depth > 8 {
-                    ui.label(
-                        RichText::new("interlaced or 10-bit: the x264 chain (more CPU)")
-                            .color(AMBER),
-                    );
-                } else if i.height > 1080 || i.fps > 30.5 {
-                    ui.label(
-                        RichText::new("a heavy source: more CPU to scale it down").color(AMBER),
-                    );
-                }
-            }
-            Some(FileInfo::Done(Probed::NoProbe)) => {
-                ui.label(RichText::new("(no ffprobe: info unavailable)").weak());
-            }
-            Some(FileInfo::Done(Probed::NoFfmpeg(_))) => {
-                ui.label(RichText::new("ffmpeg not found").color(RED));
-            }
-            Some(FileInfo::Done(Probed::Bad(_))) => {
-                ui.label(RichText::new("unreadable file").color(RED));
-            }
-            None => {}
-        }
-        ui.add_enabled_ui(!locked, |ui| {
-            ui.checkbox(&mut self.set.loop_input, "Loop")
-                .on_hover_text("Start again at the end of the file (inside ffmpeg: no breaks)");
-        });
     }
 
     fn mode_section(&mut self, ui: &mut egui::Ui) {
@@ -1283,158 +1326,649 @@ impl App {
         }
     }
 
-    fn channel_section(&mut self, ui: &mut egui::Ui) {
-        Self::section(ui, "CHANNEL");
-        let locked = self.locked();
-        let r = ui.add_enabled_ui(!locked, |ui| {
-            ui.horizontal(|ui| {
-                freq_display::show(ui, &mut self.set.centre_hz, 1e6, 6e9, 28.0);
-                ui.label("Hz");
-            });
-            ui.horizontal(|ui| {
-                ui.label("UHF channel");
-                let cur = uhf_channel_at(self.set.centre_hz).filter(|&n| {
-                    uhf_centre_hz(n).is_some_and(|c| (c - self.set.centre_hz).abs() < 1.0)
+    fn state_strip(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("DecDVB-T TX")
+                    .strong()
+                    .color(Color32::from_rgb(255, 138, 128)),
+            );
+            ui.label(RichText::new(env!("CARGO_PKG_VERSION")).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let locked = self.locked();
+                let before = self.sink;
+                ui.add_enabled_ui(!locked, |ui| {
+                    egui::ComboBox::from_id_salt("sink")
+                        .selected_text(self.sink.label())
+                        .show_ui(ui, |ui| {
+                            for k in [
+                                SinkKind::Test,
+                                SinkKind::IqFile,
+                                SinkKind::HackRf,
+                                SinkKind::Pluto,
+                            ] {
+                                ui.selectable_value(&mut self.sink, k, k.label());
+                            }
+                        });
                 });
-                egui::ComboBox::from_id_salt("uhf")
-                    .selected_text(cur.map_or("custom".to_string(), |n| format!("C{n}")))
-                    .width(80.0)
-                    .show_ui(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(260.0)
-                            .show(ui, |ui| {
-                                for n in UHF_FIRST..=UHF_LAST {
-                                    let c = uhf_centre_hz(n).unwrap_or(0.0);
-                                    if ui
-                                        .selectable_label(
-                                            cur == Some(n),
-                                            format!("C{n}  {:.0} MHz", c / 1e6),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.set.centre_hz = c;
+                if self.sink != before {
+                    // A new output starts disarmed and unticked.
+                    self.read_ack = false;
+                }
+                ui.label("Output");
+                let (text, colour) = self.state_view();
+                ui.label(RichText::new(text).strong().color(colour));
+            });
+        });
+        ui.add_space(2.0);
+    }
+
+    fn banner(&self, ui: &mut egui::Ui) {
+        let centre = self
+            .session_cfg
+            .as_ref()
+            .map_or(self.set.centre_hz, |c| c.centre_hz);
+        let pluto = self
+            .session_cfg
+            .as_ref()
+            .is_some_and(|c| matches!(c.sink, TxSink::Pluto(_)));
+        let Some(text) = safety::banner(&self.status, centre, pluto) else {
+            return;
+        };
+        egui::Frame::new()
+            .fill(Color32::from_rgb(92, 26, 22))
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("● {text}"))
+                            .size(16.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new("Esc or Space stops").color(Color32::WHITE));
+                    });
+                });
+            });
+    }
+
+    fn section(ui: &mut egui::Ui, title: &str) {
+        ui.add_space(8.0);
+        ui.label(RichText::new(title).strong().color(AMBER));
+    }
+
+    /// The left column: the form (locked while a session exists), then the
+    /// output's controls, which stay live (the TX VGA moves while sending).
+    fn left_panel(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let locked = self.locked();
+                ui.add_enabled_ui(!locked, |ui| {
+                    self.source_section(ui);
+                    if self.set.source.encodes() {
+                        self.encoder_section(ui);
+                    }
+                    self.mode_section(ui);
+                    self.channel_section(ui);
+                })
+                .response
+                .on_disabled_hover_text(STOP_FIRST);
+                self.radio_section(ui);
+                self.advanced_section(ui);
+            });
+    }
+
+    /// The cameras, microphones, their modes and which encoders work, once
+    /// the background probe has found them.
+    fn found_cameras(&self) -> Vec<String> {
+        self.found
+            .as_ref()
+            .map(|p| p.devices.cameras.clone())
+            .unwrap_or_default()
+    }
+
+    fn camera_modes(&self) -> &[CameraMode] {
+        self.found
+            .as_ref()
+            .and_then(|p| p.modes.iter().find(|(c, _)| *c == self.set.camera))
+            .map_or(&[], |(_, m)| m)
+    }
+
+    fn working(&self) -> &[(VideoCodec, Engine)] {
+        self.found.as_ref().map_or(&[], |p| &p.working)
+    }
+
+    /// The engine that will encode: the one asked for if it works, else the
+    /// best that does (the CPU while the probe has not finished).
+    fn engine_used(&self) -> Engine {
+        encode::pick_engine(self.set.video_codec, self.set.encoder.engine(), self.working())
+            .unwrap_or(Engine::Cpu)
+    }
+
+    fn source_section(&mut self, ui: &mut egui::Ui) {
+        Self::section(ui, "SOURCE");
+        let before = self.set.source;
+        ui.horizontal_wrapped(|ui| {
+            for k in SourceKind::ALL {
+                ui.selectable_value(&mut self.set.source, k, k.label());
+            }
+        });
+        if self.set.source != before {
+            self.error = None;
+            // A video file's details are read when that tab is chosen.
+            if self.set.source == SourceKind::File
+                && self.file_info.is_none()
+                && let Some(f) = self.file.clone()
+            {
+                self.open_file(f, ui.ctx());
+            }
+        }
+        egui::Grid::new("source")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                match self.set.source {
+                    SourceKind::Camera => {
+                        let cams = self.found_cameras();
+                        ui.label("Camera");
+                        let none = if self.dev.is_some() {
+                            "looking..."
+                        } else {
+                            "none found"
+                        };
+                        egui::ComboBox::from_id_salt("camera")
+                            .width(260.0)
+                            .selected_text(if self.set.camera.is_empty() {
+                                none
+                            } else {
+                                &self.set.camera
+                            })
+                            .show_ui(ui, |ui| {
+                                for c in cams {
+                                    if ui.selectable_label(self.set.camera == c, &c).clicked() {
+                                        self.set.camera = c;
+                                        self.cam_mode = None;
                                     }
                                 }
                             });
+                        ui.end_row();
+                        ui.label("Captures");
+                        let auto = self.auto_mode();
+                        let modes = self.camera_modes().to_vec();
+                        egui::ComboBox::from_id_salt("mode_cap")
+                            .width(260.0)
+                            .selected_text(match (&self.cam_mode, &auto) {
+                                (Some(m), _) => m.describe(),
+                                (None, Some(a)) => format!("auto: {}", a.describe()),
+                                (None, None) => "auto".into(),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.cam_mode, None, "auto (for the picture)");
+                                for m in modes {
+                                    let d = m.describe();
+                                    ui.selectable_value(&mut self.cam_mode, Some(m), d);
+                                }
+                            });
+                        ui.end_row();
+                        let mics = self
+                            .found
+                            .as_ref()
+                            .map(|p| p.devices.microphones.clone())
+                            .unwrap_or_default();
+                        ui.label("Microphone");
+                        egui::ComboBox::from_id_salt("mic")
+                            .width(260.0)
+                            .selected_text(self.set.mic.clone().unwrap_or_else(|| "none".into()))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.set.mic, None, "none");
+                                for m in mics {
+                                    let l = m.clone();
+                                    ui.selectable_value(&mut self.set.mic, Some(m), l);
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Mic level");
+                        let db = self.status.audio_dbfs.unwrap_or(-90.0);
+                        ui.horizontal(|ui| {
+                            let fill = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+                            let col = if db > -3.0 {
+                                RED
+                            } else if db > -12.0 {
+                                AMBER
+                            } else {
+                                GREEN
+                            };
+                            ui.add(egui::ProgressBar::new(fill).desired_width(180.0).fill(col));
+                            ui.label(if db > -89.0 {
+                                format!("{db:.0} dBFS")
+                            } else {
+                                "-".into()
+                            });
+                        });
+                        ui.end_row();
+                    }
+                    SourceKind::File | SourceKind::TsFile => {
+                        ui.label("File");
+                        ui.horizontal(|ui| {
+                            if ui.button("Choose...").clicked() {
+                                self.browse(ui.ctx());
+                            }
+                            let name = self
+                                .file
+                                .as_ref()
+                                .map_or("none".to_string(), |p| source::file_label(p));
+                            ui.add(egui::Label::new(name).truncate());
+                        });
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut self.set.loop_input, "loop");
+                        ui.end_row();
+                        if self.set.source == SourceKind::File {
+                            match &self.file_info {
+                                Some(FileInfo::Probing) => {
+                                    ui.label("");
+                                    ui.label(RichText::new("reading the file...").weak());
+                                    ui.end_row();
+                                }
+                                Some(FileInfo::Done(Probed::Info(i))) => {
+                                    let (a, b) = source::describe(i);
+                                    ui.label("");
+                                    ui.vertical(|ui| {
+                                        ui.label(a);
+                                        if !b.is_empty() {
+                                            ui.label(RichText::new(b).weak());
+                                        }
+                                        if i.interlaced || i.bit_depth > 8 {
+                                            ui.label(
+                                                RichText::new(
+                                                    "interlaced or 10-bit: the CPU chain (more CPU)",
+                                                )
+                                                .color(AMBER),
+                                            );
+                                        } else if i.height > 1080 || i.fps > 30.5 {
+                                            ui.label(
+                                                RichText::new(
+                                                    "a heavy source: more CPU to scale it down",
+                                                )
+                                                .color(AMBER),
+                                            );
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                                Some(FileInfo::Done(Probed::NoProbe)) => {
+                                    ui.label("");
+                                    ui.label(RichText::new("(no ffprobe: info unavailable)").weak());
+                                    ui.end_row();
+                                }
+                                Some(FileInfo::Done(Probed::NoFfmpeg(_))) => {
+                                    ui.label("");
+                                    ui.label(RichText::new("ffmpeg not found").color(RED));
+                                    ui.end_row();
+                                }
+                                Some(FileInfo::Done(Probed::Bad(_))) => {
+                                    ui.label("");
+                                    ui.label(RichText::new("unreadable file").color(RED));
+                                    ui.end_row();
+                                }
+                                None => {}
+                            }
+                        } else {
+                            ui.label("");
+                            ui.label(
+                                RichText::new("sent as it is, remultiplexed to the channel's rate")
+                                    .weak(),
+                            );
+                            ui.end_row();
+                        }
+                    }
+                    SourceKind::Udp => {
+                        ui.label("Listen on");
+                        ui.text_edit_singleline(&mut self.set.udp);
+                        ui.end_row();
+                        ui.label("");
+                        ui.label(
+                            RichText::new("sent as it is, remultiplexed to the channel's rate")
+                                .weak(),
+                        );
+                        ui.end_row();
+                    }
+                    SourceKind::Test => {
+                        ui.label("");
+                        ui.label(RichText::new("ffmpeg's test picture and a 1 kHz tone").weak());
+                        ui.end_row();
+                    }
+                }
+                if self.set.source.encodes() {
+                    ui.label("Call sign");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.set.callsign).desired_width(100.0),
+                        )
+                        .on_hover_text("The service name receivers list (empty: the file's name)");
+                        ui.checkbox(&mut self.set.overlay, "on the picture");
                     });
-                ui.label(RichText::new(format!("{:.3} MHz", self.set.centre_hz / 1e6)).weak());
+                    ui.end_row();
+                }
             });
-        });
-        if locked {
-            r.response.on_hover_text(STOP_FIRST);
+    }
+
+    fn encoder_section(&mut self, ui: &mut egui::Ui) {
+        Self::section(ui, "ENCODER");
+        let working = self.working().to_vec();
+        let probing = self.dev.is_some();
+        egui::Grid::new("encoder")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Video");
+                ui.horizontal_wrapped(|ui| {
+                    for c in VideoCodec::ALL {
+                        let ok = probing || working.iter().any(|(wc, _)| *wc == c);
+                        let r = ui.add_enabled(
+                            ok,
+                            egui::Button::selectable(self.set.video_codec == c, c.label()),
+                        );
+                        if r.clicked() {
+                            self.set.video_codec = c;
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Engine");
+                let used = self.engine_used();
+                egui::ComboBox::from_id_salt("engine")
+                    .selected_text(match self.set.encoder.engine() {
+                        None => format!("auto: {}", used.label()),
+                        Some(e) => e.label().to_string(),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.set.encoder,
+                            EncoderChoice::Auto,
+                            "auto (graphics card first)",
+                        );
+                        for (choice, e) in [
+                            (EncoderChoice::Cpu, Engine::Cpu),
+                            (EncoderChoice::Nvenc, Engine::Nvenc),
+                            (EncoderChoice::Amf, Engine::Amf),
+                            (EncoderChoice::Qsv, Engine::Qsv),
+                        ] {
+                            let ok = working.contains(&(self.set.video_codec, e));
+                            ui.add_enabled_ui(ok, |ui| {
+                                ui.selectable_value(&mut self.set.encoder, choice, e.label());
+                            });
+                        }
+                    });
+                ui.end_row();
+                let cfg = self.idle_cfg();
+                let p = VideoProfile::for_rate(cfg.mux_rate_bps());
+                ui.label("Picture");
+                ui.label(format!(
+                    "{}x{} {}p - {} kbit/s of {:.0}",
+                    p.width,
+                    p.height,
+                    cfg.video.fps,
+                    p.video_kbps,
+                    cfg.mux_rate_bps() as f64 / 1e3
+                ));
+                ui.end_row();
+                ui.label("Audio");
+                egui::ComboBox::from_id_salt("acodec")
+                    .selected_text(match self.set.audio_codec {
+                        AudioCodec::AacLatm => "AAC (LATM)",
+                        AudioCodec::AacAdts => "AAC (ADTS)",
+                        AudioCodec::Mp2 => "MP2",
+                        AudioCodec::None => "none",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (a, t) in [
+                            (AudioCodec::AacLatm, "AAC (LATM)"),
+                            (AudioCodec::AacAdts, "AAC (ADTS)"),
+                            (AudioCodec::Mp2, "MP2"),
+                            (AudioCodec::None, "none"),
+                        ] {
+                            ui.selectable_value(&mut self.set.audio_codec, a, t);
+                        }
+                    });
+                ui.end_row();
+            });
+        match self.set.video_codec {
+            VideoCodec::H265 => {
+                ui.label(
+                    RichText::new("H.265 plays on newer televisions (service type 0x1F).")
+                        .small()
+                        .color(AMBER),
+                );
+            }
+            VideoCodec::H266 | VideoCodec::Av1 => {
+                ui.label(
+                    RichText::new(format!(
+                        "{} is for software receivers (DecDVB-T, VLC): no television decodes it.",
+                        self.set.video_codec.label()
+                    ))
+                    .small()
+                    .color(AMBER),
+                );
+                if self.set.video_codec == VideoCodec::H266 {
+                    ui.label(
+                        RichText::new("H.266 (vvenc) is heavy: about two cores.")
+                            .small()
+                            .color(AMBER),
+                    );
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// The capture mode "auto" would pick for the picture the mode carries.
+    fn auto_mode(&self) -> Option<CameraMode> {
+        let cfg = self.idle_cfg();
+        let p = VideoProfile::for_rate(cfg.mux_rate_bps());
+        encode::best_mode(self.camera_modes(), p.width, p.height, cfg.video.fps)
+    }
+
+    fn channel_section(&mut self, ui: &mut egui::Ui) {
+        Self::section(ui, "CHANNEL");
+        freq_display::show(ui, &mut self.set.centre_hz, 1e6, 6e9, 28.0);
+        let cur = uhf_channel_at(self.set.centre_hz)
+            .filter(|&n| uhf_centre_hz(n).is_some_and(|c| (c - self.set.centre_hz).abs() < 1.0));
+        ui.label(match cur {
+            Some(n) => format!("UHF channel C{n}"),
+            None => "not on a UHF channel centre".to_string(),
+        });
+        ui.horizontal(|ui| {
+            ui.label("Channel");
+            egui::ComboBox::from_id_salt("uhf")
+                .selected_text(cur.map_or("custom".to_string(), |n| format!("C{n}")))
+                .width(80.0)
+                .show_ui(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for n in UHF_FIRST..=UHF_LAST {
+                                let c = uhf_centre_hz(n).unwrap_or(0.0);
+                                if ui
+                                    .selectable_label(
+                                        cur == Some(n),
+                                        format!("C{n}  {:.0} MHz", c / 1e6),
+                                    )
+                                    .clicked()
+                                {
+                                    self.set.centre_hz = c;
+                                }
+                            }
+                        });
+                });
+        });
         if let Some(w) = safety::television_warning(self.set.centre_hz) {
             ui.label(RichText::new(w).color(RED));
         }
     }
 
+    /// OUTPUT: what the chosen output needs. Live while sending (the TX VGA
+    /// and the Pluto's attenuation move in steps of at most 6 dB).
     fn radio_section(&mut self, ui: &mut egui::Ui) {
-        Self::section(ui, "RADIO");
-        let radio = self.sink_is_radio();
+        Self::section(ui, "OUTPUT");
+        let locked = self.locked();
         let st = self.status.state;
-        // The amp is set before Prepare; the VGA is also live while transmitting.
-        let idle = !self.locked();
-        let live = radio && st == TxState::Transmitting && !self.stopping;
-        if self.sink == SinkKind::Pluto {
-            ui.horizontal(|ui| {
-                ui.label("Attenuation");
-                let r = ui.add_enabled(
-                    idle || live,
-                    egui::Slider::new(&mut self.atten, safety::ATTEN_MAX..=0.0)
-                        .step_by(0.25)
-                        .suffix(" dB"),
-                );
-                r.on_hover_text(
-                    "89.75 dB at every start. Set before Prepare, or live while transmitting \
-                     (it moves in steps of at most 6 dB). 0 dB is the Pluto's full power, \
-                     about +7 dBm",
-                );
-            });
-            if live && self.atten != self.status.atten_db {
-                ui.label(
-                    RichText::new(format!(
-                        "   now {:.2} dB, moving to {:.2}",
-                        self.atten_sent, self.atten
-                    ))
-                    .color(AMBER),
-                );
+        let idle = !locked;
+        let live = self.sink_is_radio() && st == TxState::Transmitting && !self.stopping;
+        match self.sink {
+            SinkKind::Test => {
+                ui.label(RichText::new("Test only: the whole chain runs, nothing is sent.").weak());
+                ui.add_enabled(
+                    idle,
+                    egui::Checkbox::new(&mut self.paced, "paced (real time)"),
+                )
+                .on_hover_text("Off: generate as fast as possible (a speed test)");
             }
-            if self.status.link_short > 0 {
-                ui.label(
-                    RichText::new(format!(
-                        "   the link was late {} blocks: the Pluto sent gaps. Use a lower \
-                         rate, or a Pluto+ on Ethernet",
-                        self.status.link_short
-                    ))
-                    .color(RED),
-                );
+            SinkKind::IqFile => {
+                ui.add_enabled_ui(idle, |ui| {
+                    let hint = source::iq_file_name(
+                        self.set.centre_hz,
+                        self.set.rate.hz(self.bandwidth()),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("File");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.iq_path)
+                                .desired_width(260.0)
+                                .hint_text(hint),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Seconds");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.iq_seconds)
+                                .desired_width(50.0)
+                                .hint_text("all"),
+                        );
+                        ui.checkbox(&mut self.paced, "paced");
+                        ui.label(RichText::new("(empty: until Stop) .cs8").weak());
+                    });
+                });
             }
-            ui.label(
-                RichText::new(format!(
-                    "Level {:.0} dBFS (Advanced...)",
-                    self.set.level_dbfs
-                ))
-                .weak(),
-            );
-            return;
+            SinkKind::Pluto => {
+                egui::Grid::new("pluto")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Link");
+                        ui.add_enabled(
+                            idle,
+                            egui::TextEdit::singleline(&mut self.pluto_uri)
+                                .desired_width(140.0)
+                                .hint_text("auto"),
+                        )
+                        .on_hover_text(
+                            "auto (USB with ADI's driver, else 192.168.2.1), usb, or \
+                             ip:ADDRESS. To receive in DecDVB-T at the same time, use \
+                             ip:192.168.2.1 in both, at the same sample rate",
+                        );
+                        ui.end_row();
+                        ui.label("Attenuation");
+                        ui.add_enabled(
+                            idle || live,
+                            egui::Slider::new(&mut self.atten, safety::ATTEN_MAX..=0.0)
+                                .step_by(0.25)
+                                .suffix(" dB"),
+                        )
+                        .on_hover_text(
+                            "89.75 dB at every start; 0 dB is the Pluto's full power, about \
+                             +7 dBm. Moves in steps of at most 6 dB",
+                        );
+                        ui.end_row();
+                        if live && self.atten != self.status.atten_db {
+                            ui.label("");
+                            ui.label(
+                                RichText::new(format!(
+                                    "now {:.2} dB, moving to {:.2}",
+                                    self.atten_sent, self.atten
+                                ))
+                                .color(AMBER),
+                            );
+                            ui.end_row();
+                        }
+                        if self.status.link_short > 0 {
+                            ui.label("Link");
+                            ui.label(
+                                RichText::new(format!(
+                                    "late {} blocks: the Pluto sent gaps (a lower rate, or a \
+                                     Pluto+ on Ethernet)",
+                                    self.status.link_short
+                                ))
+                                .color(RED),
+                            );
+                            ui.end_row();
+                        }
+                        ui.label("Level");
+                        ui.add_enabled(
+                            idle,
+                            egui::Slider::new(&mut self.set.level_dbfs, -30.0..=-6.0)
+                                .suffix(" dBFS RMS")
+                                .fixed_decimals(0),
+                        );
+                        ui.end_row();
+                    });
+            }
+            SinkKind::HackRf => {
+                egui::Grid::new("radio")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("TX VGA");
+                        ui.add_enabled(
+                            idle || live,
+                            egui::Slider::new(&mut self.txvga, 0..=VGA_MAX).suffix(" dB"),
+                        )
+                        .on_hover_text("Moves in steps of at most 6 dB, also while transmitting");
+                        ui.end_row();
+                        if live && self.txvga != self.status.txvga_db {
+                            ui.label("");
+                            ui.label(
+                                RichText::new(format!(
+                                    "now {} dB, moving to {}",
+                                    self.vga_sent, self.txvga
+                                ))
+                                .color(AMBER),
+                            );
+                            ui.end_row();
+                        }
+                        ui.label("RF amp");
+                        ui.add_enabled(
+                            idle,
+                            egui::Checkbox::new(&mut self.amp, "+14 dB (off at every start)"),
+                        );
+                        ui.end_row();
+                        ui.label("Antenna power");
+                        ui.label(RichText::new("never").weak());
+                        ui.end_row();
+                        ui.label("Level");
+                        ui.add_enabled(
+                            idle,
+                            egui::Slider::new(&mut self.set.level_dbfs, -30.0..=-6.0)
+                                .suffix(" dBFS RMS")
+                                .fixed_decimals(0),
+                        );
+                        ui.end_row();
+                    });
+            }
         }
-        ui.add_enabled_ui(radio, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("TX VGA");
-                let r = ui.add_enabled(
-                    idle || live,
-                    egui::Slider::new(&mut self.txvga, 0..=VGA_MAX).suffix(" dB"),
-                );
-                r.on_hover_text(
-                    "Set before Prepare, or live while transmitting (it moves in steps of at most 6 dB)",
-                );
-            });
-            if radio && self.txvga != self.status.txvga_db && live {
-                ui.label(
-                    RichText::new(format!("   now {} dB, moving to {}", self.vga_sent, self.txvga))
-                        .color(AMBER),
-                );
-            }
-            ui.add_enabled(
-                idle,
-                egui::Checkbox::new(&mut self.amp, "RF amp (+14 dB)"),
-            )
-            .on_hover_text("Off at every start. Only while stopped.");
-            if self.amp {
-                ui.label(RichText::new("   the RF amp is on").color(AMBER));
-            }
-        });
-        if !radio {
-            ui.label(RichText::new("(no radio output is selected)").weak());
-        }
-        ui.label(
-            RichText::new(format!(
-                "Level {:.0} dBFS (Advanced...)",
-                self.set.level_dbfs
-            ))
-            .weak(),
-        );
     }
 
     fn advanced_section(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         let locked = self.locked();
-        egui::CollapsingHeader::new(RichText::new("Advanced").strong().color(Color32::from_gray(150)))
+        egui::CollapsingHeader::new(RichText::new("Advanced").strong().color(AMBER))
             .default_open(false)
             .show(ui, |ui| {
                 ui.add_enabled_ui(!locked, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Level");
-                        ui.add(
-                            egui::Slider::new(&mut self.set.level_dbfs, -30.0..=-6.0)
-                                .suffix(" dBFS")
-                                .fixed_decimals(0),
-                        )
-                        .on_hover_text(
-                            "The signal's rms before the radio's gain. -12 keeps 38 dB of \
-                             8-bit quantisation SNR without clipping; the power is set by TX VGA.",
-                        );
-                    });
                     ui.horizontal(|ui| {
                         ui.label("Radio sample rate");
                         let text = match self.set.rate {
@@ -1462,46 +1996,10 @@ impl App {
                         .weak()
                         .small(),
                     );
-                    ui.horizontal(|ui| {
-                        ui.label("Encoder");
-                        egui::ComboBox::from_id_salt("encoder")
-                            .selected_text(match self.set.encoder {
-                                EncoderChoice::Auto => "auto",
-                                EncoderChoice::Nvenc => "NVENC",
-                                EncoderChoice::X264 => "x264",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.set.encoder, EncoderChoice::Auto, "auto");
-                                ui.selectable_value(&mut self.set.encoder, EncoderChoice::Nvenc, "NVENC");
-                                ui.selectable_value(&mut self.set.encoder, EncoderChoice::X264, "x264");
-                            });
-                        ui.label("Video");
-                        egui::ComboBox::from_id_salt("vcodec")
-                            .selected_text(match self.set.video_codec {
-                                VideoCodec::H264 => "H.264",
-                                VideoCodec::Mpeg2 => "MPEG-2",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.set.video_codec, VideoCodec::H264, "H.264");
-                                ui.selectable_value(&mut self.set.video_codec, VideoCodec::Mpeg2, "MPEG-2");
-                            });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Audio");
-                        egui::ComboBox::from_id_salt("acodec")
-                            .selected_text(match self.set.audio_codec {
-                                AudioCodec::AacLatm => "AAC (LATM)",
-                                AudioCodec::AacAdts => "AAC (ADTS)",
-                                AudioCodec::Mp2 => "MP2",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.set.audio_codec, AudioCodec::AacLatm, "AAC (LATM)");
-                                ui.selectable_value(&mut self.set.audio_codec, AudioCodec::AacAdts, "AAC (ADTS)");
-                                ui.selectable_value(&mut self.set.audio_codec, AudioCodec::Mp2, "MP2");
-                            });
-                    });
-                    ui.checkbox(&mut self.set.preview, "Signal preview")
-                        .on_hover_text("One 2048-point FFT per 50 ms of signal");
+                    ui.checkbox(&mut self.set.preview, "Signal and picture preview")
+                        .on_hover_text(
+                            "One 2048-point FFT per 50 ms of signal, and the input picture at 10 fps",
+                        );
                     ui.horizontal(|ui| {
                         ui.label("ffmpeg");
                         let name = self
@@ -1526,274 +2024,307 @@ impl App {
             });
     }
 
+    /// The right side: the input picture and the meters side by side, the
+    /// signal under them.
     fn signal_and_meters(&mut self, ui: &mut egui::Ui) {
-        let total = ui.available_height();
-        let sig_h = (total * 0.56).max(240.0).min(total);
-        let ppp = ui.ctx().pixels_per_point();
-        self.wf_rows = signal_view::waterfall_rows(sig_h, ppp).max(64);
-        self.history.set_capacity(self.wf_rows);
-        let tex = self.ring.update(ui.ctx(), &self.history);
-        let live = self.session && self.status.state != TxState::Idle;
-        let empty = if !self.set.preview {
-            "the preview is off (Advanced)"
-        } else if self.status.state == TxState::Failed {
-            "no signal: the session failed (see the message above)"
-        } else if live {
-            "waiting for the first rows of the signal..."
-        } else {
-            "no signal yet: choose a file, press Prepare, then Transmit"
-        };
-        let centre = self
-            .session_cfg
-            .as_ref()
-            .map_or(self.set.centre_hz, |c| c.centre_hz);
-        let now = self.started.elapsed().as_secs_f64();
-        let levels = meters::classify(&self.status, &self.trend, now);
-        let readout = (live && self.status.level_rms_dbfs.is_finite()).then(|| Readout {
-            rms_dbfs: self.status.level_rms_dbfs,
-            peak_dbfs: self.status.peak_dbfs,
-            clipped: self.status.clipped,
-            clipping: levels.clipping == Level::Red,
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("CAMERA").strong().color(AMBER));
+                let size = vec2(384.0, 216.0);
+                match &self.cam_tex {
+                    Some(t) if self.locked() => {
+                        ui.add(egui::Image::new(t).fit_to_exact_size(size));
+                    }
+                    _ => {
+                        let (r, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(r, 0.0, Color32::from_rgb(34, 40, 48));
+                        ui.painter().text(
+                            r.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if !self.set.source.encodes() {
+                                "no picture for this source"
+                            } else if self.locked() {
+                                "no picture for this chain"
+                            } else {
+                                "the picture shows after Prepare"
+                            },
+                            egui::FontId::monospace(12.0),
+                            Color32::GRAY,
+                        );
+                    }
+                }
+            });
+            ui.vertical(|ui| {
+                ui.label(RichText::new("METERS").strong().color(AMBER));
+                self.meters(ui);
+            });
         });
-        let span = if self.span_hz > 0.0 {
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("SIGNAL (what the radio is given)")
+                .strong()
+                .color(AMBER),
+        );
+        self.spectrum(ui);
+    }
+
+    fn meters(&self, ui: &mut egui::Ui) {
+        let st = &self.status;
+        let bar = |ui: &mut egui::Ui, label: &str, frac: f32, bad: bool, text: String| {
+            ui.horizontal(|ui| {
+                ui.label(format!("{label:<12}"));
+                ui.add(
+                    egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                        .desired_width(140.0)
+                        .fill(if bad { RED } else { GREEN }),
+                );
+                ui.label(text);
+            });
+        };
+        let live = self.session && st.state == TxState::Transmitting;
+        ui.label(format!(
+            "TS          {:.0} kbit/s - stuffed {} - underruns {}",
+            st.ts_in_bps / 1e3,
+            st.ts_stuffed,
+            st.underruns
+        ));
+        ui.horizontal(|ui| {
+            ui.label(format!("{:<12}", "TS buffer"));
+            ui.add(
+                egui::ProgressBar::new(st.ts_fill.clamp(0.0, 1.0))
+                    .desired_width(140.0)
+                    .fill(if live && st.ts_fill < 0.05 { AMBER } else { GREEN }),
+            );
+            ui.label(format!("{:.0} %", st.ts_fill * 100.0));
+        });
+        bar(
+            ui,
+            "IQ buffer",
+            st.iq_fill,
+            false,
+            format!("{:.0} %", st.iq_fill * 100.0),
+        );
+        bar(
+            ui,
+            "Encoder",
+            st.ffmpeg_cpu_pct / 200.0,
+            st.ffmpeg_cpu_pct > 200.0,
+            format!(
+                "{:5.1} %  {}",
+                st.ffmpeg_cpu_pct,
+                if st.ffmpeg_speed_x > 0.0 {
+                    format!("{:.1}x", st.ffmpeg_speed_x)
+                } else {
+                    String::new()
+                }
+            ),
+        );
+        bar(
+            ui,
+            "Modulator",
+            st.modulator_load_pct / 100.0,
+            st.modulator_load_pct > 80.0,
+            format!("{:5.1} %", st.modulator_load_pct),
+        );
+        bar(
+            ui,
+            "This app",
+            st.process_cpu_pct / 150.0,
+            st.process_cpu_pct > 150.0,
+            format!("{:5.1} % of a core", st.process_cpu_pct),
+        );
+        let warn = |ui: &mut egui::Ui, bad: bool, text: String| {
+            ui.colored_label(
+                if bad {
+                    AMBER
+                } else {
+                    ui.visuals().text_color()
+                },
+                text,
+            );
+        };
+        warn(
+            ui,
+            st.dts_pcr_warnings > 0,
+            format!("Over the rate (dts < pcr): {}", st.dts_pcr_warnings),
+        );
+        warn(
+            ui,
+            st.clipped > 0,
+            format!("Peak {:.1} dBFS - clipped {}", st.peak_dbfs, st.clipped),
+        );
+        ui.label(format!(
+            "Sent {:02}:{:02}  - programme {:02}:{:02}",
+            (st.sent_s / 60.0) as u64,
+            (st.sent_s % 60.0) as u64,
+            (st.programme_s / 60.0) as u64,
+            (st.programme_s % 60.0) as u64,
+        ));
+        if !st.chain.is_empty() {
+            ui.label(format!("Encoder chain: {}", st.chain));
+        }
+    }
+
+    /// The spectrum of what the radio is given, with the occupied band
+    /// shaded and a line every 10 dB.
+    fn spectrum(&self, ui: &mut egui::Ui) {
+        let w = ui.available_width().max(200.0);
+        let h = (ui.available_height() - 4.0).clamp(120.0, 320.0);
+        let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::hover());
+        let p = ui.painter_at(r);
+        p.rect_filled(r, 0.0, Color32::from_rgb(16, 20, 24));
+        let fs = if self.span_hz > 0.0 {
             self.span_hz
         } else {
-            self.set.rate.hz(self.bandwidth()) as f64
-        };
-        ui.allocate_ui(vec2(ui.available_width(), sig_h), |ui| {
-            signal_view::show(
-                ui,
-                &SignalInput {
-                    spectrum_db: &self.smooth,
-                    centre_hz: centre,
-                    span_hz: span,
-                    occupied_hz: self.idle_cfg().occupied_hz(),
-                    levels: self.history.levels(),
-                    waterfall: tex,
-                    readout,
-                    empty_text: empty,
-                },
-            );
-        });
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("METERS")
-                .strong()
-                .color(Color32::from_gray(150)),
+            self.status.sample_rate_hz as f64
+        }
+        .max(1.0);
+        let occupied = self.idle_cfg().occupied_hz();
+        let half = (occupied / 2.0 / fs) as f32;
+        let band = egui::Rect::from_x_y_ranges(
+            r.center().x - r.width() * half..=r.center().x + r.width() * half,
+            r.y_range(),
         );
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let paced = match &self.session_cfg {
-                    Some(c) => match &c.sink {
-                        TxSink::Null { paced } | TxSink::IqFile { paced, .. } => *paced,
-                        TxSink::HackRf(_) | TxSink::Pluto(_) => true,
-                    },
-                    None => true,
-                };
-                meters::show(
-                    ui,
-                    &MetersView {
-                        status: &self.status,
-                        levels,
-                        paced,
-                        live,
-                    },
-                );
-            });
+        p.rect_filled(band, 0.0, Color32::from_rgb(24, 40, 58));
+        let y = |db: f32| r.top() + (-db / 100.0).clamp(0.0, 1.0) * r.height();
+        for k in 1..10 {
+            let yy = y(-10.0 * k as f32);
+            p.line_segment(
+                [egui::pos2(r.left(), yy), egui::pos2(r.right(), yy)],
+                (1.0, Color32::from_rgb(34, 40, 46)),
+            );
+        }
+        if self.session && self.smooth.len() > 1 {
+            let n = self.smooth.len();
+            let pts: Vec<egui::Pos2> = self
+                .smooth
+                .iter()
+                .enumerate()
+                .map(|(i, &db)| egui::pos2(r.left() + r.width() * i as f32 / (n - 1) as f32, y(db)))
+                .collect();
+            p.add(egui::Shape::line(pts, (1.0, Color32::from_rgb(111, 182, 255))));
+        }
+        p.text(
+            r.left_top() + vec2(6.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            if self.set.preview {
+                format!(
+                    "{:.3} MS/s - {:.2} MHz occupied - 10 dB a line",
+                    fs / 1e6,
+                    occupied / 1e6
+                )
+            } else {
+                "the preview is off (Advanced)".to_string()
+            },
+            egui::FontId::monospace(11.0),
+            Color32::GRAY,
+        );
     }
 
     fn safety_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("SAFETY")
-                .strong()
-                .color(Color32::from_gray(150)),
-        );
-        // Always visible, never a popup, and the very text the arm checks.
-        ui.add(
-            egui::Label::new(
-                RichText::new(self.licence_shown).color(Color32::from_rgb(255, 214, 140)),
-            )
-            .wrap(),
-        );
-        if let Some(w) = safety::television_warning(self.set.centre_hz) {
-            ui.label(RichText::new(w).color(RED).strong());
-        }
-        ui.add_space(4.0);
         let radio = self.sink_is_radio();
         let st = self.status.state;
-        ui.horizontal_wrapped(|ui| {
-            let r = ui.add_enabled(
-                radio && !self.status.armed,
-                egui::Checkbox::new(&mut self.read_ack, "I have read this"),
-            );
-            if !radio {
-                r.on_disabled_hover_text("Only the HackRF output needs an arm");
-            }
-            let armed = self.status.armed;
-            let can = safety::can_arm(st, radio, self.read_ack);
-            let label = if armed { "DISARM" } else { "ARM" };
-            let b = egui::Button::new(RichText::new(label).size(18.0).strong())
-                .min_size(vec2(100.0, 40.0));
-            let r = ui.add_enabled(armed || can, b);
-            let r = if !radio {
-                r.on_disabled_hover_text("A test output needs no arm")
-            } else if st != TxState::Ready && !armed {
-                r.on_disabled_hover_text(
-                    "Press Prepare first: ARM is available when the state is READY",
-                )
-            } else if !self.read_ack && !armed {
-                r.on_disabled_hover_text("Tick \"I have read this\" first")
-            } else {
-                r
-            };
-            if r.clicked() {
-                if armed {
-                    if let Some(h) = &self.host {
-                        h.send(Cmd::Disarm);
-                    }
-                } else {
-                    self.arm();
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 420.0).max(300.0));
+                // Always visible, never a popup, and the very text the arm checks.
+                ui.label(
+                    RichText::new(self.licence_shown)
+                        .small()
+                        .color(Color32::from_rgb(232, 201, 198)),
+                );
+                if let Some(w) = safety::television_warning(self.set.centre_hz) {
+                    ui.label(RichText::new(w).small().color(RED).strong());
                 }
-            }
-            if radio {
-                let text = safety::arm_text(&self.status);
-                ui.label(RichText::new(text).color(if self.status.armed {
-                    AMBER
-                } else {
-                    Color32::GRAY
-                }));
-            }
-
-            ui.add_space(12.0);
-            let can_tx =
-                safety::can_transmit(&self.status, self.status.armed, radio) && !self.stopping;
-            let fill = if radio {
-                DEEP_RED
-            } else {
-                Color32::from_rgb(34, 110, 60)
-            };
-            let b = egui::Button::new(
-                RichText::new(if radio { "TRANSMIT" } else { "START" })
-                    .size(18.0)
-                    .strong()
-                    .color(Color32::WHITE),
-            )
-            .fill(fill)
-            .min_size(vec2(130.0, 40.0));
-            let r = ui.add_enabled(can_tx, b);
-            let r = if radio && st == TxState::Ready && !self.status.armed {
-                r.on_disabled_hover_text(
-                    "ARM first (it lasts 60 s and is used up by one transmission)",
-                )
-            } else if st != TxState::Ready {
-                r.on_disabled_hover_text("Available when the state is READY")
-            } else {
-                r
-            };
-            if r.clicked() {
-                self.transmit();
-            }
-
-            ui.add_space(12.0);
-            let stop = egui::Button::new(
-                RichText::new("STOP")
-                    .size(26.0)
-                    .strong()
-                    .color(Color32::WHITE),
-            )
-            .fill(DEEP_RED)
-            .min_size(vec2(170.0, 52.0));
-            if ui
-                .add_enabled(self.locked(), stop)
-                .on_hover_text("Radio off, everything stopped (Esc or Space)")
-                .clicked()
-            {
-                self.stop();
-            }
-        });
-        ui.add_space(4.0);
-        self.output_row(ui);
-        ui.add_space(4.0);
-    }
-
-    fn output_row(&mut self, ui: &mut egui::Ui) {
-        let locked = self.locked();
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Output:");
-            let before = self.sink;
-            ui.add_enabled_ui(!locked, |ui| {
-                egui::ComboBox::from_id_salt("sink")
-                    .selected_text(self.sink.label())
-                    .show_ui(ui, |ui| {
-                        for k in [
-                            SinkKind::Test,
-                            SinkKind::IqFile,
-                            SinkKind::HackRf,
-                            SinkKind::Pluto,
-                        ] {
-                            ui.selectable_value(&mut self.sink, k, k.label());
-                        }
-                    });
+                let r = ui.add_enabled(
+                    radio && !self.status.armed,
+                    egui::Checkbox::new(&mut self.read_ack, "I have read this"),
+                );
+                if !radio {
+                    r.on_disabled_hover_text("Only a radio output needs an arm");
+                }
             });
-            if self.sink != before {
-                // A new output starts disarmed and unticked.
-                self.read_ack = false;
-            }
-            match self.sink {
-                SinkKind::Test => {
-                    ui.add_enabled(
-                        !locked,
-                        egui::Checkbox::new(&mut self.paced, "paced (real time)"),
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let big = |t: &str| RichText::new(t).strong().size(15.0);
+                let sending = st == TxState::Transmitting;
+                let stop = egui::Button::new(big("STOP").color(if sending {
+                    Color32::BLACK
+                } else {
+                    ui.visuals().text_color()
+                }))
+                .fill(if sending {
+                    RED
+                } else {
+                    Color32::from_rgb(44, 44, 44)
+                })
+                .min_size(vec2(if sending { 140.0 } else { 80.0 }, 34.0));
+                if ui
+                    .add_enabled(self.locked(), stop)
+                    .on_hover_text("Radio off, everything stopped (Esc or Space)")
+                    .clicked()
+                {
+                    self.stop();
+                }
+                let can_tx =
+                    safety::can_transmit(&self.status, self.status.armed, radio) && !self.stopping;
+                let r = ui.add_enabled(
+                    can_tx,
+                    egui::Button::new(big("TRANSMIT")).min_size(vec2(110.0, 34.0)),
+                );
+                let r = if radio && st == TxState::Ready && !self.status.armed {
+                    r.on_disabled_hover_text(
+                        "ARM first (it lasts 60 s and is used up by one transmission)",
                     )
-                    .on_hover_text("Off: generate as fast as possible (a speed test)");
-                    ui.label(RichText::new("Test output - no radio").color(GREEN));
+                } else if st != TxState::Ready {
+                    r.on_disabled_hover_text("Available when the state is READY")
+                } else {
+                    r
+                };
+                if r.clicked() {
+                    self.transmit();
                 }
-                SinkKind::IqFile => {
-                    ui.add_enabled_ui(!locked, |ui| {
-                        let hint = source::iq_file_name(
-                            self.set.centre_hz,
-                            self.set.rate.hz(self.bandwidth()),
-                        );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.iq_path)
-                                .desired_width(260.0)
-                                .hint_text(hint),
-                        );
-                        ui.label("seconds");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.iq_seconds)
-                                .desired_width(50.0)
-                                .hint_text("all"),
-                        );
-                        ui.checkbox(&mut self.paced, "paced");
-                    });
-                    ui.label(RichText::new("IQ file - no radio").color(GREEN));
-                }
-                SinkKind::HackRf => {
-                    ui.label(
-                        RichText::new("HackRF: this radiates when TRANSMIT is pressed")
-                            .color(AMBER),
+                if radio {
+                    let armed = self.status.armed;
+                    let label = match (armed, self.status.arm_seconds_left) {
+                        (true, Some(s)) => format!("ARMED {:.0} s", s.ceil().max(0.0)),
+                        (true, None) => "ARMED".to_string(),
+                        _ => "ARM".to_string(),
+                    };
+                    let can = safety::can_arm(st, radio, self.read_ack);
+                    let r = ui.add_enabled(
+                        armed || can,
+                        egui::Button::new(big(&label).color(AMBER)).min_size(vec2(100.0, 34.0)),
                     );
+                    let r = if armed {
+                        r.on_hover_text("Click to disarm")
+                    } else {
+                        r.on_disabled_hover_text("Prepare, and tick \"I have read this\"")
+                    };
+                    if r.clicked() {
+                        if armed {
+                            if let Some(h) = &self.host {
+                                h.send(Cmd::Disarm);
+                            }
+                        } else {
+                            self.arm();
+                        }
+                    }
                 }
-                SinkKind::Pluto => {
-                    ui.label("link");
-                    ui.add_enabled(
-                        !locked,
-                        egui::TextEdit::singleline(&mut self.pluto_uri)
-                            .desired_width(130.0)
-                            .hint_text("auto"),
-                    )
-                    .on_hover_text(
-                        "auto (USB with ADI's driver, else 192.168.2.1), usb, or ip:ADDRESS \
-                         (a Pluto+ on Ethernet)",
-                    );
-                    ui.label(
-                        RichText::new("Pluto: this radiates when TRANSMIT is pressed").color(AMBER),
-                    );
+                let can_prepare = safety::can_prepare(self.locked(), self.source_ready());
+                let r = ui.add_enabled(
+                    can_prepare,
+                    egui::Button::new(big("PREPARE")).min_size(vec2(100.0, 34.0)),
+                );
+                let r = if self.source_ready() {
+                    r.on_hover_text("Start the source and the modulator; the radio stays off")
+                } else {
+                    r.on_disabled_hover_text(self.source_missing())
+                };
+                if r.clicked() {
+                    self.prepare();
                 }
-            }
+            });
         });
     }
 
@@ -1943,7 +2474,9 @@ impl eframe::App for App {
         self.handle_dropped(ctx);
         self.handle_keys(ctx);
         self.poll_probe();
+        self.poll_dev_probe();
         self.poll_host();
+        self.update_picture(ctx);
         self.feed_demo();
         self.note_status_error();
         self.safety_tick(ctx);
@@ -1953,7 +2486,11 @@ impl eframe::App for App {
         // A live session repaints when the session thread says so (new rows,
         // a new state, the meters a few times a second); only the hooks that
         // have no session to say it keep a timer.
-        if self.demo.is_some() || self.opts.screenshot.is_some() || self.probe.is_some() {
+        if self.demo.is_some()
+            || self.opts.screenshot.is_some()
+            || self.probe.is_some()
+            || self.dev.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         let title = safety::window_title(&self.status);
@@ -1976,11 +2513,17 @@ impl eframe::App for App {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| self.banner(ui));
         }
-        egui::Panel::bottom("safety").show(ui, |ui| self.safety_panel(ui));
+        egui::Panel::bottom("safety")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(36, 29, 29))
+                    .inner_margin(8.0),
+            )
+            .show(ui, |ui| self.safety_panel(ui));
         egui::Panel::left("controls")
             .resizable(true)
-            .default_size(380.0)
-            .min_size(330.0)
+            .default_size(420.0)
+            .min_size(360.0)
             .show(ui, |ui| self.left_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| self.signal_and_meters(ui));
         let ctx = ui.ctx().clone();
@@ -2016,6 +2559,10 @@ mod tests {
         let ctx = egui::Context::default();
         let opts = Options::default();
         let mut app = App::new(opts, &ctx);
+        app.set.source = SourceKind::File;
+        // (Not whatever mode the user's own prefs file holds.)
+        app.set.mode = modeinfo::presets()[0].mode;
+        app.set.use_t2 = false;
         app.file = Some(PathBuf::from("C:/v/My Clip.mp4"));
         let c = app.build_config().unwrap();
         assert!(matches!(c.sink, TxSink::Null { paced: true }));
@@ -2050,6 +2597,9 @@ mod tests {
     fn the_pluto_output_starts_at_the_most_attenuation() {
         let ctx = egui::Context::default();
         let mut app = App::new(Options::default(), &ctx);
+        app.set.source = SourceKind::File;
+        app.set.mode = modeinfo::presets()[0].mode;
+        app.set.use_t2 = false;
         app.file = Some(PathBuf::from("C:/v/clip.mp4"));
         app.sink = SinkKind::Pluto;
         assert!(app.sink_is_radio());
@@ -2063,5 +2613,47 @@ mod tests {
             _ => panic!("expected the Pluto sink"),
         }
         assert!(!app.status.armed && !app.status.radiating);
+    }
+
+    /// Each source tab builds the source the library expects, and the
+    /// codec and call sign reach the config.
+    #[test]
+    fn every_source_builds_its_config() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(Options::default(), &ctx);
+        // No camera yet (the probe has not run): refused, not a panic.
+        app.set.source = SourceKind::Camera;
+        app.set.camera.clear();
+        assert!(app.build_config().is_err());
+        assert!(!app.source_ready());
+        app.set.camera = "USB Cam".into();
+        app.set.mic = Some("Mic".into());
+        let c = app.build_config().unwrap();
+        assert!(matches!(&c.source, Source::Camera { video, audio, .. }
+            if video == "USB Cam" && audio.as_deref() == Some("Mic")));
+
+        app.set.source = SourceKind::Test;
+        app.set.video_codec = VideoCodec::Av1;
+        app.set.callsign = "N0CALL".into();
+        app.set.overlay = true;
+        let c = app.build_config().unwrap();
+        assert_eq!(c.source, Source::Test);
+        assert_eq!(c.video.video_codec, VideoCodec::Av1);
+        assert_eq!(c.service.name, "N0CALL");
+        assert!(c.overlay);
+
+        app.set.source = SourceKind::Udp;
+        app.set.udp = "127.0.0.1:1234".into();
+        assert!(matches!(app.build_config().unwrap().source, Source::Udp(_)));
+        app.set.udp = "nonsense".into();
+        assert!(app.build_config().is_err());
+        assert!(!app.source_ready());
+
+        app.set.source = SourceKind::TsFile;
+        assert!(app.build_config().is_err());
+        app.file = Some(PathBuf::from("x.ts"));
+        let c = app.build_config().unwrap();
+        assert_eq!(c.source, Source::TsFile);
+        assert_eq!(c.input, PathBuf::from("x.ts"));
     }
 }

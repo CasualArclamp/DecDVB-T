@@ -8,12 +8,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use decdvbt_core::{Error, Result};
 
-use crate::config::{AudioCodec, EncoderChoice, TxConfig, VideoCodec};
+use crate::config::{AudioCodec, EncoderChoice, Source, TxConfig, VideoCodec};
+use crate::encode::{AUTO_ORDER, Engine, encoder_name};
 use crate::modes::VideoProfile;
 
 /// What ffprobe says about the input.
@@ -45,15 +47,20 @@ pub enum Chain {
     X264,
     /// `mpeg2video` (software, 0.37 core at 720p).
     Mpeg2,
+    /// Any other codec or engine (H.265, H.266, AV1, a card's encoder for a
+    /// camera): software decode and filters, the encoder's own options
+    /// ([`crate::encode::video_options`]).
+    Encoder(VideoCodec, Engine),
 }
 
 impl Chain {
     /// For the GUI's details line.
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Chain::NvencCuda => "NVENC (CUDA)",
-            Chain::X264 => "x264 veryfast",
-            Chain::Mpeg2 => "MPEG-2",
+            Chain::NvencCuda => "NVENC (CUDA)".into(),
+            Chain::X264 => "x264 veryfast".into(),
+            Chain::Mpeg2 => "MPEG-2".into(),
+            Chain::Encoder(c, e) => format!("{} on {}", c.label(), e.label()),
         }
     }
 }
@@ -267,47 +274,92 @@ fn nvenc_works(ffmpeg: &Path) -> bool {
     })
 }
 
-/// Which chain to use: run a 0.2 s encode of a `color` source through each
-/// candidate (NVENC 0.67 s, x264 0.15 s to test) and keep the first that
-/// works; cached for the process in a `OnceLock`. `h264_qsv` is compiled into
-/// ffmpeg here but fails at run time, which is why the encoder list is not
-/// enough.
-///
-/// `Auto` takes NVENC only for a progressive 8-bit source (CUDA's decoders
-/// and `scale_cuda` do not take the others well); x264 always works.
+/// Whether `codec` encodes on `engine` here: a 3-frame test encode, cached
+/// for the process. The encoder list is not enough: `h264_qsv` is compiled
+/// into the Gyan build and fails at run time, and NVENC without a card or
+/// driver does the same.
+fn encoder_works(ffmpeg: &Path, codec: VideoCodec, engine: Engine) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<(VideoCodec, Engine), bool>>> = OnceLock::new();
+    let Some(name) = encoder_name(codec, engine) else {
+        return false;
+    };
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(&ok) = cache.lock().unwrap().get(&(codec, engine)) {
+        return ok;
+    }
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=320x180:rate=25")
+        .args(["-frames:v", "3", "-c:v", name, "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    no_console(&mut cmd);
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+    cache.lock().unwrap().insert((codec, engine), ok);
+    ok
+}
+
+/// Which chain to use. H.264 from a file on NVIDIA keeps the measured CUDA
+/// chain (decode, scale and encode on the card, `NvencCuda`; only for a
+/// progressive 8-bit source, and not with the call-sign overlay, which needs
+/// the frames in memory). Everything else picks an engine: the one asked for
+/// if a test encode works, else the first of [`AUTO_ORDER`] that does.
+/// `h264`'s CPU engine is the `X264` chain, MPEG-2 always `Mpeg2`.
 pub fn detect_chain(
     ffmpeg: &Path,
     choice: EncoderChoice,
+    codec: VideoCodec,
     info: Option<&VideoInfo>,
+    cuda_ok: bool,
 ) -> Result<Chain> {
-    match choice {
-        EncoderChoice::X264 => Ok(Chain::X264),
-        EncoderChoice::Nvenc => {
-            if nvenc_works(ffmpeg) {
-                Ok(Chain::NvencCuda)
-            } else {
-                Err(Error::Other(
-                    "the NVIDIA encoder (NVENC with CUDA) does not work on this PC".into(),
-                ))
-            }
-        }
-        EncoderChoice::Auto => {
-            let suits = info.is_none_or(|i| !i.interlaced && i.bit_depth <= 8);
-            Ok(if suits && nvenc_works(ffmpeg) {
-                Chain::NvencCuda
-            } else {
-                Chain::X264
-            })
+    if codec == VideoCodec::Mpeg2 {
+        return Ok(Chain::Mpeg2);
+    }
+    if codec == VideoCodec::H264
+        && cuda_ok
+        && matches!(choice, EncoderChoice::Auto | EncoderChoice::Nvenc)
+    {
+        let suits = choice == EncoderChoice::Nvenc
+            || info.is_none_or(|i| !i.interlaced && i.bit_depth <= 8);
+        if suits && nvenc_works(ffmpeg) {
+            return Ok(Chain::NvencCuda);
         }
     }
+    let engine = match choice.engine() {
+        Some(e) if encoder_works(ffmpeg, codec, e) => e,
+        Some(e) => {
+            return Err(Error::Other(format!(
+                "{} does not encode {} on this PC",
+                e.label(),
+                codec.label()
+            )));
+        }
+        None => AUTO_ORDER
+            .into_iter()
+            .find(|&e| encoder_works(ffmpeg, codec, e))
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "this ffmpeg has no working {} encoder",
+                    codec.label()
+                ))
+            })?,
+    };
+    Ok(match (codec, engine) {
+        (VideoCodec::H264, Engine::Cpu) => Chain::X264,
+        (c, e) => Chain::Encoder(c, e),
+    })
 }
 
 /// The DVB service_type (EN 300 468 table 87) for the video we send.
 pub fn service_type(video: VideoCodec, profile: &VideoProfile) -> u8 {
     let hd = profile.height > 576;
     match (video, hd) {
-        (VideoCodec::H264, true) => 0x19, // advanced codec HD digital television
-        (VideoCodec::H264, false) => 0x16, // advanced codec SD digital television
+        // HEVC digital television (0x1F); H.266 and AV1 have no value of
+        // their own in EN 300 468, so they go out as advanced-codec services.
+        (VideoCodec::H265, _) => 0x1F,
+        (VideoCodec::H264 | VideoCodec::H266 | VideoCodec::Av1, true) => 0x19, // advanced codec HD
+        (VideoCodec::H264 | VideoCodec::H266 | VideoCodec::Av1, false) => 0x16, // advanced codec SD
         (VideoCodec::Mpeg2, true) => 0x11, // MPEG-2 HD digital television
         (VideoCodec::Mpeg2, false) => 0x01, // digital television
     }
@@ -340,16 +392,33 @@ pub fn sanitise_name(s: &str) -> String {
 /// chain, encoder, `-muxrate`, service ids, `pipe:1`.
 ///
 /// Invariants (tests check each): `-muxrate` is [`TxConfig::mux_rate_bps`];
-/// `-threads 1` before `-i`; `-maxrate` and `-bufsize` always present;
-/// `-pcr_period 20`; `-muxdelay 0.4`; `-mpegts_flags +system_b+nit` only if
-/// `muxer_has_nit`; `-stream_loop -1` before `-i` iff `cfg.loop_input`;
-/// `-progress pipe:2 -nostats`; output is `pipe:1`; never `-re`.
+/// `-threads 1` before `-i`; `-maxrate` and `-bufsize` always present for an
+/// encoded chain; `-pcr_period 20`; `-muxdelay 0.4`; `-mpegts_flags
+/// +system_b+nit` only if `muxer_has_nit`; `-stream_loop -1` before `-i` iff
+/// `cfg.loop_input` (a file source); `-progress pipe:2 -nostats`; output is
+/// `pipe:1` (then, with a preview, the preview's own output); never `-re` for
+/// a file.
 pub fn command_line(
     cfg: &TxConfig,
     info: Option<&VideoInfo>,
     chain: Chain,
     profile: &VideoProfile,
     muxer_has_nit: bool,
+) -> Vec<String> {
+    command_line_with(cfg, info, chain, profile, muxer_has_nit, None)
+}
+
+/// [`command_line`] with a `preview` URL (ffmpeg connects to it): the
+/// picture small (320x180, 10 fps, RGBA) and the sound (8 kHz mono float) in
+/// Matroska, for the window. A chain on the card's frames (`NvencCuda`) and a
+/// transport stream that is not re-encoded have no preview.
+pub fn command_line_with(
+    cfg: &TxConfig,
+    info: Option<&VideoInfo>,
+    chain: Chain,
+    profile: &VideoProfile,
+    muxer_has_nit: bool,
+    preview: Option<&str>,
 ) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut add = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
@@ -363,166 +432,333 @@ pub fn command_line(
         "-nostats",
     ]);
 
+    let source = &cfg.source;
+    let encodes = source.encodes();
+    let (w, h) = (profile.width, profile.height);
+    let fps = cfg.video.fps;
+    let audio_wanted = encodes && cfg.video.audio_codec != AudioCodec::None;
+    let preview = preview.filter(|_| encodes && chain != Chain::NvencCuda);
+
     // Input. The decoder's own threads are never left at "auto": 16 threads
     // spent twice the CPU of one (TX_DESIGN.md §4.3).
     add(&["-threads", "1"]);
-    match chain {
-        Chain::NvencCuda => add(&["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]),
-        Chain::X264 | Chain::Mpeg2 => {
+    // Where the sound comes from: input 0 (a file, DirectShow's camera and
+    // microphone) or input 1 (a separate device, the test tone); empty when
+    // there is none.
+    let mut audio_in = if audio_wanted { "0:a:0?" } else { "" }.to_string();
+    match source {
+        Source::File => {
+            match chain {
+                Chain::NvencCuda => add(&["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]),
+                _ => {
+                    add(&["-filter_threads", "1"]);
+                    // 4K or 50/60 fps: software decode cannot keep up on one
+                    // thread; the card decodes and the frames come back.
+                    if info.is_some_and(|i| i.height > 1080 || i.fps > 30.5) {
+                        add(&["-hwaccel", "auto"]);
+                    }
+                }
+            }
+            if cfg.loop_input {
+                add(&["-stream_loop", "-1"]);
+            }
+            let input = cfg.input.to_string_lossy().into_owned();
+            // A name starting with '-' would be read as an option.
+            let input = if input.starts_with('-') {
+                format!("./{input}")
+            } else {
+                input
+            };
+            add(&["-i", &input]);
+        }
+        Source::TsFile => {
+            if cfg.loop_input {
+                add(&["-stream_loop", "-1"]);
+            }
+            let input = cfg.input.to_string_lossy().into_owned();
+            let input = if input.starts_with('-') {
+                format!("./{input}")
+            } else {
+                input
+            };
+            add(&["-i", &input]);
+        }
+        Source::Udp(addr) => {
+            let url = format!("udp://{addr}?fifo_size=5000000&overrun_nonfatal=1");
+            add(&["-i", &url]);
+        }
+        Source::Test => {
+            add(&["-filter_threads", "1", "-re", "-f", "lavfi", "-i"]);
+            add(&[&format!("testsrc2=size={w}x{h}:rate={fps}")]);
+            if audio_wanted {
+                add(&["-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000"]);
+                audio_in = "1:a:0".into();
+            }
+        }
+        Source::Camera { video, audio, mode } => {
             add(&["-filter_threads", "1"]);
-            // 4K or 50/60 fps: software decode cannot keep up on one thread;
-            // the card decodes and the frames come back to memory.
-            if info.is_some_and(|i| i.height > 1080 || i.fps > 30.5) {
-                add(&["-hwaccel", "auto"]);
+            let mut have_audio = audio_wanted;
+            if cfg!(windows) {
+                add(&["-f", "dshow", "-rtbufsize", "64M"]);
+                if let Some(m) = mode {
+                    add(&[
+                        "-video_size",
+                        &format!("{}x{}", m.width, m.height),
+                        "-framerate",
+                        &m.fps.to_string(),
+                    ]);
+                    if m.format == "mjpeg" {
+                        add(&["-vcodec", "mjpeg"]);
+                    } else {
+                        add(&["-pixel_format", &m.format]);
+                    }
+                }
+                let mut spec = format!("video={video}");
+                match audio {
+                    Some(mic) if have_audio => spec.push_str(&format!(":audio={mic}")),
+                    _ => have_audio = false,
+                }
+                add(&["-i", &spec]);
+                audio_in = "0:a:0".into();
+            } else {
+                add(&["-f", "v4l2"]);
+                if let Some(m) = mode {
+                    add(&[
+                        "-video_size",
+                        &format!("{}x{}", m.width, m.height),
+                        "-framerate",
+                        &m.fps.to_string(),
+                    ]);
+                }
+                add(&["-i", video]);
+                match audio {
+                    Some(mic) if have_audio => add(&["-f", "alsa", "-i", mic]),
+                    _ => have_audio = false,
+                }
+                audio_in = "1:a:0".into();
+            }
+            if !have_audio {
+                audio_in.clear();
             }
         }
     }
-    if cfg.loop_input {
-        add(&["-stream_loop", "-1"]);
-    }
-    let input = cfg.input.to_string_lossy().into_owned();
-    // A name starting with '-' would be read as an option.
-    let input = if input.starts_with('-') {
-        format!("./{input}")
-    } else {
-        input
-    };
-    add(&["-i", &input, "-map", "0:v:0", "-map", "0:a:0?"]);
+    let audio_on = !audio_in.is_empty();
 
-    // Picture. SD is anamorphic: 720x576 (352x288 at the lowest rates) with
-    // the sample aspect ratio that makes it 16:9 (or 4:3 for a 4:3 source). HD keeps the source's aspect
-    // ratio inside the frame, so the size varies, which receivers accept.
-    let (w, h) = (profile.width, profile.height);
-    let fps = cfg.video.fps;
-    let scale_name = if chain == Chain::NvencCuda {
-        "scale_cuda"
-    } else {
-        "scale"
-    };
-    let sd = h <= 576;
-    let dar = info
-        .filter(|i| i.height > 0)
-        .map(|i| i.width as f64 / i.height as f64);
-    // The pixels' shape that shows `w`x`h` at 16:9 (4:3 for a 4:3 source):
-    // 64/45 and 16/15 for 720x576, 16/11 and 12/11 for the low rates' 352x288.
-    let (dw, dh) = if dar.is_some_and(|d| d < 1.5) {
-        (4, 3)
-    } else {
-        (16, 9)
-    };
-    let sar = {
-        let (n, d) = (dw * h, dh * w);
-        let g = gcd(n, d);
-        format!("{}/{}", n / g, d / g)
-    };
-    let mut vf = String::new();
-    if chain != Chain::NvencCuda && info.is_some_and(|i| i.interlaced) {
-        vf.push_str("yadif=deint=interlaced,");
+    let mut flags = String::from("+system_b");
+    if muxer_has_nit {
+        flags.push_str("+nit");
     }
-    if sd {
-        vf.push_str(&format!("{scale_name}={w}:{h},setsar={sar}"));
-    } else {
-        vf.push_str(&format!(
-            "{scale_name}={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2"
-        ));
-    }
-    vf.push_str(&format!(",fps={fps}"));
-    if chain != Chain::NvencCuda {
-        vf.push_str(",format=yuv420p");
-    }
-    add(&["-vf", &vf]);
-
-    // Video encoder.
-    let gop = (fps * cfg.video.gop_seconds.max(1)).to_string();
-    let (vb, maxrate) = (
-        format!("{}k", profile.video_kbps),
-        format!("{}k", profile.maxrate_kbps),
-    );
-    let mut bufsize_kbps = profile.bufsize_kbps;
-    match chain {
-        Chain::NvencCuda => add(&[
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p4",
-            "-tune",
-            "hq",
-            "-profile:v",
-            "high",
-            "-rc",
-            "cbr",
-        ]),
-        Chain::X264 => add(&[
-            "-c:v",
-            "libx264",
-            "-threads",
-            "4",
-            "-preset",
-            "veryfast",
-            "-profile:v",
-            "high",
-            "-keyint_min",
-            &gop,
-            "-sc_threshold",
-            "0",
-        ]),
-        Chain::Mpeg2 => {
-            add(&["-c:v", "mpeg2video", "-threads", "4"]);
-            // MP@ML's decoder buffer is 1 835 008 bits; bigger is invalid for
-            // an SD receiver.
-            if !(w > 720 || h > 576) {
-                bufsize_kbps = bufsize_kbps.min(1835);
-            }
-        }
-    }
-    let bufsize = format!("{bufsize_kbps}k");
-    add(&[
-        "-b:v", &vb, "-maxrate", &maxrate, "-bufsize", &bufsize, "-g", &gop, "-bf", "2",
-    ]);
-
-    // Audio.
     let audio_codec = if chain == Chain::Mpeg2 {
         AudioCodec::Mp2
     } else {
         cfg.video.audio_codec
     };
-    let ab = format!("{}k", profile.audio_kbps);
-    add(&[
-        "-c:a",
-        if audio_codec == AudioCodec::Mp2 {
-            "mp2"
-        } else {
-            "aac"
-        },
-        "-b:a",
-        &ab,
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-        "-af",
-        "aresample=async=1:first_pts=0",
-    ]);
+    let video_codec = match chain {
+        Chain::Mpeg2 => VideoCodec::Mpeg2,
+        Chain::Encoder(c, _) => c,
+        _ => VideoCodec::H264,
+    };
 
-    // Mux: constant rate, exact PCR, the service identity.
-    let mut flags = String::from("+system_b");
-    if muxer_has_nit {
-        flags.push_str("+nit");
+    // The sound is split for the preview's meter (through the filter graph,
+    // which then also carries its resampling), except a file's: it may have
+    // none.
+    let split_audio = preview.is_some() && audio_on && !matches!(source, Source::File);
+    if !encodes {
+        // A transport stream as it is: every stream copied, the muxer
+        // restamping the PCRs to the channel's constant rate.
+        add(&["-map", "0", "-c", "copy"]);
+    } else {
+        // Picture. SD is anamorphic: 720x576 (352x288 at the lowest rates)
+        // with the sample aspect ratio that makes it 16:9 (or 4:3 for a 4:3
+        // source). HD keeps the source's aspect ratio inside the frame, so
+        // the size varies, which receivers accept.
+        let scale_name = if chain == Chain::NvencCuda {
+            "scale_cuda"
+        } else {
+            "scale"
+        };
+        let sd = h <= 576;
+        let dar = info
+            .filter(|i| i.height > 0)
+            .map(|i| i.width as f64 / i.height as f64);
+        // The pixels' shape that shows `w`x`h` at 16:9 (4:3 for a 4:3
+        // source): 64/45 and 16/15 for 720x576, 16/11 and 12/11 for the low
+        // rates' 352x288.
+        let (dw, dh) = if dar.is_some_and(|d| d < 1.5) {
+            (4, 3)
+        } else {
+            (16, 9)
+        };
+        let sar = {
+            let (n, d) = (dw * h, dh * w);
+            let g = gcd(n, d);
+            format!("{}/{}", n / g, d / g)
+        };
+        let mut vf = String::new();
+        if chain != Chain::NvencCuda && info.is_some_and(|i| i.interlaced) {
+            vf.push_str("yadif=deint=interlaced,");
+        }
+        if sd {
+            vf.push_str(&format!("{scale_name}={w}:{h},setsar={sar}"));
+        } else {
+            vf.push_str(&format!(
+                "{scale_name}={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+            ));
+        }
+        vf.push_str(&format!(",fps={fps}"));
+        if chain != Chain::NvencCuda {
+            vf.push_str(",format=yuv420p");
+            if cfg.overlay && !cfg.service.name.is_empty() {
+                vf.push(',');
+                vf.push_str(&crate::encode::overlay_filter(&cfg.service.name, h));
+            }
+        }
+
+        let mut add = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
+        if preview.is_some() {
+            let mut graph = format!(
+                "[0:v:0]{vf},split=2[enc][pv0];[pv0]fps=10,scale=320:180:force_original_aspect_ratio=decrease,\
+                 pad=320:180:-1:-1,format=rgba[pv]"
+            );
+            if split_audio {
+                graph.push_str(&format!(
+                    ";[{audio_in}]aresample=48000,asplit=2[aenc][apv0];[apv0]aresample=8000,\
+                     aformat=sample_fmts=flt:channel_layouts=mono[apv]"
+                ));
+                add(&[
+                    "-filter_complex",
+                    &graph,
+                    "-map",
+                    "[enc]",
+                    "-map",
+                    "[aenc]",
+                ]);
+            } else {
+                add(&["-filter_complex", &graph, "-map", "[enc]"]);
+                if audio_on {
+                    add(&["-map", &audio_in]);
+                }
+            }
+        } else {
+            add(&["-vf", &vf, "-map", "0:v:0"]);
+            if audio_on {
+                add(&["-map", &audio_in]);
+            }
+        }
+
+        // Video encoder.
+        let gop = (fps * cfg.video.gop_seconds.max(1)).to_string();
+        let (vb, maxrate) = (
+            format!("{}k", profile.video_kbps),
+            format!("{}k", profile.maxrate_kbps),
+        );
+        let mut bufsize_kbps = profile.bufsize_kbps;
+        match chain {
+            Chain::NvencCuda => add(&[
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p4",
+                "-tune",
+                "hq",
+                "-profile:v",
+                "high",
+                "-rc",
+                "cbr",
+            ]),
+            Chain::X264 => add(&[
+                "-c:v",
+                "libx264",
+                "-threads",
+                "4",
+                "-preset",
+                "veryfast",
+                "-profile:v",
+                "high",
+                "-keyint_min",
+                &gop,
+                "-sc_threshold",
+                "0",
+            ]),
+            Chain::Mpeg2 => {
+                add(&["-c:v", "mpeg2video", "-threads", "4"]);
+                // MP@ML's decoder buffer is 1 835 008 bits; bigger is invalid
+                // for an SD receiver.
+                if !(w > 720 || h > 576) {
+                    bufsize_kbps = bufsize_kbps.min(1835);
+                }
+            }
+            Chain::Encoder(..) => {}
+        }
+        if let Chain::Encoder(codec, engine) = chain {
+            let o = crate::encode::video_options(
+                codec,
+                engine,
+                profile.video_kbps,
+                profile.maxrate_kbps,
+                bufsize_kbps,
+                fps * cfg.video.gop_seconds.max(1),
+            );
+            a.extend(o);
+        } else {
+            let bufsize = format!("{bufsize_kbps}k");
+            a.extend(
+                [
+                    "-b:v", &vb, "-maxrate", &maxrate, "-bufsize", &bufsize, "-g", &gop, "-bf",
+                    "2",
+                ]
+                .map(String::from),
+            );
+        }
+
+        // Audio.
+        if audio_on {
+            let ab = format!("{}k", profile.audio_kbps);
+            let channels = if matches!(source, Source::Camera { .. }) {
+                "1"
+            } else {
+                "2"
+            };
+            a.extend(
+                [
+                    "-c:a",
+                    if audio_codec == AudioCodec::Mp2 {
+                        "mp2"
+                    } else {
+                        "aac"
+                    },
+                    "-b:a",
+                    &ab,
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    channels,
+                ]
+                .map(String::from),
+            );
+            // (`-af` cannot be used on a stream the filter graph makes.)
+            if !split_audio {
+                a.extend(["-af", "aresample=async=1:first_pts=0"].map(String::from));
+            }
+        }
     }
-    if audio_codec == AudioCodec::AacLatm {
+    if audio_codec == AudioCodec::AacLatm && audio_on {
         flags.push_str("+latm");
     }
-    let rate = cfg.mux_rate_bps().to_string();
-    let s = &cfg.service;
-    let stype = service_type(
-        if chain == Chain::Mpeg2 {
-            VideoCodec::Mpeg2
-        } else {
-            VideoCodec::H264
-        },
-        profile,
-    )
+
+    // Mux: constant rate, exact PCR, the service identity.
+    // A live source (camera, test pattern, UDP) keeps its own time, so the
+    // multiplex runs 0.2 % under the channel's rate: the modulator fills the
+    // difference with nulls and the ring never fills.
+    let mux = cfg.mux_rate_bps();
+    let rate = if source.is_live() {
+        (mux as f64 * 0.998).floor() as u64
+    } else {
+        mux
+    }
     .to_string();
+    let s = &cfg.service;
+    let stype = service_type(video_codec, profile).to_string();
     let (sid, onid, tsid) = (
         s.service_id.to_string(),
         s.original_network_id.to_string(),
@@ -530,6 +766,7 @@ pub fn command_line(
     );
     let provider = format!("service_provider={}", sanitise_name(&s.provider));
     let name = format!("service_name={}", sanitise_name(&s.name));
+    let mut add = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
     add(&[
         "-muxdelay",
         "0.4",
@@ -555,6 +792,23 @@ pub fn command_line(
         &name,
         "pipe:1",
     ]);
+    if let Some(url) = preview {
+        add(&["-map", "[pv]", "-c:v", "rawvideo"]);
+        if audio_on && !matches!(source, Source::File) {
+            add(&["-map", "[apv]", "-c:a", "pcm_f32le"]);
+        }
+        add(&[
+            "-f",
+            "matroska",
+            "-live",
+            "1",
+            "-cluster_time_limit",
+            "100",
+            "-flush_packets",
+            "1",
+            url,
+        ]);
+    }
     a
 }
 
@@ -759,6 +1013,142 @@ mod tests {
         assert_eq!(after(&a, "-c:v"), "mpeg2video");
         assert_eq!(after(&a, "-c:a"), "mp2");
         assert_eq!(after(&a, "-mpegts_service_type"), "17");
+    }
+
+    fn with_source(source: Source) -> (TxConfig, VideoProfile) {
+        let mut c = cfg(Modulation::Qam64, Rate::R2_3, Guard::G1_32);
+        c.source = source;
+        let p = VideoProfile::for_rate(c.mux_rate_bps());
+        (c, p)
+    }
+
+    #[test]
+    fn the_other_codecs_use_their_own_encoders_and_service_types() {
+        use crate::encode::Engine;
+        let (c, p) = with_source(Source::Test);
+        for (codec, engine, name, stype) in [
+            (VideoCodec::H265, Engine::Cpu, "libx265", "31"),
+            (VideoCodec::H265, Engine::Nvenc, "hevc_nvenc", "31"),
+            (VideoCodec::H266, Engine::Cpu, "libvvenc", "25"),
+            (VideoCodec::Av1, Engine::Cpu, "libsvtav1", "25"),
+            (VideoCodec::Av1, Engine::Nvenc, "av1_nvenc", "25"),
+        ] {
+            let a = command_line(&c, None, Chain::Encoder(codec, engine), &p, true);
+            assert_eq!(after(&a, "-c:v"), name);
+            assert_eq!(after(&a, "-mpegts_service_type"), stype, "{name}");
+            assert_eq!(after(&a, "-muxdelay"), "0.4");
+            assert_eq!(a.last().unwrap(), "pipe:1");
+        }
+        // SVT-AV1 takes its key frame period in its own params; the others `-g`.
+        let a = command_line(&c, None, Chain::Encoder(VideoCodec::Av1, Engine::Cpu), &p, true);
+        assert!(!a.contains(&"-g".to_string()));
+        assert!(after(&a, "-svtav1-params").contains("keyint=25"));
+        let a = command_line(&c, None, Chain::Encoder(VideoCodec::H265, Engine::Cpu), &p, true);
+        assert_eq!(after(&a, "-g"), "25");
+    }
+
+    #[test]
+    fn the_test_pattern_and_the_camera_are_live_and_run_under_the_rate() {
+        let (c, p) = with_source(Source::Test);
+        let a = command_line(&c, None, Chain::X264, &p, true);
+        assert!(a.contains(&"lavfi".to_string()));
+        assert!(a.iter().any(|x| x.starts_with("testsrc2=size=1920x1080:rate=25")));
+        assert_eq!(after(&a, "-map"), "0:v:0");
+        // Live: 0.2 % under the channel's rate, and no looping.
+        let rate = (c.mux_rate_bps() as f64 * 0.998).floor() as u64;
+        assert_eq!(after(&a, "-muxrate"), rate.to_string());
+        assert!(!a.contains(&"-stream_loop".to_string()));
+        assert!(a.contains(&"sine=frequency=1000:sample_rate=48000".to_string()));
+        assert!(a.contains(&"1:a:0".to_string()));
+
+        let camera = Source::Camera {
+            video: "USB Cam".into(),
+            audio: Some("Mic".into()),
+            mode: Some(crate::encode::CameraMode {
+                width: 1280,
+                height: 720,
+                fps: 30,
+                format: "mjpeg".into(),
+            }),
+        };
+        let (c, p) = with_source(camera);
+        let a = command_line(&c, None, Chain::X264, &p, true);
+        if cfg!(windows) {
+            assert_eq!(after(&a, "-f"), "dshow");
+            assert_eq!(after(&a, "-i"), "video=USB Cam:audio=Mic");
+            assert_eq!(after(&a, "-video_size"), "1280x720");
+            assert_eq!(after(&a, "-vcodec"), "mjpeg");
+        }
+        assert_eq!(after(&a, "-muxrate"), rate.to_string());
+        // A camera is mono.
+        assert_eq!(after(&a, "-ac"), "1");
+        // No microphone: no audio at all.
+        let mut c2 = c.clone();
+        if let Source::Camera { audio, .. } = &mut c2.source {
+            *audio = None;
+        }
+        let a = command_line(&c2, None, Chain::X264, &p, true);
+        assert!(!a.contains(&"-c:a".to_string()));
+        assert!(!after(&a, "-mpegts_flags").contains("latm"));
+    }
+
+    #[test]
+    fn a_transport_stream_is_copied_not_encoded() {
+        for source in [Source::TsFile, Source::Udp("127.0.0.1:1234".parse().unwrap())] {
+            let (mut c, p) = with_source(source.clone());
+            c.input = "in.ts".into();
+            let a = command_line(&c, None, Chain::X264, &p, true);
+            assert_eq!(after(&a, "-c"), "copy");
+            assert!(!a.contains(&"-c:v".to_string()));
+            assert!(!a.contains(&"-vf".to_string()));
+            assert!(!a.contains(&"-maxrate".to_string()));
+            assert_eq!(after(&a, "-map"), "0");
+            assert_eq!(after(&a, "-f"), "mpegts");
+            match source {
+                Source::TsFile => {
+                    assert_eq!(after(&a, "-i"), "in.ts");
+                    assert!(pos(&a, "-stream_loop") < pos(&a, "-i"));
+                    assert_eq!(after(&a, "-muxrate"), c.mux_rate_bps().to_string());
+                }
+                _ => {
+                    assert!(after(&a, "-i").starts_with("udp://127.0.0.1:1234?"));
+                    assert!(!a.contains(&"-stream_loop".to_string()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_preview_is_a_second_output_and_the_sound_is_not_filtered_twice() {
+        let (mut c, p) = with_source(Source::Test);
+        c.overlay = true;
+        c.service.name = "N0CALL".into();
+        let url = "tcp://127.0.0.1:5555";
+        let a = command_line_with(&c, None, Chain::X264, &p, true, Some(url));
+        let g = after(&a, "-filter_complex");
+        assert!(g.contains("split=2[enc][pv0]") && g.contains("drawtext="));
+        assert!(g.contains("asplit=2[aenc][apv0]"));
+        // The graph makes the audio: `-af` on the same stream is an error.
+        assert!(!a.contains(&"-af".to_string()));
+        assert!(!a.contains(&"-vf".to_string()));
+        assert!(pos(&a, "pipe:1") < pos(&a, "[pv]"));
+        assert_eq!(a.last().unwrap(), url);
+        // Without a preview the one chain, with the audio filter.
+        let a = command_line_with(&c, None, Chain::X264, &p, true, None);
+        assert!(a.contains(&"-vf".to_string()) && a.contains(&"-af".to_string()));
+        // The card's own frames and a copied stream have no preview.
+        let a = command_line_with(&c, None, Chain::NvencCuda, &p, true, Some(url));
+        assert!(!a.contains(&"-filter_complex".to_string()));
+        assert_eq!(a.last().unwrap(), "pipe:1");
+    }
+
+    #[test]
+    fn no_audio_means_no_audio() {
+        let (mut c, p) = with_source(Source::File);
+        c.video.audio_codec = AudioCodec::None;
+        let a = command_line(&c, None, Chain::X264, &p, true);
+        assert!(!a.contains(&"-c:a".to_string()));
+        assert!(!a.contains(&"0:a:0?".to_string()));
     }
 
     #[test]

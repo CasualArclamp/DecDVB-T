@@ -114,24 +114,133 @@ impl Default for HackRfTxConfig {
     }
 }
 
-/// Which encoder chain makes the video.
+/// Which engine encodes the video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EncoderChoice {
-    /// NVENC with CUDA decode and scale if a test encode works, else x264.
+    /// A graphics card's encoder if a test encode works (NVENC, AMF, Quick
+    /// Sync, in that order), else the CPU.
     #[default]
     Auto,
-    /// The NVIDIA chain only (fails if it does not work).
+    /// The CPU (libx264, libx265, libvvenc, SVT-AV1, mpeg2video). Works anywhere.
+    Cpu,
+    /// NVIDIA's encoder (fails if it does not work).
     Nvenc,
-    /// libx264 `veryfast`, hardware decode where it helps. Works anywhere.
-    X264,
+    /// AMD's.
+    Amf,
+    /// Intel's.
+    Qsv,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+impl EncoderChoice {
+    /// The engine asked for, `None` for automatic.
+    pub fn engine(self) -> Option<crate::encode::Engine> {
+        use crate::encode::Engine;
+        match self {
+            EncoderChoice::Auto => None,
+            EncoderChoice::Cpu => Some(Engine::Cpu),
+            EncoderChoice::Nvenc => Some(Engine::Nvenc),
+            EncoderChoice::Amf => Some(Engine::Amf),
+            EncoderChoice::Qsv => Some(Engine::Qsv),
+        }
+    }
+}
+
+/// A video codec. H.264 and MPEG-2 are what DVB-T receivers decode; H.265 is
+/// in the standard's service types (0x1F) and plays on newer sets; H.266 and
+/// AV1 are for software receivers (DecDVB-T's own, VLC, ffplay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum VideoCodec {
     #[default]
     H264,
+    H265,
+    H266,
+    Av1,
     /// MPEG-2 video: what the oldest receivers want (pairs with MP2 audio).
     Mpeg2,
+}
+
+impl VideoCodec {
+    pub const ALL: [VideoCodec; 5] = [
+        VideoCodec::H264,
+        VideoCodec::H265,
+        VideoCodec::H266,
+        VideoCodec::Av1,
+        VideoCodec::Mpeg2,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "H.264",
+            VideoCodec::H265 => "H.265",
+            VideoCodec::H266 => "H.266",
+            VideoCodec::Av1 => "AV1",
+            VideoCodec::Mpeg2 => "MPEG-2",
+        }
+    }
+
+    /// For prefs and the command line.
+    pub fn key(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "h264",
+            VideoCodec::H265 => "h265",
+            VideoCodec::H266 => "h266",
+            VideoCodec::Av1 => "av1",
+            VideoCodec::Mpeg2 => "mpeg2",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<VideoCodec> {
+        let s = s.to_ascii_lowercase();
+        Self::ALL.into_iter().find(|c| {
+            c.key() == s
+                || matches!(
+                    (c, s.as_str()),
+                    (VideoCodec::H265, "hevc")
+                        | (VideoCodec::H266, "vvc")
+                        | (VideoCodec::H264, "avc")
+                )
+        })
+    }
+}
+
+/// Where the programme comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Source {
+    /// A video file, encoded (`TxConfig::input`, looped by `loop_input`).
+    #[default]
+    File,
+    /// A camera and microphone, by the names the system gives them. `mode`
+    /// is a capture mode from [`crate::encode::camera_modes`], or `None` for
+    /// the camera's default.
+    Camera {
+        video: String,
+        audio: Option<String>,
+        mode: Option<crate::encode::CameraMode>,
+    },
+    /// ffmpeg's test picture and a 1 kHz tone (no camera needed).
+    Test,
+    /// A transport stream file (`TxConfig::input`), remultiplexed to the
+    /// channel's rate without re-encoding.
+    TsFile,
+    /// A transport stream arriving on UDP (OBS, ffmpeg elsewhere), likewise.
+    Udp(std::net::SocketAddr),
+}
+
+impl Source {
+    /// Whether ffmpeg encodes it (everything but a transport stream).
+    pub fn encodes(&self) -> bool {
+        !matches!(self, Source::TsFile | Source::Udp(_))
+    }
+
+    /// Whether it is live (paced by the world, not by the pipe).
+    pub fn is_live(&self) -> bool {
+        matches!(self, Source::Camera { .. } | Source::Udp(_) | Source::Test)
+    }
+
+    /// Whether `TxConfig::input` names its file.
+    pub fn uses_file(&self) -> bool {
+        matches!(self, Source::File | Source::TsFile)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -143,6 +252,8 @@ pub enum AudioCodec {
     AacAdts,
     /// MPEG-1 layer II: the safest for hardware receivers.
     Mp2,
+    /// No sound.
+    None,
 }
 
 /// What ffmpeg is asked for. Sizes and bitrates come from the mode
@@ -206,8 +317,13 @@ impl Default for ServiceInfo {
 /// Everything a [`crate::session::TxSession`] needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TxConfig {
-    /// The video file (anything ffmpeg reads).
+    /// The video file (anything ffmpeg reads) for `Source::File`, the
+    /// transport stream for `Source::TsFile`.
     pub input: PathBuf,
+    /// What is sent.
+    pub source: Source,
+    /// Draw the service name (the call sign) on the picture.
+    pub overlay: bool,
     /// Start again at the end of the file (inside ffmpeg, so counters and PCR
     /// stay continuous). Off: the session finishes when the file does.
     pub loop_input: bool,
@@ -240,6 +356,8 @@ impl TxConfig {
     pub fn new(input: PathBuf) -> TxConfig {
         TxConfig {
             input,
+            source: Source::File,
+            overlay: false,
             loop_input: true,
             mode: Mode::uk(Modulation::Qam64, Rate::R2_3),
             t2: None,
@@ -353,7 +471,7 @@ impl TxConfig {
         if self.video.fps == 0 || self.video.fps > 60 {
             return Err(Error::Other("frame rate must be 1 to 60".into()));
         }
-        if self.input.as_os_str().is_empty() {
+        if self.source.uses_file() && self.input.as_os_str().is_empty() {
             return Err(Error::Other("no input file".into()));
         }
         Ok(())

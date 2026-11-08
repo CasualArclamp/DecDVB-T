@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use decdvbt_tx::feeder::PreviewFrame;
 use decdvbt_tx::{LicenceAck, PreviewRow, TxConfig, TxSession, TxStatus};
 use eframe::egui;
 
@@ -63,6 +64,8 @@ struct Shared {
     /// `None` while there is no session.
     status: Option<TxStatus>,
     rows: VecDeque<PreviewRow>,
+    /// The newest picture of the encoder's input (camera, test pattern), once.
+    picture: Option<PreviewFrame>,
     problems: Vec<Problem>,
     /// The thread has ended (it should only do that on `Quit`).
     dead: bool,
@@ -119,6 +122,11 @@ impl Host {
         }
     }
 
+    /// The newest input picture if there is one not yet taken.
+    pub fn take_picture(&self) -> Option<PreviewFrame> {
+        self.shared.lock().ok()?.picture.take()
+    }
+
     pub fn take_problems(&self) -> Vec<Problem> {
         self.shared
             .lock()
@@ -171,6 +179,7 @@ fn problem(shared: &Mutex<Shared>, text: String, from_radio_start: bool) {
 fn run(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
     let mut session: Option<TxSession> = None;
     let mut last_repaint = Instant::now();
+    let mut picture_serial = 0u64;
     loop {
         let cmd = match rx.recv_timeout(TICK) {
             Ok(Cmd::Quit) | Err(RecvTimeoutError::Disconnected) => break,
@@ -188,13 +197,18 @@ fn run(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
                 let status = s.status();
                 let mut rows = Vec::new();
                 s.take_preview_rows(&mut rows);
-                (status, rows)
+                let picture = s.preview_picture_since(picture_serial);
+                (status, rows, picture)
             }) {
-                Ok((status, rows)) => {
-                    let has_rows = !rows.is_empty();
+                Ok((status, rows, picture)) => {
+                    let has_rows = !rows.is_empty() || picture.is_some();
                     let changed = had_cmd || shared_state_changed(&shared, &status);
                     if let Ok(mut sh) = shared.lock() {
                         sh.status = Some(status);
+                        if let Some(p) = picture {
+                            picture_serial = p.serial;
+                            sh.picture = Some(p);
+                        }
                         sh.rows.extend(rows);
                         while sh.rows.len() > MAX_ROWS {
                             sh.rows.pop_front();
@@ -218,6 +232,10 @@ fn run(rx: Receiver<Cmd>, shared: Arc<Mutex<Shared>>, ctx: egui::Context) {
             end_session(&mut session, &shared);
             wake(&ctx);
         }
+        // A new session numbers its pictures from 1 again.
+        if session.is_none() {
+            picture_serial = 0;
+        }
     }
     // Exit (or the window is gone): the radio goes off before this returns.
     end_session(&mut session, &shared);
@@ -237,6 +255,7 @@ fn end_session(session: &mut Option<TxSession>, shared: &Mutex<Shared>) {
     if let Ok(mut sh) = shared.lock() {
         sh.status = None;
         sh.rows.clear();
+        sh.picture = None;
     }
 }
 

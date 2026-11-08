@@ -24,10 +24,8 @@ mod prefs;
 mod safety;
 mod selftest;
 mod settings;
-mod signal_view;
 mod source;
 mod thread_cpu;
-mod waterfall;
 
 use eframe::egui::{self, Color32};
 

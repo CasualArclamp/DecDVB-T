@@ -16,6 +16,7 @@
 //! for stdout (the default Windows pipe holds 4 KB).
 
 use std::io::{BufRead, BufReader, Read};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -27,7 +28,19 @@ use decdvbt_core::{Error, Result};
 use decdvbt_mod::ts::{TS_LEN, TS_SYNC};
 
 use crate::ffmpeg::no_console;
+use crate::mkv::{Event, MkvReader};
 use crate::ring::TsRing;
+
+/// The encoder's input picture, small, for the window (a camera, the test
+/// pattern).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    /// Counts up with each new picture.
+    pub serial: u64,
+}
 
 /// What the feeder knows, shared with the session's status.
 #[derive(Debug, Default)]
@@ -53,7 +66,14 @@ pub struct FeederShared {
     pub error: Mutex<Option<String>>,
     /// The child's process id (0 before it is spawned).
     pub pid: AtomicU32,
+    /// The newest preview picture, if the command line asked for one.
+    pub preview: Mutex<Option<PreviewFrame>>,
+    /// The sound's peak level, dBFS as `f32` bits (`NO_LEVEL` before any).
+    pub audio_dbfs_bits: AtomicU32,
 }
+
+/// `audio_dbfs_bits` before a level is known.
+pub const NO_LEVEL: u32 = 0x7FC0_0000; // a quiet NaN
 
 /// Lines of ffmpeg's log kept for the GUI.
 const LOG_KEEP: usize = 20;
@@ -79,6 +99,18 @@ impl Feeder {
     /// Start ffmpeg with `args` and feed `ring`. Returns once the process is
     /// spawned; it fails if ffmpeg cannot be started.
     pub fn spawn(ffmpeg: PathBuf, args: Vec<String>, ring: Arc<TsRing>) -> Result<Feeder> {
+        Feeder::spawn_with_preview(ffmpeg, args, ring, None)
+    }
+
+    /// [`Feeder::spawn`], and with `preview` (the listener whose address the
+    /// command line gave ffmpeg) a thread that reads the picture and sound
+    /// ffmpeg connects to send.
+    pub fn spawn_with_preview(
+        ffmpeg: PathBuf,
+        args: Vec<String>,
+        ring: Arc<TsRing>,
+        preview: Option<TcpListener>,
+    ) -> Result<Feeder> {
         let mut cmd = Command::new(&ffmpeg);
         cmd.args(&args).stdin(Stdio::null()).stderr(Stdio::piped());
         no_console(&mut cmd);
@@ -97,6 +129,7 @@ impl Feeder {
 
         let shared = Arc::new(FeederShared::default());
         shared.pid.store(child.id(), Ordering::Relaxed);
+        shared.audio_dbfs_bits.store(NO_LEVEL, Ordering::Relaxed);
         let stopping = Arc::new(AtomicBool::new(false));
         let log_done = Arc::new(AtomicBool::new(false));
         let child = Arc::new(Mutex::new(child));
@@ -131,12 +164,22 @@ impl Feeder {
                 })
                 .map_err(|e| Error::Other(format!("cannot start the ffmpeg reader: {e}")))?
         };
+        let mut threads = vec![ts_thread, log_thread];
+        if let Some(listener) = preview {
+            let (shared, stopping) = (shared.clone(), stopping.clone());
+            threads.push(
+                std::thread::Builder::new()
+                    .name("tx-preview".into())
+                    .spawn(move || read_preview(listener, &shared, &stopping))
+                    .map_err(|e| Error::Other(format!("cannot start the preview reader: {e}")))?,
+            );
+        }
         Ok(Feeder {
             shared,
             child,
             ring,
             stopping,
-            threads: vec![ts_thread, log_thread],
+            threads,
             cpu_last: (0.0, Instant::now()),
             cpu_pct: 0.0,
         })
@@ -259,6 +302,68 @@ fn child_cpu_seconds(child: &Child) -> f64 {
 
 /// Index of the first byte that starts three packets in a row (0x47 at i,
 /// i+188 and i+376), or `None`.
+/// The preview: ffmpeg connects to `listener` and writes Matroska (RGBA
+/// pictures, float PCM). The newest picture and the sound's peak over each
+/// tenth of a second are kept for the window.
+fn read_preview(listener: TcpListener, shared: &FeederShared, stopping: &AtomicBool) {
+    let _ = listener.set_nonblocking(true);
+    let conn = loop {
+        if stopping.load(Ordering::Acquire) {
+            return;
+        }
+        match listener.accept() {
+            Ok((c, _)) => break c,
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let _ = conn.set_nonblocking(false);
+    let mut r = MkvReader::new(BufReader::with_capacity(256 * 1024, conn));
+    let (mut vtrack, mut atrack, mut size) = (0, 0, (0, 0));
+    let (mut peak, mut peak_at, mut serial) = (0f32, Instant::now(), 0u64);
+    while let Ok(Some(ev)) = r.next_event() {
+        if stopping.load(Ordering::Acquire) {
+            return;
+        }
+        match ev {
+            Event::Tracks(t) => {
+                for tr in t {
+                    if tr.kind == 1 {
+                        vtrack = tr.number;
+                        size = (tr.width, tr.height);
+                    } else if tr.kind == 2 {
+                        atrack = tr.number;
+                    }
+                }
+            }
+            Event::Block { track, data, .. } if track == vtrack => {
+                let (w, h) = size;
+                if data.len() == (w * h * 4) as usize {
+                    serial += 1;
+                    *shared.preview.lock().unwrap() = Some(PreviewFrame {
+                        width: w,
+                        height: h,
+                        rgba: data,
+                        serial,
+                    });
+                }
+            }
+            Event::Block { track, data, .. } if track == atrack => {
+                for c in data.as_chunks::<4>().0 {
+                    let v = f32::from_le_bytes(*c).abs();
+                    peak = peak.max(v);
+                }
+                if peak_at.elapsed() >= Duration::from_millis(100) {
+                    let db = 20.0 * peak.max(1e-6).log10();
+                    shared.audio_dbfs_bits.store(db.to_bits(), Ordering::Relaxed);
+                    peak = 0.0;
+                    peak_at = Instant::now();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn find_sync(buf: &[u8]) -> Option<usize> {
     let last = buf.len().checked_sub(2 * TS_LEN + 1)?;
     (0..=last).find(|&i| {

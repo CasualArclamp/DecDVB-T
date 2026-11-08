@@ -1989,3 +1989,25 @@ modes. **Not verified live.**
   the attenuation. Behind the same arm; `open_pluto` is the only opener and
   refuses in tests and under `DECDVBT_TX_NO_RADIO`.
 - Tested against the fake IIOD server only; never keyed here.
+
+## TX window like DecSAT's (2026-11-08)
+
+- The window is laid out as DecSAT TX: SOURCE tabs, ENCODER, MODE, CHANNEL,
+  OUTPUT on the left; the input picture, the meters and the spectrum on the
+  right; the licence strip with PREPARE / ARM / TRANSMIT / STOP below, the
+  output chooser at the top. The waterfall and the old meters panel went.
+- Sources: Camera (DirectShow/V4L2, capture mode, microphone with a level
+  meter), Video file, TS file, UDP, Test (ffmpeg's pattern and a 1 kHz tone).
+  A TS file or UDP stream is not re-encoded: ffmpeg copies it, remultiplexed to
+  the channel's constant rate (its PIDs are renumbered, which a receiver
+  following the PSI does not mind).
+- Codecs: H.264, H.265 (service type 0x1F), H.266 (vvenc), AV1 (SVT-AV1 or a
+  card's), MPEG-2; audio AAC (LATM/ADTS), MP2 or none. Engine: auto (NVENC,
+  AMF, Quick Sync, CPU), or chosen; `encode::working_encoders` tries each
+  once in the background. H.264 from a file on NVIDIA keeps the CUDA chain.
+- Call sign as the service name, optionally on the picture (drawtext).
+- Live sources run 0.2 % under the channel's rate so the ring never fills.
+- `--source camera[:NAME]|test|file:PATH|ts:PATH|udp:ADDR`, `--codec`.
+- Not done: AV1 goes out as ffmpeg muxes it (DecSAT also fixes up AOM's TS
+  mapping, `Av1TsFixer`); H.266 and AV1 are for software receivers.
+

@@ -29,7 +29,7 @@ fn the_stream_is_clean_for_each_target_and_chain() {
     let Some(ff) = ffmpeg() else { return };
     let dir = test_dir("t2");
     let clip = make_clip(&ff, &dir, "hd.mp4", 1920, 1080, 8, false);
-    let mut chains = vec![("x264", EncoderChoice::X264)];
+    let mut chains = vec![("x264", EncoderChoice::Cpu)];
     if nvenc_works(&ff) {
         chains.push(("nvenc", EncoderChoice::Nvenc));
     }
