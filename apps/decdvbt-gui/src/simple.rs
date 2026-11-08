@@ -1772,7 +1772,7 @@ impl App {
             // One block a channel of the country's plan, squeezed to fit the
             // row when the plan is long (Europe has 57).
             let chans: Vec<u8> = decdvbt_core::channel::all_channels().collect();
-            let pitch = (((rect.width() - 60.0) / chans.len().max(1) as f32).min(34.0)).max(6.0);
+            let pitch = ((rect.width() - 60.0) / chans.len().max(1) as f32).clamp(6.0, 34.0);
             for (k, &n) in chans.iter().enumerate() {
                 let r = Rect::from_min_size(
                     pos2(rect.left() + 30.0 + k as f32 * pitch, y),

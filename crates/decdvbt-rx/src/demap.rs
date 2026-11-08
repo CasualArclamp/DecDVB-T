@@ -332,7 +332,9 @@ impl Demapper {
         }
         // The bit deinterleaver, a block of 126 cells at a time: each bit's
         // array rotated by its interleaver's offset, then the arrays' bytes
-        // put side by side.
+        // put side by side. (Not `as_chunks_mut`: its size must be a constant,
+        // and `V` is a generic parameter.)
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         for (b, block) in out.chunks_exact_mut(BLOCK * V).enumerate() {
             let base = b * BLOCK;
             for k in 0..V {
