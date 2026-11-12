@@ -232,7 +232,8 @@ impl RadioArgs {
 }
 
 /// A live radio at UHF channel `n`: the source and its dropped-buffer count.
-/// `rate_msps` is the HackRF's rate (the Airspy has only 10); `gains` are the
+/// `rate_msps` is the HackRF's rate, and the Airspy's (its board takes the
+/// nearest it has: 10 or 2.5 on an R2, 6 or 3 on a Mini); `gains` are the
 /// HackRF's (the radio's defaults if `None`).
 pub fn open_live(
     n: u8,
@@ -246,7 +247,7 @@ pub fn open_live(
 
 /// A live radio at `center` Hz. `rate_msps` is the HackRF's rate; `narrow`
 /// (a 1 or 1.7 MHz channel) overrides it with the HackRF's lowest, 2 MS/s,
-/// and its narrowest filter. The Airspy has one rate, 10 MS/s, whatever the
+/// and its narrowest filter. The Airspy keeps `rate_msps` whatever the
 /// width.
 fn open_radio(
     center: f64,
@@ -289,13 +290,22 @@ fn open_radio(
             // (tests/narrow_wide.rs): the receivers take the radio's rate.
             let s = AirspySource::open(AirspySettings {
                 center_hz: center.round() as u64,
-                // The Airspy has one rate; anything else is refused, not
-                // quietly changed.
+                // The board takes the nearest rate it has: an R2 10 or 2.5
+                // MS/s, a Mini 6 or 3.
                 sample_rate: (rate_msps * 1e6).round() as u32,
                 gains: radio.airspy_gains()?,
                 packed: radio.airspy_packed,
             })?;
             let ctl = s.control();
+            let got = f64::from(ctl.settings().sample_rate) / 1e6;
+            if (got - rate_msps).abs() > 1e-3 {
+                // A channel needs 8/7 of its width: 6 MS/s holds 5 MHz, not 6 to 8.
+                eprintln!(
+                    "{}: running at {got} MS/s, its nearest to {rate_msps} (holds a channel up to {:.2} MHz wide)",
+                    ctl.model(),
+                    got * 7.0 / 8.0
+                );
+            }
             Ok((Box::new(s), Some(Box::new(move || ctl.lost()))))
         }
         #[cfg(not(feature = "airspy"))]

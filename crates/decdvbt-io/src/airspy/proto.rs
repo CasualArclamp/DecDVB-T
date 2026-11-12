@@ -45,6 +45,9 @@ pub const GPIO_BIAS_TEE_INDEX: u16 = (1 << 5) | 13;
 pub enum Model {
     #[default]
     AirspyR2,
+    /// The Airspy Mini: the R2's protocol with a 12 MS/s ADC, so it lists
+    /// 6 and 3 MS/s. Its firmware names itself "AirSpy MINI".
+    AirspyMini,
     HydraSdr,
 }
 
@@ -52,6 +55,8 @@ impl Model {
     pub fn from_firmware(version: &str) -> Model {
         if version.to_ascii_lowercase().starts_with("hydrasdr") {
             Model::HydraSdr
+        } else if version.to_ascii_lowercase().contains("mini") {
+            Model::AirspyMini
         } else {
             Model::AirspyR2
         }
@@ -60,6 +65,7 @@ impl Model {
     pub fn name(self) -> &'static str {
         match self {
             Model::AirspyR2 => "Airspy R2",
+            Model::AirspyMini => "Airspy Mini",
             Model::HydraSdr => "HydraSDR RFOne",
         }
     }
@@ -75,9 +81,18 @@ pub const LNA_MAX: u8 = 14;
 pub const MIXER_MAX: u8 = 15;
 pub const VGA_MAX: u8 = 15;
 
-/// The one sample rate this front end supports, complex samples per second.
-/// The ADC runs at twice this and the bulk stream is a real 20 MS/s signal.
+/// The rate asked for by default, complex samples per second: the R2's.
+/// The ADC runs at twice the complex rate and the bulk stream is that real
+/// signal (20 MS/s on an R2 at this rate).
 pub const IQ_RATE: u32 = 10_000_000;
+
+/// The complex rates a request may name, Hz. An R2 lists 10 and 2.5 MS/s, a
+/// Mini 6 and 3 MS/s; the board's nearest is taken (see [`rate_index`]).
+pub const RATE_MIN_HZ: u32 = 2_500_000;
+pub const RATE_MAX_HZ: u32 = 10_000_000;
+
+/// The rates worth offering in a list: what the R2 and the Mini carry.
+pub const RATES_HZ: [u32; 4] = [10_000_000, 6_000_000, 3_000_000, 2_500_000];
 
 /// Bulk IN endpoint carrying the samples.
 pub const ENDPOINT_IN: u8 = 0x81;
@@ -159,7 +174,7 @@ pub fn set_freq(model: Model, hz: u64) -> Result<Command> {
         )));
     }
     let data = match model {
-        Model::AirspyR2 => (hz as u32).to_le_bytes().to_vec(),
+        Model::AirspyR2 | Model::AirspyMini => (hz as u32).to_le_bytes().to_vec(),
         Model::HydraSdr => hz.to_le_bytes().to_vec(),
     };
     Ok(Command::out(REQ_SET_FREQ, 0, 0, data))
@@ -232,18 +247,18 @@ pub fn parse_sample_rates(reply: &[u8], count: u32) -> Result<Vec<u32>> {
     Ok(chunks.iter().map(|c| u32::from_le_bytes(*c)).collect())
 }
 
-/// The index of [`IQ_RATE`] in the device's list (the R2 lists 10 MS/s and
-/// 2.5 MS/s).
-pub fn rate_index(rates: &[u32]) -> Result<u16> {
+/// The entry of the device's list nearest to `want`, as (index, rate). So
+/// 10 MS/s asked of a Mini is 6 MS/s, and 3 MS/s asked of an R2 is 2.5 MS/s
+/// (as DecSAT's Airspy front end does). A tie goes to the higher rate.
+pub fn rate_index(rates: &[u32], want: u32) -> Result<(u16, u32)> {
     rates
         .iter()
-        .position(|&r| r == IQ_RATE)
-        .map(|i| i as u16)
-        .ok_or_else(|| {
-            Error::Other(format!(
-                "Airspy: this device does not offer 10 MS/s (it lists {rates:?})"
-            ))
-        })
+        .enumerate()
+        // Rust note: `min_by_key` keeps the first of equal keys, so the
+        // rate itself (negated by `Reverse`) is the tie-break.
+        .min_by_key(|&(_, &r)| (r.abs_diff(want), std::cmp::Reverse(r)))
+        .map(|(i, &r)| (i as u16, r))
+        .ok_or_else(|| Error::Other("Airspy: the device lists no sample rates".into()))
 }
 
 /// One step of starting the stream.
@@ -324,7 +339,16 @@ mod tests {
             Model::from_firmware("AirSpy NOS v1.0.0-rc10-6-g4008185 2020-05-08"),
             Model::AirspyR2
         );
+        assert_eq!(
+            Model::from_firmware("AirSpy MINI v1.0.0-rc10-6-g4008185 2020-05-08"),
+            Model::AirspyMini
+        );
         assert_eq!(Model::from_firmware(""), Model::AirspyR2);
+        // The Mini's frequency goes out as the R2's does.
+        assert_eq!(
+            set_freq(Model::AirspyMini, 546_000_000).unwrap(),
+            set_freq(Model::AirspyR2, 546_000_000).unwrap()
+        );
     }
 
     #[test]
@@ -383,10 +407,23 @@ mod tests {
         assert_eq!(parse_u32(&2u32.to_le_bytes()).unwrap(), 2);
         let rates = parse_sample_rates(&reply, 2).unwrap();
         assert_eq!(rates, [10_000_000, 2_500_000]);
-        assert_eq!(rate_index(&rates).unwrap(), 0);
-        // The order is the device's: find 10 MS/s wherever it is.
-        assert_eq!(rate_index(&[2_500_000, 10_000_000]).unwrap(), 1);
-        assert!(rate_index(&[2_500_000, 6_000_000]).is_err());
+        assert_eq!(rate_index(&rates, IQ_RATE).unwrap(), (0, 10_000_000));
+        // The order is the device's: find the rate wherever it is.
+        assert_eq!(
+            rate_index(&[2_500_000, 10_000_000], IQ_RATE).unwrap(),
+            (1, 10_000_000)
+        );
+        assert_eq!(rate_index(&rates, 2_500_000).unwrap(), (1, 2_500_000));
+        // A Mini lists 6 and 3 MS/s: the nearest to what was asked.
+        let mini = [6_000_000, 3_000_000];
+        assert_eq!(rate_index(&mini, IQ_RATE).unwrap(), (0, 6_000_000));
+        assert_eq!(rate_index(&mini, 6_000_000).unwrap(), (0, 6_000_000));
+        assert_eq!(rate_index(&mini, 3_000_000).unwrap(), (1, 3_000_000));
+        assert_eq!(rate_index(&mini, 2_500_000).unwrap(), (1, 3_000_000));
+        // An R2 asked for a Mini's rates.
+        assert_eq!(rate_index(&rates, 3_000_000).unwrap(), (1, 2_500_000));
+        assert_eq!(rate_index(&rates, 6_000_000).unwrap(), (1, 2_500_000));
+        assert!(rate_index(&[], IQ_RATE).is_err());
         assert!(parse_sample_rates(&reply, 3).is_err());
         assert!(parse_u32(&[1, 2]).is_err());
     }

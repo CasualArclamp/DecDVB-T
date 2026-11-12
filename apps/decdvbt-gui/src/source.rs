@@ -294,6 +294,7 @@ impl Session {
                 use decdvbt_io::{AirspyGains, AirspySettings, AirspySource};
                 let src = AirspySource::open(AirspySettings {
                     center_hz: center_hz.round() as u64,
+                    // The board's nearest: a Mini runs at 6 MS/s.
                     sample_rate: 10_000_000,
                     gains: AirspyGains {
                         lna: gains.lna,
