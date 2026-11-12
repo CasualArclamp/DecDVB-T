@@ -187,16 +187,10 @@ pub enum Spec {
     },
     /// An RTL-SDR, at its 2.048 MS/s: the 1 and 1.7 MHz channels.
     #[cfg_attr(not(feature = "rtlsdr"), allow(dead_code))]
-    RtlSdr {
-        center_hz: f64,
-        gains: RtlGains,
-    },
+    RtlSdr { center_hz: f64, gains: RtlGains },
     /// Raw IQ from another program; `center_hz` labels it (an rtl_tcp
     /// server is tuned to it).
-    Net {
-        net: NetUi,
-        center_hz: f64,
-    },
+    Net { net: NetUi, center_hz: f64 },
     /// The Fobos, an SDRplay, a USRP or a DecSAT server's radio.
     More {
         kind: Extra,

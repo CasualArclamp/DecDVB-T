@@ -281,7 +281,8 @@ impl Options {
                 "--record" => o.record = true,
                 "--optimise" => o.optimise = true,
                 "--radio" => {
-                    const RADIOS: &str = "hackrf, airspy, pluto, rtlsdr, fobos, sdrplay, uhd, remote or net";
+                    const RADIOS: &str =
+                        "hackrf, airspy, pluto, rtlsdr, fobos, sdrplay, uhd, remote or net";
                     o.radio = Some(match value(RADIOS)?.as_str() {
                         "hackrf" => SourceKind::HackRf,
                         "airspy" | "hydrasdr" => SourceKind::Airspy,
