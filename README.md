@@ -132,6 +132,28 @@ AD9361's AGC (`--pluto-gain agc`). A plain Pluto's USB carries only about
 Ethernet. Receive only: the transmit LO is powered down. Not yet tried on a
 real Pluto (tested against a stand-in IIOD server).
 
+**Fobos SDR, SDRplay RSP or USRP?** Pick it in the source list, or `--radio
+fobos`, `sdrplay` or `uhd`. These three use their maker's own library, loaded
+when the radio is started, so DecDVB-T still runs without it: RigExpert's
+`fobos_sdr.dll` (agile firmware) or `fobos.dll` (stock) beside the exe; the
+SDRplay API installed from sdrplay.com; UHD installed for a USRP (`uhd.dll`
+in `C:\Program Files\UHD\bin`, or its path in the `UHD_DLL` variable; Windows
+only). Their rate and gain are in the bar at the top (`--radio-rate`,
+`--fobos-gain`, `--sdrplay-gain`, `--uhd-gain` on the command line). Receive
+only, and not yet tried on the real radios (the drivers are DecSAT's).
+
+**RTL-SDR?** `--radio rtlsdr`, for the narrow channels only: a dongle carries
+2.048 MS/s, which holds a 1 MHz DVB-T or a 1.7 MHz DVB-T2 channel but not a
+5 to 8 MHz one.
+
+**A radio on another machine, or under another program?** "DecSAT server"
+(`--radio remote --remote HOST`) takes a radio from
+[DecSAT](https://github.com/CasualArclamp/DecSAT)'s `decsat-server` over one
+TCP connection (not encrypted: use a VPN or an SSH tunnel over the internet).
+"Network IQ" (`--radio net --net tcp://127.0.0.1:7777 --radio-rate 10`) takes
+raw IQ from SDR++'s IQ Exporter, GNU Radio or an rtl_tcp server; the stream
+says neither its rate nor its frequency, and its sender is tuned at its end.
+
 No radio? The GUI and the CLI also read IQ recordings (8-bit complex `.cs8`
 and others), and the CLI's `modulate` makes DVB-T and DVB-T2 test signals to
 play with.
@@ -199,7 +221,7 @@ unoptimised.
 |---|---|
 | `decdvbt-core` | shared types: modes, code rates, channels |
 | `decdvbt-dsp` | filters, resamplers, DC and AGC |
-| `decdvbt-io` | the HackRF and Airspy R2 (pure Rust over USB) and IQ files |
+| `decdvbt-io` | the radios (HackRF, Airspy R2, Pluto, RTL-SDR in pure Rust; Fobos, SDRplay, USRP through their own libraries), network IQ, DecSAT's server link and IQ files |
 | `decdvbt-ofdm` | DVB-T and T2 pilots, interleavers, L1 signalling |
 | `decdvbt-fec` | Viterbi, Reed–Solomon, LDPC (AVX2), BCH, the T2 demappers |
 | `decdvbt-rx` | the receivers: acquisition, tracking, equalisers, the sounder |
