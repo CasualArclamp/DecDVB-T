@@ -435,9 +435,7 @@ fn open_radio(
                 let (name, v) = part
                     .split_once('=')
                     .context("--remote-gain takes NAME=VALUE,NAME=VALUE")?;
-                let v: f64 = v
-                    .parse()
-                    .with_context(|| format!("--remote-gain {part}"))?;
+                let v: f64 = v.parse().with_context(|| format!("--remote-gain {part}"))?;
                 stages.push((name.to_string(), v));
             }
             let s = RemoteIqSource::connect(
