@@ -1,5 +1,5 @@
 // made by CasualArclamp
-//! Live Airspy R2 front end, in pure Rust over USB.
+//! Live Airspy R2 and Airspy Mini front end, in pure Rust over USB.
 //!
 //! Like the HackRF front end, this speaks the radio's USB vendor protocol
 //! through `nusb` — no libairspy, no libusb, no DLLs. On Windows the Airspy
@@ -19,8 +19,12 @@
 //! argument to set it any other way). The HydraSDR RFOne runs here too
 //! ([`proto::Model`]).
 //!
-//! **Only 10 MS/s complex** (the R2's ADC runs at 20 MS/s; the bulk stream is
-//! that real signal, turned into IQ on the host by [`convert::RealToIq`]).
+//! **10 or 2.5 MS/s complex on an R2, 6 or 3 MS/s on a Mini**: the board's
+//! own list is read at open and the entry nearest to the rate asked for is
+//! taken. The ADC runs at twice the complex rate and the tuner puts the
+//! channel on fs/4 at every rate (the firmware sets the IF with the rate);
+//! the bulk stream is that real signal, turned into IQ on the host by
+//! [`convert::RealToIq`], which is the same at every rate.
 //!
 //! The reader thread keeps [`IN_FLIGHT`] bulk transfers outstanding, converts
 //! each to IQ itself (so the receive thread does no extra work) and hands the
@@ -180,8 +184,9 @@ impl std::fmt::Display for AirspyPreset {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AirspySettings {
     pub center_hz: u64,
-    /// Complex samples per second. Only 10 MS/s ([`proto::IQ_RATE`]) is
-    /// supported.
+    /// Complex samples per second: 10 or 2.5 MS/s on an R2, 6 or 3 MS/s on
+    /// a Mini. The nearest the board lists is taken, and a running source's
+    /// settings ([`AirspyControl::settings`]) say which that was.
     pub sample_rate: u32,
     pub gains: AirspyGains,
     /// The device's packed 12-bit transfers (8 samples in 12 bytes: 30 MB/s
@@ -290,11 +295,11 @@ impl Usb {
             .to_string())
     }
 
-    /// The device's rate list, and the index of 10 MS/s in it.
-    fn rate_index(&self) -> Result<u16> {
+    /// The device's rate list: the entry nearest to `want`, as (index, rate).
+    fn rate_index(&self, want: u32) -> Result<(u16, u32)> {
         let n = proto::parse_u32(&self.control(&proto::sample_rate_count())?)?;
         let list = self.control(&proto::sample_rate_list(n))?;
-        proto::rate_index(&proto::parse_sample_rates(&list, n)?)
+        proto::rate_index(&proto::parse_sample_rates(&list, n)?, want)
     }
 }
 
@@ -304,7 +309,7 @@ pub struct AirspyInfo {
     /// libairspy's board id (0 is an Airspy One/R2/Mini).
     pub board_id: u8,
     pub board_name: &'static str,
-    /// "Airspy R2" or "HydraSDR RFOne" (see [`proto::Model`]).
+    /// "Airspy R2", "Airspy Mini" or "HydraSDR RFOne" (see [`proto::Model`]).
     pub model: &'static str,
     pub firmware: String,
     /// The complex sample rates the device lists, Hz.
@@ -353,7 +358,8 @@ impl AirspyControl {
         *self.settings.lock().unwrap()
     }
 
-    /// "Airspy R2" or "HydraSDR RFOne", from the firmware it reported at open.
+    /// "Airspy R2", "Airspy Mini" or "HydraSDR RFOne", from the firmware it
+    /// reported at open.
     pub fn model(&self) -> &'static str {
         self.model.name()
     }
@@ -462,9 +468,9 @@ pub struct AirspySource {
 impl AirspySource {
     /// Open the first Airspy, configure it and start receiving.
     pub fn open(settings: AirspySettings) -> Result<Self> {
-        if settings.sample_rate != proto::IQ_RATE {
+        if !(proto::RATE_MIN_HZ..=proto::RATE_MAX_HZ).contains(&settings.sample_rate) {
             return Err(Error::Other(format!(
-                "Airspy sample rate {} is not supported: the R2 front end runs at 10 MS/s only",
+                "Airspy sample rate {} is not supported: an R2 runs at 10 or 2.5 MS/s, a Mini at 6 or 3 MS/s",
                 settings.sample_rate
             )));
         }
@@ -476,7 +482,15 @@ impl AirspySource {
         // Only names the radio: an unreadable version string is no reason
         // to fail.
         let model = Model::from_firmware(&usb.firmware().unwrap_or_default());
-        let rate_index = usb.rate_index()?;
+        // The board's nearest: a Mini asked for 10 MS/s runs at 6.
+        let (rate_index, sample_rate) = usb.rate_index(settings.sample_rate)?;
+        if sample_rate != settings.sample_rate {
+            tracing::info!(
+                "Airspy: {} MS/s asked for, the board's nearest is {} MS/s",
+                settings.sample_rate as f64 / 1e6,
+                sample_rate as f64 / 1e6
+            );
+        }
         let steps = proto::start_sequence(&proto::StartParams {
             model,
             center_hz: settings.center_hz,
@@ -536,7 +550,11 @@ impl AirspySource {
             control: AirspyControl {
                 usb,
                 model,
-                settings: Arc::new(Mutex::new(AirspySettings { gains, ..settings })),
+                settings: Arc::new(Mutex::new(AirspySettings {
+                    gains,
+                    sample_rate,
+                    ..settings
+                })),
                 overflows,
                 blanked,
             },
@@ -627,7 +645,8 @@ impl IqSource for AirspySource {
     }
 
     fn sample_rate(&self) -> f64 {
-        proto::IQ_RATE as f64
+        // What the board was set to, which may not be what was asked for.
+        self.control.settings().sample_rate as f64
     }
 
     fn center_freq(&self) -> f64 {
@@ -787,13 +806,13 @@ mod tests {
 
     #[test]
     fn rejects_other_rates_and_frequencies_before_any_usb_access() {
-        for rate in [2_500_000u32, 8_000_000, 20_000_000] {
+        for rate in [0u32, 2_000_000, 12_000_000, 20_000_000] {
             let s = AirspySettings {
                 sample_rate: rate,
                 ..Default::default()
             };
             let e = AirspySource::open(s).err().expect("must fail").to_string();
-            assert!(e.contains("10 MS/s only"), "{e}");
+            assert!(e.contains("is not supported"), "{e}");
         }
         for hz in [1_000_000u64, 2_000_000_000] {
             let s = AirspySettings {
@@ -913,6 +932,11 @@ mod tests {
             rate / 1e6,
             src.control().overflows()
         );
-        assert!(rate > 9.0e6, "only {:.2} MS/s", rate / 1e6);
+        // An R2 runs at 10 MS/s, a Mini at its nearest (6).
+        assert!(
+            rate > 0.9 * src.sample_rate(),
+            "only {:.2} MS/s",
+            rate / 1e6
+        );
     }
 }

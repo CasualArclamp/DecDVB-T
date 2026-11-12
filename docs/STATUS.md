@@ -2011,3 +2011,17 @@ modes. **Not verified live.**
 - Not done: AV1 goes out as ffmpeg muxes it (DecSAT also fixes up AOM's TS
   mapping, `Av1TsFixer`); H.266 and AV1 are for software receivers.
 
+## Airspy Mini (2026-11-12)
+
+- The Airspy driver takes whichever rate the board lists: it reads the list at
+  open and takes the entry nearest to the rate asked for, as DecSAT's Airspy
+  front end does. An R2 lists 10 and 2.5 MS/s, a Mini 6 and 3 MS/s, so a Mini
+  asked for the default 10 runs at 6. The real-to-IQ conversion is unchanged
+  (the firmware keeps the tuner's IF on fs/4 at every rate), and the firmware's
+  "AirSpy MINI" names the radio.
+- 6 MS/s holds a channel up to 5.25 MHz wide (the receiver needs 8/7 of the
+  width), so on a Mini: the 1, 1.7 and 5 MHz channels, not the 6 to 8 MHz
+  ones. The CLI says so when the rate it got is not the one asked for; the GUI
+  shows the running rate.
+- **Not run on a Mini**, nor on an R2 at 2.5 MS/s: checked by the rate
+  selection's tests only.

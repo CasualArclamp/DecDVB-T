@@ -479,7 +479,7 @@ fn main() -> eframe::Result {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
     HackRf,
-    /// The Airspy R2 (10 MS/s only; its own gain stages).
+    /// The Airspy R2 (10 MS/s) or Mini (6 MS/s); its own gain stages.
     Airspy,
     /// The ADALM-PLUTO / Pluto+ (64/7 MS/s, or 2.5 for narrow channels; one
     /// gain in dB or its AGC).
@@ -2402,7 +2402,7 @@ impl App {
                 .width(90.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.kind, SourceKind::HackRf, "HackRF");
-                    ui.selectable_value(&mut self.kind, SourceKind::Airspy, "Airspy R2 / HydraSDR");
+                    ui.selectable_value(&mut self.kind, SourceKind::Airspy, "Airspy R2 / Mini / HydraSDR");
                     ui.selectable_value(&mut self.kind, SourceKind::Pluto, "ADALM-PLUTO / Pluto+");
                     ui.selectable_value(&mut self.kind, SourceKind::RtlSdr, "RTL-SDR (1 and 1.7 MHz channels)");
                     for k in Extra::ALL {
@@ -2435,7 +2435,7 @@ impl App {
                     "The channel's width: the receiver must be told it. 1 MHz is DVB-T with \
                      every clock of 8 MHz divided by 8 (DecDVB-T's narrow mode); 1.7 MHz is \
                      DVB-T2's narrow channel. Both run the HackRF at 2 MS/s; the Airspy (10 \
-                     MS/s only) decodes them from its 10 MS/s stream.",
+                     MS/s; a Mini 6) decodes them from its own stream.",
                 );
             self.set_bandwidth(bw);
 
@@ -2503,9 +2503,15 @@ impl App {
                 if self.kind.other() {
                     // Drawn above.
                 } else if self.kind == SourceKind::Airspy {
-                    // The R2 has one rate here (its ADC runs at 20 MS/s and
-                    // the host makes 10 MS/s IQ).
-                    ui.label("10 MS/s");
+                    // 10 MS/s is asked for and the board takes its nearest:
+                    // an R2 has it, a Mini runs at 6 (its ADC at twice that;
+                    // the host makes the IQ).
+                    if self.session.is_some() && self.stats.sample_rate > 0.0 {
+                        ui.label(format!("{} MS/s", self.stats.sample_rate / 1e6));
+                    } else {
+                        ui.label("10 MS/s")
+                            .on_hover_text("An Airspy Mini runs at 6 MS/s, which holds a channel up to 5 MHz wide.");
+                    }
                 } else if self.kind == SourceKind::Pluto {
                     ui.label(format!(
                         "{:.3} MS/s",

@@ -81,7 +81,7 @@ enum Command {
     Capture {
         /// A UHF channel ("C34") for the radio, or an IQ file to replay.
         source: String,
-        /// Sample rate, MS/s (10 holds one 8 MHz channel; the Airspy has only 10).
+        /// Sample rate, MS/s (10 holds one 8 MHz channel; an Airspy takes its nearest: 10 or 2.5 on an R2, 6 or 3 on a Mini).
         #[arg(long, default_value_t = 10.0)]
         rate: f64,
         /// Seconds to run.

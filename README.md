@@ -108,7 +108,10 @@ main requirement: a DVB-T multiplex decodes in about a third of one core, a
 airspy` to `scan`, `capture` or `decode`. It has no RF amp switch: its gain is
 three stages (LNA, mixer, VGA, 0–15) with libairspy's presets
 (`--airspy-preset sensitivity:10`, `linearity:N`; `--airspy-lna/-mixer/-vga`
-override single stages). It runs at 10 MS/s only. The driver is pure Rust like
+override single stages). An R2 runs at 10 MS/s. An **Airspy Mini** works on
+the same driver at 6 MS/s, its highest, which holds a channel up to 5 MHz
+wide, not the usual 6 to 8 (`--rate 3` for its other rate; not yet tried on a
+Mini). The driver is pure Rust like
 the HackRF's, and the radio's real 20 MS/s stream is turned into IQ on the
 host (about 4 % of a core). The Airspy front end is new and has not yet been
 tried on the radio; see `docs/STATUS.md` for what is still to be checked.
@@ -245,7 +248,7 @@ have not been tried yet.
 
 Not done yet: DVB-T2 MISO, FEF parts, T2-Lite, time interleaving over several
 frames, and more than one PLP at a time (choosing one works); other radios
-(the Airspy Mini, SDRplay, RTL-SDR).
+(none known).
 
 ## Credits
 

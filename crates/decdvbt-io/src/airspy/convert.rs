@@ -15,6 +15,11 @@
 //! imaginary part). That is the whole cost: 8 multiplies (the taps are
 //! symmetric) per output sample.
 //!
+//! The figures here are the R2's at 10 MS/s. Nothing in the conversion
+//! depends on the rate: at its other rate, and on an Airspy Mini (ADC at 12
+//! or 6 MS/s), the firmware moves the IF to the new fs/4 and the same steps
+//! give IQ at half the ADC's rate.
+//!
 //! # Spectral orientation — **needs a live check**
 //!
 //! [`IF_SPECTRUM_INVERTED`] is the one place that decides whether the band
