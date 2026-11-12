@@ -204,6 +204,25 @@ pub fn airspy_gain_row(ui: &mut Ui, air: &mut AirGains, preset: &mut Option<Pres
     *air != before
 }
 
+/// The RTL-SDR's tuner gain: its AGC, or one of the R82xx's 29 steps (as in
+/// DecDAB's SDR window).
+pub fn rtl_gain_controls(ui: &mut Ui, g: &mut decdvbt_io::RtlGains) {
+    ui.checkbox(&mut g.agc, "AGC")
+        .on_hover_text("The tuner's own AGC on the LNA and mixer.");
+    ui.add_enabled_ui(!g.agc, |ui| {
+        egui::ComboBox::from_id_salt("rtl_gain")
+            .selected_text(format!("{:.1} dB", f32::from(g.db10) / 10.0))
+            .width(80.0)
+            .show_ui(ui, |ui| {
+                for s in decdvbt_io::rtlsdr_proto::GAINS_DB10.iter().rev() {
+                    ui.selectable_value(&mut g.db10, *s, format!("{:.1} dB", f32::from(*s) / 10.0));
+                }
+            })
+            .response
+            .on_hover_text("The LNA and mixer together; the VGA stays at 16.3 dB.");
+    });
+}
+
 // ---- the window -----------------------------------------------------------
 
 /// What the window edits and shows.
@@ -218,6 +237,9 @@ pub struct SdrView<'a> {
     pub airspy: bool,
     /// The Pluto's settings, when it is the radio.
     pub pluto: Option<&'a mut PlutoUi>,
+    /// The radio is none of the HackRF, the Airspy and the Pluto: its rate
+    /// and gain are in the top bar.
+    pub other: bool,
     /// What the running radio said about itself.
     pub radio_info: Option<&'a str>,
     pub live: bool,
@@ -262,6 +284,7 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
         air_packed,
         airspy,
         mut pluto,
+        other,
         radio_info,
         live,
         front_end,
@@ -344,7 +367,16 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
             .weak(),
         );
     }
-    if !airspy && pluto.is_none() {
+    if other {
+        ui.label(
+            RichText::new(
+                "This radio's rate and gain are in the bar at the top. The gain optimiser is for the HackRF and the Airspy.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+    if !airspy && pluto.is_none() && !other {
         ui.add_enabled_ui(live, |ui| {
             ui.label(RichText::new("Gain").strong());
             egui::Grid::new("sdr_gain")
@@ -413,7 +445,7 @@ fn body(ui: &mut Ui, v: SdrView, asks: &mut SdrAsks) {
 
     ui.add_space(6.0);
     // The baseband filter and clock trim are the HackRF's.
-    let hackrf = !airspy && pluto.is_none();
+    let hackrf = !airspy && pluto.is_none() && !other;
     ui.add_enabled_ui(live && hackrf, |ui| {
         ui.label(RichText::new(if hackrf { "Radio" } else { "Radio (HackRF only)" }).strong());
         egui::Grid::new("sdr_radio").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {

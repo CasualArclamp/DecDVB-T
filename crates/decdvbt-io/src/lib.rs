@@ -2,11 +2,29 @@
 //! IQ input and output for DecDVB-T.
 //!
 //! Everything upstream of the demodulator talks to an [`IqSource`]: an IQ file
-//! (replay) or
-//! the live HackRF One or Airspy R2. Recording goes out through [`IqFileWriter`].
+//! (replay), the live HackRF One, Airspy R2, ADALM-PLUTO, RTL-SDR, Fobos SDR,
+//! SDRplay RSP or USRP, IQ over the network ([`net`]) or a radio behind a
+//! DecSAT server ([`remote`]). Recording goes out through [`IqFileWriter`].
 
 pub mod file;
+pub mod net;
+pub mod raw_stream;
+pub mod rtlsdr_proto;
 pub mod wav;
+
+#[cfg(feature = "rtlsdr")]
+pub mod rtlsdr;
+#[cfg(feature = "rtlsdr")]
+mod usb;
+
+#[cfg(feature = "fobos")]
+pub mod fobos;
+#[cfg(feature = "remote")]
+pub mod remote;
+#[cfg(feature = "sdrplay")]
+pub mod sdrplay;
+#[cfg(all(windows, feature = "uhd"))]
+pub mod uhd;
 
 #[cfg(feature = "airspy")]
 pub mod airspy;
@@ -18,7 +36,22 @@ pub mod hackrf_tx;
 pub mod pluto;
 
 pub use file::{IqFileReader, IqFileWriter, NameHint, format_from_path, name_hint};
+pub use net::{NetIqControl, NetIqSettings, NetIqSource, NetMode, NetSample};
+pub use rtlsdr_proto::{RtlGains, RtlSettings};
 pub use wav::{CaptureInfo, WavIq, probe_capture};
+
+#[cfg(feature = "fobos")]
+pub use fobos::{FOBOS_RATES, FobosControl, FobosGains, FobosInfo, FobosSettings, FobosSource};
+#[cfg(feature = "remote")]
+pub use remote::{RemoteControl, RemoteIqSource};
+#[cfg(feature = "rtlsdr")]
+pub use rtlsdr::{RtlInfo, RtlSdrControl, RtlSdrSource, rtlsdr_info};
+#[cfg(feature = "sdrplay")]
+pub use sdrplay::{
+    SDRPLAY_RATES, SdrplayControl, SdrplayGains, SdrplayInfo, SdrplaySettings, SdrplaySource,
+};
+#[cfg(all(windows, feature = "uhd"))]
+pub use uhd::{UhdControl, UhdSettings, UhdSource};
 
 #[cfg(feature = "airspy")]
 pub use airspy::{
@@ -70,6 +103,12 @@ pub trait IqSource: Send {
     /// Retune to `hz`. `Ok(false)` for a source with no tuner (a file).
     fn retune(&mut self, _hz: f64) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Whether a retune moves what the source receives. A network stream is
+    /// live but tuned at its sender (except rtl_tcp's).
+    fn can_retune(&self) -> bool {
+        self.is_live()
     }
 
     /// Whether the source paces itself in real time (a radio does; a file

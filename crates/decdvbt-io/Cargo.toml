@@ -1,7 +1,7 @@
 # made by CasualArclamp
 [package]
 name = "decdvbt-io"
-description = "DecDVB-T I/O: IQ file replay/record and the HackRF, Airspy R2 / HydraSDR and ADALM-PLUTO front ends"
+description = "DecDVB-T I/O: IQ file replay/record, the HackRF, Airspy R2 / HydraSDR, ADALM-PLUTO, RTL-SDR, Fobos SDR, SDRplay and USRP front ends, network IQ and DecSAT's server link"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,6 +20,28 @@ airspy = ["dep:nusb", "dep:futures-lite"]
 # Live ADALM-PLUTO / Pluto+ front end: its IIOD protocol in pure Rust over USB
 # (nusb, WinUSB) or TCP. No libiio, no DLLs.
 pluto = ["dep:nusb", "dep:futures-lite"]
+# Live RTL-SDR front end (RTL2832U with an R820T/R820T2/R828D tuner), from
+# DecLAB (DecDAB before it), pure Rust over nusb as well; WinUSB driver on
+# Windows (Zadig). Receive only, the bias tee stays off. It runs at 2.048 MS/s:
+# enough for the 1 MHz and 1.7 MHz channels, not the 5 to 8 MHz ones. The
+# chips' logic is plain code, built and tested without the feature.
+rtlsdr = ["dep:nusb"]
+# Live RigExpert Fobos SDR front end (from DecSAT). RigExpert's C library
+# (fobos_sdr.dll for the agile firmware, fobos.dll for the stock one) is loaded
+# at run time, so nothing extra is needed to build, and only a Fobos user needs
+# the file.
+fobos = ["dep:libloading"]
+# Live SDRplay RSP (RSPduo, RSP1A, RSPdx ...) front end (from DecSAT).
+# SDRplay's API library (sdrplay_api.dll, from the SDRplay installer) is loaded
+# at run time as well.
+sdrplay = ["dep:libloading"]
+# Ettus/NI USRP through UHD's C API (from DecSAT): uhd.dll is loaded at run
+# time from the user's UHD install. Windows only; elsewhere the feature builds
+# to nothing. Receive only: the transmitter app does not use it.
+uhd = []
+# A radio on another machine: the client of DecSAT's remote server
+# (decsat-server), its IQ mode. Plain TCP; zstd is the one C dependency.
+remote = ["dep:serde", "dep:postcard", "dep:zstd", "dep:hmac", "dep:sha2", "dep:getrandom"]
 
 [dependencies]
 decdvbt-core = { path = "../decdvbt-core" }
@@ -30,6 +52,15 @@ seify-hackrfone = { version = "0.2.2", optional = true }
 # The versions seify-hackrfone already uses, so the exe carries one copy.
 nusb = { version = "0.1.14", optional = true }
 futures-lite = { version = "2", optional = true }
+libloading = { version = "0.8", optional = true }
+# The remote link, as DecSAT's decsat-remote has them: postcard for the
+# control messages, zstd for compressed frames, HMAC-SHA-256 for the password.
+serde = { version = "1", features = ["derive"], optional = true }
+postcard = { version = "1", default-features = false, features = ["use-std"], optional = true }
+zstd = { version = "0.13", optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+getrandom = { version = "0.3", optional = true }
 
 [dev-dependencies]
 rustfft.workspace = true

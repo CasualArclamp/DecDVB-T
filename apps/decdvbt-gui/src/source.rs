@@ -1,12 +1,16 @@
 // made by CasualArclamp
-//! Opening a source and running the engine on it: the HackRF or the Airspy R2
-//! at a channel, or a recorded IQ file.
+//! Opening a source and running the engine on it: the HackRF, the Airspy R2,
+//! the Pluto, an RTL-SDR, one of the radios from DecSAT (`more_radios.rs`) or
+//! network IQ at a channel, or a recorded IQ file.
 
 use std::path::PathBuf;
 
 use decdvbt_core::SampleFormat;
 use decdvbt_engine::{Rx, RxOptions};
-use decdvbt_io::{IqFileReader, IqSource, format_from_path};
+use decdvbt_io::{IqFileReader, IqSource, NetIqControl, RtlGains, format_from_path};
+
+use crate::more_radios::{Extra, MoreControl, MoreRadios};
+use crate::net_ui::NetUi;
 
 /// The HackRF's three gain stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +185,26 @@ pub enum Spec {
         rate_hz: f64,
         gains: Gains,
     },
+    /// An RTL-SDR, at its 2.048 MS/s: the 1 and 1.7 MHz channels.
+    #[cfg_attr(not(feature = "rtlsdr"), allow(dead_code))]
+    RtlSdr {
+        center_hz: f64,
+        gains: RtlGains,
+    },
+    /// Raw IQ from another program; `center_hz` labels it (an rtl_tcp
+    /// server is tuned to it).
+    Net {
+        net: NetUi,
+        center_hz: f64,
+    },
+    /// The Fobos, an SDRplay, a USRP or a DecSAT server's radio.
+    More {
+        kind: Extra,
+        center_hz: f64,
+        // Rust note: boxed so this one variant does not make every `Spec`
+        // as large as the whole settings struct.
+        radios: Box<MoreRadios>,
+    },
     File {
         path: PathBuf,
         center_hz: f64,
@@ -199,6 +223,11 @@ pub struct Session {
     /// What the radio said about itself, for the status line (the Pluto's
     /// link, firmware and sample width).
     pub info: Option<String>,
+    /// The network stream's counters, when that is the source.
+    pub net: Option<NetIqControl>,
+    /// The live controls of a radio from DecSAT, when one is the source.
+    pub more: Option<MoreControl>,
+    set_rtl_gains: Option<Setter<RtlGains>>,
     set_gains: Option<GainSetter>,
     set_pluto: Option<Setter<PlutoUi>>,
     set_air_gains: Option<AirGainSetter>,
@@ -247,6 +276,9 @@ impl Session {
                 Ok(Session {
                     rx,
                     live: true,
+                    net: None,
+                    more: None,
+                    set_rtl_gains: None,
                     info: Some(info),
                     set_gains: None,
                     set_air_gains: None,
@@ -287,6 +319,9 @@ impl Session {
                 Ok(Session {
                     rx,
                     live: true,
+                    net: None,
+                    more: None,
+                    set_rtl_gains: None,
                     info: None,
                     set_gains: None,
                     set_pluto: None,
@@ -334,6 +369,9 @@ impl Session {
                 Ok(Session {
                     rx,
                     live: true,
+                    net: None,
+                    more: None,
+                    set_rtl_gains: None,
                     info: None,
                     set_pluto: None,
                     set_air_gains: None,
@@ -357,6 +395,83 @@ impl Session {
             }
             #[cfg(not(feature = "hackrf"))]
             Spec::HackRf { .. } => Err("built without the hackrf feature".into()),
+            #[cfg(feature = "rtlsdr")]
+            Spec::RtlSdr { center_hz, gains } => {
+                use decdvbt_io::{RtlSdrSource, RtlSettings};
+                let src = RtlSdrSource::open(RtlSettings {
+                    center_hz: center_hz.round() as u64,
+                    gains: *gains,
+                    ..RtlSettings::default()
+                })
+                .map_err(|e| e.to_string())?;
+                let ctl = src.control();
+                let probe = ctl.clone();
+                let rx = Rx::start(
+                    Box::new(src),
+                    RxOptions::default(),
+                    Some(Box::new(move || probe.overflows())),
+                );
+                Ok(Session {
+                    rx,
+                    live: true,
+                    net: None,
+                    more: None,
+                    set_rtl_gains: Some(Box::new(move |g| {
+                        ctl.set_gains(g).map_err(|e| e.to_string())
+                    })),
+                    info: None,
+                    set_gains: None,
+                    set_pluto: None,
+                    set_air_gains: None,
+                    set_filter: None,
+                    set_ppm: None,
+                })
+            }
+            #[cfg(not(feature = "rtlsdr"))]
+            Spec::RtlSdr { .. } => Err("built without the rtlsdr feature".into()),
+            Spec::Net { net, center_hz } => {
+                let (src, ctl) = net.open(*center_hz)?;
+                let probe = ctl.clone();
+                let rx = Rx::start(
+                    src,
+                    RxOptions::default(),
+                    Some(Box::new(move || probe.overflows())),
+                );
+                Ok(Session {
+                    rx,
+                    live: true,
+                    net: Some(ctl),
+                    more: None,
+                    set_rtl_gains: None,
+                    info: None,
+                    set_gains: None,
+                    set_pluto: None,
+                    set_air_gains: None,
+                    set_filter: None,
+                    set_ppm: None,
+                })
+            }
+            Spec::More {
+                kind,
+                center_hz,
+                radios,
+            } => {
+                let (src, control) = radios.open(*kind, *center_hz)?;
+                let rx = Rx::start(src, RxOptions::default(), Some(control.drop_probe()));
+                Ok(Session {
+                    rx,
+                    live: true,
+                    net: None,
+                    info: Some(control.info()).filter(|i| !i.is_empty()),
+                    more: Some(control),
+                    set_rtl_gains: None,
+                    set_gains: None,
+                    set_pluto: None,
+                    set_air_gains: None,
+                    set_filter: None,
+                    set_ppm: None,
+                })
+            }
             Spec::File {
                 path,
                 center_hz,
@@ -370,6 +485,9 @@ impl Session {
                 Ok(Session {
                     rx: Rx::start(src, RxOptions::default(), None),
                     live: false,
+                    net: None,
+                    more: None,
+                    set_rtl_gains: None,
                     info: None,
                     set_pluto: None,
                     set_gains: None,
@@ -389,6 +507,11 @@ impl Session {
     /// The HackRF's frequency error, ppm; no-op for a file.
     pub fn set_ppm(&self, ppm: f32) -> Result<(), String> {
         self.set_ppm.as_ref().map_or(Ok(()), |f| f(ppm))
+    }
+
+    /// Change the RTL-SDR's gain (no-op for any other source).
+    pub fn set_rtl_gains(&self, g: RtlGains) -> Result<(), String> {
+        self.set_rtl_gains.as_ref().map_or(Ok(()), |f| f(g))
     }
 
     /// Change the Pluto's gain or AGC (no-op for any other source).

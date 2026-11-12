@@ -13,10 +13,17 @@ name = "decdvbt"
 path = "src/main.rs"
 
 [features]
-default = ["hackrf", "airspy", "pluto"]
+# The Fobos, SDRplay and USRP (UHD, Windows) drivers load their maker's
+# library at run time, so they build anywhere; the remote link is plain TCP.
+default = ["hackrf", "airspy", "pluto", "rtlsdr", "fobos", "sdrplay", "uhd", "remote"]
 hackrf = ["decdvbt-io/hackrf"]
 airspy = ["decdvbt-io/airspy"]
 pluto = ["decdvbt-io/pluto"]
+rtlsdr = ["decdvbt-io/rtlsdr"]
+fobos = ["decdvbt-io/fobos"]
+sdrplay = ["decdvbt-io/sdrplay"]
+uhd = ["decdvbt-io/uhd"]
+remote = ["decdvbt-io/remote"]
 
 [dependencies]
 decdvbt-core = { path = "../../crates/decdvbt-core" }

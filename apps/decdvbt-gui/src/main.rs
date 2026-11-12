@@ -23,6 +23,8 @@ mod freq_display;
 mod gain_opt;
 mod heatmaps;
 mod ic_stream;
+mod more_radios;
+mod net_ui;
 mod player;
 mod prefs;
 mod radar_view;
@@ -50,13 +52,15 @@ use decdvbt_core::dvbt::{Bandwidth, Mode};
 use decdvbt_engine::{
     Command, CpuGauge, FrontEndSettings, Outputs, Row, Stats, TsView, signal_block, spectral_cn_db,
 };
-use decdvbt_io::name_hint;
+use decdvbt_io::{RtlGains, name_hint};
 use decdvbt_rx::auto::Standard;
 use decdvbt_rx::receiver::ReceiverStatus;
 use decdvbt_rx::sounder::Geometry;
 use decdvbt_rx::t2::receiver::{T2Status, s1_name};
 use decdvbt_ts::{Epg, TsTap};
 use eframe::egui::{self, Color32, RichText};
+use more_radios::{Extra, MoreRadios};
+use net_ui::NetUi;
 use source::{AirGains, Gains, PlutoUi, Preset, Session, Spec};
 use waterfall::{History, RingImage};
 
@@ -145,7 +149,8 @@ struct Options {
     record: bool,
     /// Run the gain optimiser once the receiver has locked (a test aid).
     optimise: bool,
-    /// The radio to use (`--radio hackrf|airspy|pluto`), else the one last used.
+    /// The radio to use (`--radio hackrf|airspy|pluto|rtlsdr|fobos|sdrplay|uhd|remote|net`),
+    /// else the one last used.
     radio: Option<SourceKind>,
     /// Which view settings the command line gave: what it did not is what
     /// was kept from the last run (but a screenshot, which has to come out
@@ -276,11 +281,15 @@ impl Options {
                 "--record" => o.record = true,
                 "--optimise" => o.optimise = true,
                 "--radio" => {
-                    o.radio = Some(match value("hackrf, airspy or pluto")?.as_str() {
+                    const RADIOS: &str = "hackrf, airspy, pluto, rtlsdr, fobos, sdrplay, uhd, remote or net";
+                    o.radio = Some(match value(RADIOS)?.as_str() {
                         "hackrf" => SourceKind::HackRf,
                         "airspy" | "hydrasdr" => SourceKind::Airspy,
                         "pluto" | "plutoplus" => SourceKind::Pluto,
-                        v => return Err(format!("--radio is hackrf, airspy or pluto, not {v}")),
+                        v => match SourceKind::from_other(v) {
+                            Some(k) => k,
+                            None => return Err(format!("--radio is {RADIOS}, not {v}")),
+                        },
                     });
                 }
                 "--subs" => o.subs = true,
@@ -417,6 +426,7 @@ fn main() -> eframe::Result {
             eprintln!(
                 "usage: decdvbt-gui [capture.cs8] [--channel C26 | --freq MHZ] \
                  [--bandwidth 8|7|6|1.7|1] [--rate MSPS] \
+                 [--radio hackrf|airspy|pluto|rtlsdr|fobos|sdrplay|uhd|remote|net] \
                  [--screenshot OUT.png] [--after SECS] [--fps N] [--assume 64qam-2/3-8k-1/32] \
                  [--bottom scopes|channel|heat|none] [--window ts|epg|sdr] [--service ID] [--play ID] [--subs] \
                  [--http ADDR] [--udp ADDR] [--record] [--no-decode] [--fullscreen]"
@@ -473,6 +483,12 @@ enum SourceKind {
     /// The ADALM-PLUTO / Pluto+ (64/7 MS/s, or 2.5 for narrow channels; one
     /// gain in dB or its AGC).
     Pluto,
+    /// An RTL-SDR (2.048 MS/s: the 1 and 1.7 MHz channels only).
+    RtlSdr,
+    /// Raw IQ from another program over TCP or UDP (tuned at its sender).
+    Network,
+    /// The Fobos, an SDRplay, a USRP or a DecSAT server (`more_radios.rs`).
+    More(Extra),
     File,
 }
 
@@ -480,6 +496,55 @@ impl SourceKind {
     /// A radio, as against a capture file.
     fn live(self) -> bool {
         self != SourceKind::File
+    }
+
+    /// One of the radios that keep their own rate and gain (drawn by
+    /// `other_radio_row`), and their own learned offsets.
+    fn other(self) -> bool {
+        matches!(
+            self,
+            SourceKind::RtlSdr | SourceKind::Network | SourceKind::More(_)
+        )
+    }
+
+    /// The key such a radio is remembered by ("" for the rest, which
+    /// `remember.rs` names itself).
+    fn other_key(self) -> &'static str {
+        match self {
+            SourceKind::RtlSdr => "rtlsdr",
+            SourceKind::Network => "net",
+            SourceKind::More(k) => k.key(),
+            _ => "",
+        }
+    }
+
+    fn from_other(s: &str) -> Option<SourceKind> {
+        match s {
+            "rtlsdr" | "rtl" => Some(SourceKind::RtlSdr),
+            "net" | "network" => Some(SourceKind::Network),
+            k => Extra::from_key(k).map(SourceKind::More),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SourceKind::HackRf => "HackRF",
+            SourceKind::Airspy => "Airspy R2 / HydraSDR",
+            SourceKind::Pluto => "Pluto / Pluto+",
+            SourceKind::RtlSdr => "RTL-SDR",
+            SourceKind::Network => "Network IQ",
+            SourceKind::More(k) => k.label(),
+            SourceKind::File => "IQ file",
+        }
+    }
+}
+
+/// The RTL-SDR's gain as the prefs keep it (`RtlGains::parse` reads it back).
+fn rtl_key(g: RtlGains) -> String {
+    if g.agc {
+        "agc".into()
+    } else {
+        format!("{:.1}", f32::from(g.db10) / 10.0)
     }
 }
 
@@ -569,6 +634,11 @@ struct App {
     air_packed: bool,
     /// The Pluto's link, gain and sample width.
     pluto: PlutoUi,
+    /// The RTL-SDR's gain, network IQ's settings, and those of the radios
+    /// from DecSAT (Fobos, SDRplay, USRP, a DecSAT server).
+    rtl: RtlGains,
+    net: NetUi,
+    more: MoreRadios,
     /// A file source: its path, centre (MHz) and rate (MS/s), editable
     /// because a raw file has no header.
     file: Option<PathBuf>,
@@ -610,6 +680,8 @@ struct App {
     air_offsets: HashMap<u8, f64>,
     /// The same for the Pluto (this run only, like the Airspy's).
     pluto_offsets: HashMap<u8, f64>,
+    /// And for the other radios (`SourceKind::other`), this run only.
+    other_offsets: HashMap<u8, f64>,
     tuned_at: Instant,
     centre_checked: bool,
     centre_tries: u8,
@@ -680,6 +752,8 @@ impl App {
             SourceKind::File
         } else if let Some(k) = opts.radio {
             k
+        } else if let Some(k) = kept.other.as_deref().and_then(SourceKind::from_other) {
+            k
         } else if kept.airspy {
             SourceKind::Airspy
         } else if kept.pluto {
@@ -718,6 +792,17 @@ impl App {
             },
             air_packed: kept.air_packed.unwrap_or(false),
             pluto: kept.pluto_ui.clone(),
+            rtl: prefs::get("rtl_gain")
+                .and_then(|g| RtlGains::parse(&g).ok())
+                .unwrap_or_default(),
+            net: NetUi::load(prefs::get),
+            more: {
+                let mut m = MoreRadios::load(prefs::get);
+                if let (SourceKind::More(k), Some(r)) = (kind, opts.rate_msps) {
+                    m.set_rate(k, r * 1e6);
+                }
+                m
+            },
             file,
             file_centre_mhz: kept.file_centre_mhz.unwrap_or(0.0),
             file_rate_msps: kept.file_rate_msps.unwrap_or(10.0),
@@ -797,6 +882,7 @@ impl App {
             offsets,
             air_offsets: HashMap::new(),
             pluto_offsets: HashMap::new(),
+            other_offsets: HashMap::new(),
             tuned_at: Instant::now(),
             centre_checked: false,
             centre_tries: 0,
@@ -856,6 +942,7 @@ impl App {
             file_source: self.kind == SourceKind::File,
             airspy: self.kind == SourceKind::Airspy,
             pluto: self.kind == SourceKind::Pluto,
+            other: self.kind.other_key().to_string(),
             pluto_ui: self.pluto.clone(),
             rate_khz: (self.rate_msps * 1e3).round() as i64,
             gains: self.gains,
@@ -934,6 +1021,40 @@ impl App {
                     center_hz: fc,
                     narrow: self.bandwidth.narrow(),
                     ui: self.pluto.clone(),
+                };
+                self.begin(spec, Some(fc));
+            }
+            SourceKind::RtlSdr => {
+                let fc = self.tune_hz;
+                if fc <= 0.0 {
+                    return;
+                }
+                let spec = Spec::RtlSdr {
+                    center_hz: fc,
+                    gains: self.rtl,
+                };
+                self.begin(spec, Some(fc));
+            }
+            SourceKind::Network => {
+                let fc = self.tune_hz;
+                if fc <= 0.0 {
+                    return;
+                }
+                let spec = Spec::Net {
+                    net: self.net.clone(),
+                    center_hz: fc,
+                };
+                self.begin(spec, Some(fc));
+            }
+            SourceKind::More(kind) => {
+                let fc = self.tune_hz;
+                if fc <= 0.0 {
+                    return;
+                }
+                let spec = Spec::More {
+                    kind,
+                    center_hz: fc,
+                    radios: Box::new(self.more.clone()),
                 };
                 self.begin(spec, Some(fc));
             }
@@ -1417,7 +1538,60 @@ impl App {
         match self.kind {
             SourceKind::Airspy => &self.air_offsets,
             SourceKind::Pluto => &self.pluto_offsets,
+            k if k.other() => &self.other_offsets,
             _ => &self.offsets,
+        }
+    }
+
+    /// Write settings that are kept as they change (not in a screenshot
+    /// run, which leaves the preferences as it found them).
+    fn keep(&self, pairs: Vec<(&'static str, String)>) {
+        if self.keeper.is_none() {
+            return;
+        }
+        let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        prefs::set_many(&refs);
+    }
+
+    /// The rate and gain of the radios that keep their own settings: the
+    /// RTL-SDR, network IQ and the ones from DecSAT.
+    fn other_radio_row(&mut self, ui: &mut egui::Ui, running: bool) {
+        match self.kind {
+            SourceKind::RtlSdr => {
+                ui.label("2.048 MS/s").on_hover_text(
+                    "The RTL-SDR's one rate here: it holds a 1 MHz DVB-T or a 1.7 MHz DVB-T2 \
+                     channel, not the 5 to 8 MHz ones.",
+                );
+                let before = self.rtl;
+                sdr::rtl_gain_controls(ui, &mut self.rtl);
+                if self.rtl != before {
+                    self.keep(vec![("rtl_gain", rtl_key(self.rtl))]);
+                    self.change_gains();
+                }
+            }
+            SourceKind::Network => {
+                // Rust note: `self.net` and `self.session` are different
+                // fields, so one can be borrowed mutably while the other
+                // is read.
+                let live = self.session.as_ref().and_then(|s| s.net.as_ref());
+                if self.net.ui(ui, live) {
+                    self.keep(self.net.save());
+                    if running {
+                        self.start();
+                    }
+                }
+            }
+            SourceKind::More(k) => {
+                let live = self.session.as_ref().and_then(|s| s.more.as_ref());
+                let ch = self.more.ui(k, ui, live);
+                if ch.reopen || ch.save {
+                    self.keep(self.more.save());
+                }
+                if ch.reopen && running {
+                    self.start();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1548,6 +1722,8 @@ impl App {
             self.air_offsets.insert(ch, off);
         } else if self.kind == SourceKind::Pluto {
             self.pluto_offsets.insert(ch, off);
+        } else if self.kind.other() {
+            self.other_offsets.insert(ch, off);
         } else {
             self.offsets.insert(ch, off);
             prefs::set(&format!("offset_C{ch}"), &format!("{off:.0}"));
@@ -1650,6 +1826,12 @@ impl App {
             self.note = "Optimising the gain needs a live radio".into();
             return;
         }
+        if self.kind.other() {
+            self.note = "The optimiser steps the HackRF's and the Airspy's stages; \
+                         set this radio's gain by hand"
+                .into();
+            return;
+        }
         if self.kind == SourceKind::Pluto {
             self.note = "The optimiser steps the HackRF's and the Airspy's stages; \
                          on the Pluto set the gain, or use its AGC"
@@ -1743,6 +1925,7 @@ impl App {
         let r = match self.kind {
             SourceKind::Airspy => s.set_air_gains(self.air),
             SourceKind::Pluto => s.set_pluto(&self.pluto),
+            SourceKind::RtlSdr => s.set_rtl_gains(self.rtl),
             _ => s.set_gains(self.gains),
         };
         if let Err(e) = r {
@@ -2214,17 +2397,17 @@ impl App {
             let live = self.kind.live();
             let before = self.kind;
             egui::ComboBox::from_id_salt("source")
-                .selected_text(match self.kind {
-                    SourceKind::HackRf => "HackRF",
-                    SourceKind::Airspy => "Airspy R2 / HydraSDR",
-                    SourceKind::Pluto => "Pluto / Pluto+",
-                    SourceKind::File => "IQ file",
-                })
+                .selected_text(self.kind.label())
                 .width(90.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.kind, SourceKind::HackRf, "HackRF");
                     ui.selectable_value(&mut self.kind, SourceKind::Airspy, "Airspy R2 / HydraSDR");
                     ui.selectable_value(&mut self.kind, SourceKind::Pluto, "ADALM-PLUTO / Pluto+");
+                    ui.selectable_value(&mut self.kind, SourceKind::RtlSdr, "RTL-SDR (1 and 1.7 MHz channels)");
+                    for k in Extra::ALL {
+                        ui.selectable_value(&mut self.kind, SourceKind::More(k), k.label());
+                    }
+                    ui.selectable_value(&mut self.kind, SourceKind::Network, "Network IQ");
                     ui.selectable_value(&mut self.kind, SourceKind::File, "IQ file");
                 });
             if before != self.kind && running {
@@ -2310,8 +2493,15 @@ impl App {
                 ));
 
                 ui.separator();
-                ui.label("rate");
-                if self.kind == SourceKind::Airspy {
+                if self.kind.other() {
+                    // Its own rate and gain, in one run of controls.
+                    self.other_radio_row(ui, running);
+                } else {
+                    ui.label("rate");
+                }
+                if self.kind.other() {
+                    // Drawn above.
+                } else if self.kind == SourceKind::Airspy {
                     // The R2 has one rate here (its ADC runs at 20 MS/s and
                     // the host makes 10 MS/s IQ).
                     ui.label("10 MS/s");
@@ -2339,8 +2529,12 @@ impl App {
                     }
                 }
 
-                ui.separator();
-                if self.kind == SourceKind::Airspy {
+                if !self.kind.other() {
+                    ui.separator();
+                }
+                if self.kind.other() {
+                    // Drawn above.
+                } else if self.kind == SourceKind::Airspy {
                     if sdr::airspy_gain_bar(ui, &mut self.air, &mut self.air_preset) {
                         self.change_gains();
                     }
@@ -2829,6 +3023,7 @@ impl eframe::App for App {
                     air_packed: &mut self.air_packed,
                     airspy: self.kind == SourceKind::Airspy,
                     pluto: (self.kind == SourceKind::Pluto).then_some(&mut self.pluto),
+                    other: self.kind.other(),
                     radio_info: self.session.as_ref().and_then(|s| s.info.as_deref()),
                     live,
                     front_end: self.stats.front_end,
@@ -2837,6 +3032,7 @@ impl eframe::App for App {
                     offsets: match self.kind {
                         SourceKind::Airspy => &self.air_offsets,
                         SourceKind::Pluto => &self.pluto_offsets,
+                        k if k.other() => &self.other_offsets,
                         _ => &self.offsets,
                     },
                 },

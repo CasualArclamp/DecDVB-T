@@ -24,6 +24,11 @@ cargo run --release -p decdvbt-mheg --example redbutton -- out/x.ts --sid SID --
 cargo run --release -p decdvbt-cli -- capture C23 --amp --lna 32 --vga 8 --record x.cs8  # the RF amp must be on for DVB-T
 cargo run --release -p decdvbt-cli -- decode C23 --radio airspy -o out/c23.ts   # Airspy R2 (10 MS/s only; --airspy-preset sensitivity:10|linearity:N, --airspy-lna/-mixer/-vga, --airspy-packed)
 cargo run --release -p decdvbt-cli -- decode C23 --radio pluto --pluto-uri auto --pluto-gain 50 -o out/c23.ts   # ADALM-PLUTO / Pluto+ (usb, ip:ADDRESS; --pluto-gain agc; --pluto-16bit); receive only
+cargo run --release -p decdvbt-cli -- decode C23 --radio sdrplay --radio-rate 10 --sdrplay-gain 4,40 -o out/c23.ts   # the radios from DecSAT: --radio fobos (--fobos-gain LNA,VGA), sdrplay, uhd (--uhd-args, --uhd-gain, --uhd-antenna); each loads its maker's DLL at run time
+cargo run --release -p decdvbt-cli -- decode C23 --radio remote --remote 127.0.0.1:5262 --remote-radio hackrf --radio-rate 10 -o out/c23.ts   # a radio behind DecSAT's decsat-server (--remote-password-file, --remote-bits, --remote-zstd, --remote-gain NAME=V,…)
+cargo run --release -p decdvbt-cli -- decode C23 --radio net --net tcp://127.0.0.1:7777 --net-iq int8 --radio-rate 10 -o out/c23.ts   # raw IQ from SDR++'s IQ Exporter, GNU Radio, rtl_tcp (also listen://, udp://); decdvbt-io's net_send example plays a file out as one
+cargo run --release -p decdvbt-cli -- decode radio --freq 433.25 --bandwidth 1.7 --radio rtlsdr --rtl-gain 40.2   # RTL-SDR (2.048 MS/s: 1 and 1.7 MHz channels only); `radio` as the source is --radio's radio at --freq
+cargo test -p decdvbt-io --features remote,rtlsdr   # the server link against a stand-in server, network IQ on loopback, the RTL-SDR's chips against a mock dongle
 PLUTO_URI=ip:192.168.2.1 cargo test -p decdvbt-io --features pluto live_pluto -- --ignored --nocapture   # Pluto live: link, firmware, 8/16-bit, MS/s delivered
 cargo run --release -p decdvbt-io --features airspy --example airspy_convert_bench   # the Airspy real-to-IQ converter: ns per sample
 cargo run --release -p decdvbt-cli --example airspy_live -- 618 60 [packed]   # Airspy soak: per second, samples, drops/blanked blocks, read gaps, RS losses (env DECDVBT_AIRSPY_RAW=dump.raw keeps the raw USB transfers)
@@ -77,6 +82,18 @@ Rust is installed through rustup (stable MSVC). In Git Bash, `~/.cargo/bin`
 may need adding to PATH. The player needs `ffmpeg` at run time: on the PATH,
 beside the exe, or installed by `winget install Gyan.FFmpeg` (found in winget's
 package folder even before the PATH is refreshed).
+
+**More radios** (all receive only; the GUI's settings for them are in
+`apps/decdvbt-gui/src/more_radios.rs` and `net_ui.rs`, kept in `prefs.txt` as
+they change): the Fobos SDR, SDRplay RSP and USRP drivers are DecSAT's
+(`decdvbt-io/src/fobos.rs`, `sdrplay.rs`, `uhd.rs`; features `fobos`,
+`sdrplay`, `uhd`), each loading its maker's library at run time
+(`DECDVBT_FOBOS_LIB`, `DECDVBT_SDRPLAY_LIB`, `UHD_DLL` name a file; UHD on
+Windows only). `remote` is the client of DecSAT's `decsat-server` in its IQ
+mode (`remote/msg.rs` must keep DecSAT's layout). Network IQ (`net.rs`) and
+the RTL-SDR (`rtlsdr*.rs`, feature `rtlsdr`, 2.048 MS/s: the 1 and 1.7 MHz
+channels only) are DecLAB's. None of these has been run on hardware here.
+The transmitter app uses none of them.
 
 ## House rules
 

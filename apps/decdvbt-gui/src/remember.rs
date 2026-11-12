@@ -32,6 +32,9 @@ pub struct Snapshot {
     pub airspy: bool,
     /// The radio is the ADALM-PLUTO / Pluto+, and its settings.
     pub pluto: bool,
+    /// Another radio's key (`rtlsdr`, `net`, `fobos`, `sdrplay`, `uhd`,
+    /// `remote`), or empty. Their own settings are written as they change.
+    pub other: String,
     pub pluto_ui: PlutoUi,
     pub rate_khz: i64,
     pub gains: Gains,
@@ -63,6 +66,8 @@ impl Snapshot {
                 "source",
                 if self.file_source {
                     "file"
+                } else if !self.other.is_empty() {
+                    &self.other
                 } else if self.airspy {
                     "airspy"
                 } else if self.pluto {
@@ -108,6 +113,8 @@ pub struct Saved {
     pub file_source: bool,
     pub airspy: bool,
     pub pluto: bool,
+    /// The source's key when it is none of those.
+    pub other: Option<String>,
     pub pluto_ui: PlutoUi,
     pub rate_msps: Option<f64>,
     pub gains: Option<Gains>,
@@ -173,6 +180,8 @@ impl Saved {
             file_source: prefs::get("source").is_some_and(|v| v == "file"),
             airspy: prefs::get("source").is_some_and(|v| v == "airspy"),
             pluto: prefs::get("source").is_some_and(|v| v == "pluto"),
+            other: prefs::get("source")
+                .filter(|v| !matches!(v.as_str(), "file" | "airspy" | "pluto" | "hackrf")),
             pluto_ui: {
                 let d = PlutoUi::default();
                 PlutoUi {
@@ -267,6 +276,7 @@ mod tests {
             file_source: false,
             airspy: false,
             pluto: false,
+            other: String::new(),
             pluto_ui: PlutoUi::default(),
             rate_khz: 10_000,
             gains: Gains {
