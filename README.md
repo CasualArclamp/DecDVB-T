@@ -2,6 +2,8 @@
   <img src="docs/assets/banner.png" alt="DecDVB-T: DVB-T and DVB-T2 (Freeview) receiver for the HackRF One" width="100%">
 </p>
 
+[![release](https://img.shields.io/github/v/release/CasualArclamp/DecDVB-T?logo=github&label=release)](https://github.com/CasualArclamp/DecDVB-T/releases/latest) [![downloads](https://img.shields.io/github/downloads/CasualArclamp/DecDVB-T/total?logo=github&label=downloads)](https://github.com/CasualArclamp/DecDVB-T/releases)
+
 If you've found this worth your time, please consider [donating via PayPal](https://www.paypal.me/Arclamp).
 
 <p align="center">
