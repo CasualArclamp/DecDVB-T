@@ -354,7 +354,9 @@ fn read_preview(listener: TcpListener, shared: &FeederShared, stopping: &AtomicB
                 }
                 if peak_at.elapsed() >= Duration::from_millis(100) {
                     let db = 20.0 * peak.max(1e-6).log10();
-                    shared.audio_dbfs_bits.store(db.to_bits(), Ordering::Relaxed);
+                    shared
+                        .audio_dbfs_bits
+                        .store(db.to_bits(), Ordering::Relaxed);
                     peak = 0.0;
                     peak_at = Instant::now();
                 }

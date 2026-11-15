@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 
 use decdvbt_core::channel::{UHF_FIRST, UHF_LAST, uhf_centre_hz, uhf_channel_at};
 use decdvbt_core::dvbt::{Bandwidth, Rate};
+use decdvbt_tx::encode::{self, CameraMode, Devices, Engine};
 use decdvbt_tx::modes::{
     T2_FFTS, T2_QAMS, T2_RATES, T2Config, baseband_filter_hz, qam_name, t2_guards, t2_mode,
     t2_mode_table, t2_rate,
 };
-use decdvbt_tx::encode::{self, CameraMode, Devices, Engine};
 use decdvbt_tx::{
     AudioCodec, EncoderChoice, HackRfTxConfig, LICENCE_WARNING, LicenceAck, PlutoTxConfig,
     ServiceInfo, Source, TxConfig, TxRate, TxSink, TxState, TxStatus, VideoCodec, VideoProfile,
@@ -445,9 +445,10 @@ impl App {
     fn build_config(&self) -> Result<TxConfig, String> {
         let source = self.build_source()?;
         let file = match self.set.source {
-            SourceKind::File | SourceKind::TsFile => {
-                self.file.clone().ok_or_else(|| self.source_missing().to_string())?
-            }
+            SourceKind::File | SourceKind::TsFile => self
+                .file
+                .clone()
+                .ok_or_else(|| self.source_missing().to_string())?,
             _ => PathBuf::new(),
         };
         let mut c = TxConfig::new(file.clone());
@@ -646,9 +647,11 @@ impl App {
             && self.demo.is_none()
         {
             // A transport stream is a TS source, anything else a video file.
-            let ts = p
-                .extension()
-                .is_some_and(|e| ["ts", "m2ts", "mts"].iter().any(|x| e.eq_ignore_ascii_case(x)));
+            let ts = p.extension().is_some_and(|e| {
+                ["ts", "m2ts", "mts"]
+                    .iter()
+                    .any(|x| e.eq_ignore_ascii_case(x))
+            });
             if !self.locked() {
                 self.set.source = if ts {
                     SourceKind::TsFile
@@ -1445,8 +1448,12 @@ impl App {
     /// The engine that will encode: the one asked for if it works, else the
     /// best that does (the CPU while the probe has not finished).
     fn engine_used(&self) -> Engine {
-        encode::pick_engine(self.set.video_codec, self.set.encoder.engine(), self.working())
-            .unwrap_or(Engine::Cpu)
+        encode::pick_engine(
+            self.set.video_codec,
+            self.set.encoder.engine(),
+            self.working(),
+        )
+        .unwrap_or(Engine::Cpu)
     }
 
     fn source_section(&mut self, ui: &mut egui::Ui) {
@@ -2094,7 +2101,11 @@ impl App {
             ui.add(
                 egui::ProgressBar::new(st.ts_fill.clamp(0.0, 1.0))
                     .desired_width(140.0)
-                    .fill(if live && st.ts_fill < 0.05 { AMBER } else { GREEN }),
+                    .fill(if live && st.ts_fill < 0.05 {
+                        AMBER
+                    } else {
+                        GREEN
+                    }),
             );
             ui.label(format!("{:.0} %", st.ts_fill * 100.0));
         });
@@ -2203,7 +2214,10 @@ impl App {
                 .enumerate()
                 .map(|(i, &db)| egui::pos2(r.left() + r.width() * i as f32 / (n - 1) as f32, y(db)))
                 .collect();
-            p.add(egui::Shape::line(pts, (1.0, Color32::from_rgb(111, 182, 255))));
+            p.add(egui::Shape::line(
+                pts,
+                (1.0, Color32::from_rgb(111, 182, 255)),
+            ));
         }
         p.text(
             r.left_top() + vec2(6.0, 4.0),

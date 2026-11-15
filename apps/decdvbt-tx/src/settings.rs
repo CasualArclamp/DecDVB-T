@@ -243,8 +243,8 @@ fn parse_audio(s: &str) -> Option<AudioCodec> {
         AudioCodec::Mp2,
         AudioCodec::None,
     ]
-        .into_iter()
-        .find(|a| audio_text(*a) == s)
+    .into_iter()
+    .find(|a| audio_text(*a) == s)
 }
 
 pub fn video_text(v: VideoCodec) -> &'static str {
