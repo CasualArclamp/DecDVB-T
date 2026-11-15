@@ -921,6 +921,11 @@ impl App {
                     .strong()
                     .color(Color32::from_gray(160)),
             );
+            ui.label(
+                egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                    .weak()
+                    .size(12.0),
+            );
             ui.separator();
             for (s, name) in [
                 (Screen::Tv, "TV"),

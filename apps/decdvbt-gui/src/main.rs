@@ -448,7 +448,7 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([w as f32, h as f32])
         .with_min_inner_size([900.0, 560.0])
-        .with_title("DecDVB-T")
+        .with_title(concat!("DecDVB-T v", env!("CARGO_PKG_VERSION")))
         .with_drag_and_drop(true)
         .with_fullscreen(opts.fullscreen)
         .with_decorations(!opts.fullscreen);
