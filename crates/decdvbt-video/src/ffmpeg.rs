@@ -125,6 +125,13 @@ pub fn args(
         // cannot take (MPEG-2 on some, 4:2:2) falls back to software.
         a.extend(["-hwaccel", "auto"].map(String::from));
     }
+    if video.is_some() {
+        // An H.264/HEVC "display orientation" SEI (some adverts carry one, and
+        // a corrupted packet can look like one) makes ffmpeg turn the picture
+        // by that angle, black corners and all. A television ignores it: so
+        // do we. An input option, like `-hwaccel`.
+        a.push("-noautorotate".into());
+    }
     a.extend(["-f", "mpegts", "-i", "pipe:0"].map(String::from));
     // By PID (`i:` matches an MPEG-TS stream's PID); `?`: no such stream is
     // not an error.
@@ -325,6 +332,18 @@ mod tests {
         let hw = a.iter().position(|x| x == "-hwaccel").unwrap();
         assert_eq!(a[hw + 1], "auto");
         assert!(hw < a.iter().position(|x| x == "-i").unwrap());
+    }
+
+    #[test]
+    fn the_stream_cannot_turn_the_picture() {
+        for subs in [None, Some(0x30)] {
+            let a = args(Some(0x21), Some(0x22), subs, Deinterlace::Bob, true);
+            let no = a.iter().position(|x| x == "-noautorotate").unwrap();
+            assert!(no < a.iter().position(|x| x == "-i").unwrap());
+        }
+        // Radio has no picture to turn.
+        let r = args(None, Some(0x22), None, Deinterlace::Bob, false);
+        assert!(!r.iter().any(|x| x == "-noautorotate"));
     }
 
     #[test]
