@@ -6,9 +6,9 @@
 //! them from a [`TxConfig`]. Every figure there was measured on this machine
 //! (ffmpeg 9.0.2, Gyan full build).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -288,12 +288,20 @@ fn encoder_works(ffmpeg: &Path, codec: VideoCodec, engine: Engine) -> bool {
         return ok;
     }
     let mut cmd = Command::new(ffmpeg);
-    cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
-        .arg("testsrc2=size=320x180:rate=25")
-        .args(["-frames:v", "3", "-c:v", name, "-f", "null", "-"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.args([
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+    ])
+    .arg("testsrc2=size=320x180:rate=25")
+    .args(["-frames:v", "3", "-c:v", name, "-f", "null", "-"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
     no_console(&mut cmd);
     let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
     cache.lock().unwrap().insert((codec, engine), ok);
@@ -625,14 +633,7 @@ pub fn command_line_with(
                     ";[{audio_in}]aresample=48000,asplit=2[aenc][apv0];[apv0]aresample=8000,\
                      aformat=sample_fmts=flt:channel_layouts=mono[apv]"
                 ));
-                add(&[
-                    "-filter_complex",
-                    &graph,
-                    "-map",
-                    "[enc]",
-                    "-map",
-                    "[aenc]",
-                ]);
+                add(&["-filter_complex", &graph, "-map", "[enc]", "-map", "[aenc]"]);
             } else {
                 add(&["-filter_complex", &graph, "-map", "[enc]"]);
                 if audio_on {
@@ -704,8 +705,7 @@ pub fn command_line_with(
             let bufsize = format!("{bufsize_kbps}k");
             a.extend(
                 [
-                    "-b:v", &vb, "-maxrate", &maxrate, "-bufsize", &bufsize, "-g", &gop, "-bf",
-                    "2",
+                    "-b:v", &vb, "-maxrate", &maxrate, "-bufsize", &bufsize, "-g", &gop, "-bf", "2",
                 ]
                 .map(String::from),
             );
@@ -1040,10 +1040,22 @@ mod tests {
             assert_eq!(a.last().unwrap(), "pipe:1");
         }
         // SVT-AV1 takes its key frame period in its own params; the others `-g`.
-        let a = command_line(&c, None, Chain::Encoder(VideoCodec::Av1, Engine::Cpu), &p, true);
+        let a = command_line(
+            &c,
+            None,
+            Chain::Encoder(VideoCodec::Av1, Engine::Cpu),
+            &p,
+            true,
+        );
         assert!(!a.contains(&"-g".to_string()));
         assert!(after(&a, "-svtav1-params").contains("keyint=25"));
-        let a = command_line(&c, None, Chain::Encoder(VideoCodec::H265, Engine::Cpu), &p, true);
+        let a = command_line(
+            &c,
+            None,
+            Chain::Encoder(VideoCodec::H265, Engine::Cpu),
+            &p,
+            true,
+        );
         assert_eq!(after(&a, "-g"), "25");
     }
 
@@ -1052,7 +1064,10 @@ mod tests {
         let (c, p) = with_source(Source::Test);
         let a = command_line(&c, None, Chain::X264, &p, true);
         assert!(a.contains(&"lavfi".to_string()));
-        assert!(a.iter().any(|x| x.starts_with("testsrc2=size=1920x1080:rate=25")));
+        assert!(
+            a.iter()
+                .any(|x| x.starts_with("testsrc2=size=1920x1080:rate=25"))
+        );
         assert_eq!(after(&a, "-map"), "0:v:0");
         // Live: 0.2 % under the channel's rate, and no looping.
         let rate = (c.mux_rate_bps() as f64 * 0.998).floor() as u64;
@@ -1094,7 +1109,10 @@ mod tests {
 
     #[test]
     fn a_transport_stream_is_copied_not_encoded() {
-        for source in [Source::TsFile, Source::Udp("127.0.0.1:1234".parse().unwrap())] {
+        for source in [
+            Source::TsFile,
+            Source::Udp("127.0.0.1:1234".parse().unwrap()),
+        ] {
             let (mut c, p) = with_source(source.clone());
             c.input = "in.ts".into();
             let a = command_line(&c, None, Chain::X264, &p, true);
